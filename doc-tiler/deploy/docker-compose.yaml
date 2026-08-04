@@ -1,0 +1,49 @@
+services:
+  tiler:
+    build:
+      context: ..
+      target: runtime
+
+    image: tiler:3.2.0
+    # The runtime user (uid/gid 10001) is baked into the image and enforced by the
+    # entrypoint; there is deliberately no `user:` override here.
+    ports: ["8080:8080"]
+
+    volumes:
+      - tiler_data:/data
+      - ./metadata_schema.yaml:/config/metadata_schema.yaml:ro
+
+    shm_size: "1gb"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+    env_file:
+      - path: .env
+        required: true
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+
+  # `docker compose --profile test run --rm tests` — the full suite (browser tests
+  # included) against the same image the service runs on. Profile-gated so `up` ignores it.
+  tests:
+    profiles: ["test"]
+    build:
+      context: ..
+      target: test
+    image: tiler-test:3.2.0
+    environment:
+      TILER_DB_PATH: "/tmp/test/meta.sqlite"
+      TILER_BLOB_DIR: "/tmp/test/blobs"
+      TILER_TMP_DIR: "/tmp/test/tmp"
+      TILER_METADATA_SCHEMA_PATH: "/config/metadata_schema.yaml"
+    shm_size: "1gb"
+
+volumes:
+  tiler_data:

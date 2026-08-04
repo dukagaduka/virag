@@ -1,0 +1,23 @@
+# Declared indexed-metadata schema.
+# See docs/CONFIG.md ("Metadata schema") and docs/ARCHITECTURE.md ("Metadata & search").
+#
+# Only the keys listed here are searchable via POST /docs/search — each one gets a
+# SQLite expression index that SQLite backfills and maintains automatically.
+# Any other key you send is still stored verbatim in docs.metadata, just not
+# searchable (filtering on it returns 400).
+#
+# Adding a field: add it here and restart. SQLite backfills the new index over the
+# existing rows on startup; there is no reindex step and no downtime beyond the
+# restart. Removing a field drops its index (the data itself is untouched).
+#
+# Keys are dotted JSON paths into the metadata object and must be plain
+# identifiers: [A-Za-z_][A-Za-z0-9_]* joined by dots.
+version: 1
+fields:
+  - key: project
+    type: text
+    required: false
+  - key: source.host
+    type: text
+  - key: year
+    type: number

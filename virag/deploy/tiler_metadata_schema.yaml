@@ -1,0 +1,8 @@
+# Declared indexed-metadata schema for tiler service.
+
+version: 1
+
+fields:
+  - key: name
+    type: text
+

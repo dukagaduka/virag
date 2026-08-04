@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tiler"
+version = "3.2.0"
+description = "Turns documents (PDF/URL/MHTML/IMG) into fixed-geometry image tiles for a screenshot-RAG embedder, with on-demand tile regeneration and indexed metadata search."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# Single source of truth for runtime dependencies. The Docker build reads this
+# list straight out of pyproject (see Dockerfile) — there is no requirements.txt.
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "playwright==1.49.1",
+    "pymupdf==1.25.1",
+    "pillow==11.1.0",
+    "aiosqlite==0.20.0",
+    "pysqlite3-binary==0.5.4",
+    "python-multipart==0.0.20",
+    "pyyaml==6.0.2",
+    "prometheus-client==0.21.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.0",
+    "httpx==0.28.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tiler"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "tiler",
+    "docs",
+    "metadata_schema.yaml",
+    "README.md",
+]
