@@ -20,7 +20,10 @@ services:
       tiler-virag:
         condition: service_healthy
       qdrant-virag:
-        condition: service_healthy
+        # The qdrant image ships no curl/wget/bash, so an in-container HTTP healthcheck
+        # isn't possible; gate on start only. virag connects during its lifespan (with
+        # restart as a safety net) once qdrant is up (~1 s).
+        condition: service_started
       embeddings-vllm-virag:
         condition: service_started
 
@@ -79,16 +82,12 @@ services:
 
     restart: unless-stopped
 
-    env_file: 
+    env_file:
       - path: .env
         required: true
 
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:6333/ >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 30s
+    # No healthcheck: the qdrant image has no curl/wget/bash to probe with. Consumers
+    # gate on service_started and retry their own connection.
 
     networks:
       - virag
@@ -101,10 +100,20 @@ services:
     command: ["bash /start.sh"]
     shm_size: "16g"
 
+    # The serve script is driven entirely by VLLM_* env vars; without this the
+    # container falls back to script defaults and ignores the configured model name,
+    # LoRA settings and 6 GB tuning.
+    env_file:
+      - path: .env
+        required: true
+
     ports:
       - "${VLLM_DEPLOY_HOST}:${VLLM_DEPLOY_PORT}:8000"
     volumes:
       - ${VLLM_DEPLOY_MODEL_PATH}:/model:ro
+      # LoRA adapter — internal path is the constant /adapter; only the host path
+      # (VLLM_DEPLOY_ADAPTER_PATH) varies. Point it at the base model dir if unused.
+      - ${VLLM_DEPLOY_ADAPTER_PATH}:/adapter:ro
       - ./serve_vllm_embeddings.sh:/start.sh:ro
 
     ulimits:

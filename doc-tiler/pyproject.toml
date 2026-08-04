@@ -45,6 +45,6 @@ packages = ["tiler"]
 include = [
     "tiler",
     "docs",
-    "metadata_schema.yaml",
+    "deploy/metadata_schema.yaml",
     "README.md",
 ]

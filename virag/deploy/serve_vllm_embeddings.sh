@@ -20,11 +20,34 @@ VLLM_LOAD_FORMAT="${VLLM_LOAD_FORMAT:-auto}"
 VLLM_POOLER_CONFIG="${VLLM_POOLER_CONFIG:-}"
 VLLM_UVICORN_LOG_LEVEL="${VLLM_UVICORN_LOG_LEVEL:-warning}"
 
+# LoRA adapter (optional). The base model is always mounted at /model; a LoRA
+# adapter, when used, is mounted at the fixed path /adapter (only the host path
+# varies, via VLLM_DEPLOY_ADAPTER_PATH in compose). When an adapter is present the
+# base is served under VLLM_BASE_MODEL_NAME and the adapter is registered under
+# VLLM_SERVED_MODEL_NAME — so clients (virag) query VLLM_SERVED_MODEL_NAME and
+# transparently get base+adapter.
+VLLM_BASE_MODEL_NAME="${VLLM_BASE_MODEL_NAME:-base-model}"
+VLLM_MAX_LORA_RANK="${VLLM_MAX_LORA_RANK:-32}"
+ADAPTER_DIR="/adapter"
+
+# Optional weight quantization (e.g. fp8) and eager mode — mainly for fitting a
+# large model on a small GPU. Both are off by default.
+VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
+
+if [[ -f "$ADAPTER_DIR/adapter_config.json" ]]; then
+  LORA_ENABLED=1
+  SERVED_MODEL_NAME="$VLLM_BASE_MODEL_NAME"
+else
+  LORA_ENABLED=0
+  SERVED_MODEL_NAME="$VLLM_SERVED_MODEL_NAME"
+fi
+
 ARGS=(
   "/model"
   "--host" "0.0.0.0"
   "--port" "8000"
-  "--served-model-name" "$VLLM_SERVED_MODEL_NAME"
+  "--served-model-name" "$SERVED_MODEL_NAME"
   "--runner" "$VLLM_RUNNER"
   "--tensor-parallel-size" "$VLLM_TENSOR_PARALLEL_SIZE"
   "--pipeline-parallel-size" "$VLLM_PIPELINE_PARALLEL_SIZE"
@@ -52,9 +75,31 @@ if [[ -n "$VLLM_POOLER_CONFIG" ]]; then
   ARGS+=("--pooler-config" "$VLLM_POOLER_CONFIG")
 fi
 
-echo "vLLM embeddings model: $MODEL_NAME"
-echo "served model name:     $VLLM_SERVED_MODEL_NAME"
-echo "listen:                $HOST:$PORT"
+if [[ "$LORA_ENABLED" == "1" ]]; then
+  ARGS+=(
+    "--enable-lora"
+    "--max-lora-rank" "$VLLM_MAX_LORA_RANK"
+    "--lora-modules" "${VLLM_SERVED_MODEL_NAME}=${ADAPTER_DIR}"
+  )
+fi
+
+if [[ -n "$VLLM_QUANTIZATION" ]]; then
+  ARGS+=("--quantization" "$VLLM_QUANTIZATION")
+fi
+
+if [[ "$VLLM_ENFORCE_EAGER" == "1" ]]; then
+  ARGS+=("--enforce-eager")
+fi
+
+echo "vLLM base model dir:   /model"
+if [[ "$LORA_ENABLED" == "1" ]]; then
+  echo "LoRA adapter:          $ADAPTER_DIR (max_lora_rank=$VLLM_MAX_LORA_RANK)"
+  echo "base served name:      $SERVED_MODEL_NAME"
+  echo "client model name:     $VLLM_SERVED_MODEL_NAME (base+adapter)"
+else
+  echo "served model name:     $SERVED_MODEL_NAME"
+fi
+echo "listen:                0.0.0.0:8000"
 echo "metrics:               /metrics"
 echo "OpenAI endpoint:       /v1/embeddings"
 

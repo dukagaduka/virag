@@ -89,7 +89,7 @@ b.close(); p.stop()"
 
 COPY --chown=${APP_UID}:${APP_GID} tiler/ ./tiler/
 COPY --chown=${APP_UID}:${APP_GID} docker/entrypoint.sh /usr/local/bin/tiler-entrypoint
-COPY --chown=${APP_UID}:${APP_GID} metadata_schema.yaml /config/metadata_schema.yaml
+COPY --chown=${APP_UID}:${APP_GID} deploy/metadata_schema.yaml /config/metadata_schema.yaml
 RUN chmod +x /usr/local/bin/tiler-entrypoint
 
 # /data is pre-created *owned by the app user*: Docker seeds an empty named volume
