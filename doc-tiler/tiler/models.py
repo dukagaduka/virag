@@ -40,6 +40,8 @@ class DocSummary(BaseModel):
     doc_id: str
     doc_type: StoredDocType
     tile_count: int
+    complete: bool = True
+    render_version: str | None = None
     created_at: int
     source_url: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

@@ -49,6 +49,7 @@ DDL = (
         mime_type      TEXT NOT NULL,
         metadata       TEXT,
         render_version TEXT NOT NULL,
+        complete       INTEGER NOT NULL DEFAULT 1,
         created_at     INTEGER NOT NULL,
         updated_at     INTEGER NOT NULL
     )
@@ -106,6 +107,7 @@ class DocRow:
     render_version: str
     created_at: int
     updated_at: int
+    complete: bool = True
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> "DocRow":
@@ -123,6 +125,7 @@ class DocRow:
             render_version=row["render_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            complete=bool(row["complete"]),
         )
 
 
@@ -205,7 +208,7 @@ def build_search_query(
 
     sql = (
         "SELECT doc_id, doc_type, blob_rel_path, source_url, page_height, tile_count, "
-        "mime_type, metadata, render_version, created_at, updated_at FROM docs"
+        "mime_type, metadata, render_version, complete, created_at, updated_at FROM docs"
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -263,6 +266,14 @@ class MetaStore:
             if "secret_hash" not in columns:
                 await self.db.execute(
                     "ALTER TABLE service_meta ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''"
+                )
+            # Migrate volumes created before streaming ingest: pre-existing docs were
+            # written atomically, so they backfill to complete=1.
+            cur = await self.db.execute("PRAGMA table_info(docs)")
+            doc_columns = {row["name"] for row in await cur.fetchall()}
+            if "complete" not in doc_columns:
+                await self.db.execute(
+                    "ALTER TABLE docs ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
                 )
             await self.db.commit()
 
@@ -401,9 +412,9 @@ class MetaStore:
                 await self.db.execute(
                     """
                     INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, page_height,
-                                      tile_count, mime_type, metadata, render_version,
+                                      tile_count, mime_type, metadata, render_version, complete,
                                       created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,1,?,?)
                     ON CONFLICT(doc_id) DO UPDATE SET
                         doc_type=excluded.doc_type,
                         blob_rel_path=excluded.blob_rel_path,
@@ -413,6 +424,7 @@ class MetaStore:
                         mime_type=excluded.mime_type,
                         metadata=COALESCE(excluded.metadata, docs.metadata),
                         render_version=excluded.render_version,
+                        complete=1,
                         updated_at=excluded.updated_at
                     """,
                     (
@@ -441,6 +453,101 @@ class MetaStore:
         row = await self.get_doc(doc_id)
         assert row is not None
         return row
+
+    async def begin_doc(
+        self,
+        *,
+        doc_id: str,
+        doc_type: str,
+        blob_rel_path: str,
+        source_url: str | None,
+        page_height: int,
+        tile_count: int,
+        mime_type: str,
+        metadata: dict[str, Any] | None,
+        render_version: str,
+    ) -> None:
+        """Open a streaming ingest: (re)create the doc row as incomplete, clear old tiles.
+
+        `complete=0` hides the doc from regeneration until `finish_doc`, so a stream
+        that dies mid-way leaves a swept-able partial rather than a servable half-doc.
+        """
+        now = int(time.time())
+        meta_json = json.dumps(metadata, sort_keys=True) if metadata else None
+        async with self._lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                await self.db.execute(
+                    """
+                    INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, page_height,
+                                      tile_count, mime_type, metadata, render_version, complete,
+                                      created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,0,?,?)
+                    ON CONFLICT(doc_id) DO UPDATE SET
+                        doc_type=excluded.doc_type,
+                        blob_rel_path=excluded.blob_rel_path,
+                        source_url=COALESCE(excluded.source_url, docs.source_url),
+                        page_height=excluded.page_height,
+                        tile_count=excluded.tile_count,
+                        mime_type=excluded.mime_type,
+                        metadata=COALESCE(excluded.metadata, docs.metadata),
+                        render_version=excluded.render_version,
+                        complete=0,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        doc_id,
+                        doc_type,
+                        blob_rel_path,
+                        source_url,
+                        page_height,
+                        tile_count,
+                        mime_type,
+                        meta_json,
+                        render_version,
+                        now,
+                        now,
+                    ),
+                )
+                await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+
+
+    async def append_tiles(self, doc_id: str, tiles: Sequence[tuple[int, int, str]]) -> None:
+        """Insert a batch of tile rows for an in-progress streaming ingest."""
+        if not tiles:
+            return
+
+        async with self._lock:
+            await self.db.executemany(
+                "INSERT OR REPLACE INTO tiles (doc_id, tile_num, height, image_hash) VALUES (?,?,?,?)",
+                [(doc_id, num, height, image_hash) for num, height, image_hash in tiles],
+            )
+            await self.db.commit()
+
+
+    async def finish_doc(self, doc_id: str, *, tile_count: int, page_height: int) -> None:
+        """Close a streaming ingest: fix the final counts and flip the doc to complete."""
+        async with self._lock:
+            await self.db.execute(
+                "UPDATE docs SET tile_count = ?, page_height = ?, complete = 1, updated_at = ? "
+                "WHERE doc_id = ?",
+                (tile_count, page_height, int(time.time()), doc_id),
+            )
+            await self.db.commit()
+
+
+    async def list_incomplete(self, older_than: int) -> list[str]:
+        """Return doc_ids of incomplete ingests last touched before `older_than` (for the sweeper)."""
+        cur = await self.db.execute(
+            "SELECT doc_id FROM docs WHERE complete = 0 AND updated_at < ?",
+            (older_than,),
+        )
+        return [row["doc_id"] for row in await cur.fetchall()]
+
 
     async def set_metadata(self, doc_id: str, metadata: dict[str, Any]) -> None:
         """Replace a doc's metadata JSON; the expression indexes follow automatically."""

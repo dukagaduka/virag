@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sys
@@ -11,7 +12,8 @@ from virag.clients.qdrant_store import QdrantStore
 from virag.clients.embeddings_client import EmbeddingsClient
 from virag.clients.tiler_client import TilerService
 from virag.clients.vlm_client import VLMClient
-from virag.binding import enforce_binding, warn_doc_id_overlap, secret_hash
+from virag.binding import enforce_binding, enforce_metadata_schema, secret_hash
+from virag.reconcile import reconcile, run_periodic
 from virag.api import enroll as enroll_api
 from virag.api import chat_completions as chat_completions_api
 from virag.api import proxy as proxy_api
@@ -64,7 +66,15 @@ async def lifespan(app: FastAPI):
 
     # Refuse to serve an unrelated Tiler/Qdrant pair; bind a fresh collection.
     render_version = await enforce_binding(store, tiler, secret_hash(settings.db_secret))
-    await warn_doc_id_overlap(store, tiler)
+    # Reconcile depends on these indexed metadata fields being declared in the tiler.
+    await enforce_metadata_schema(tiler)
+
+    # Repair any partial/orphaned enrolls left by an earlier crash before serving.
+    await reconcile(store, tiler, embeddings, settings.reconcile_settings)
+
+    reconcile_task = asyncio.create_task(
+        run_periodic(store, tiler, embeddings, settings.reconcile_settings)
+    )
 
     app.state.settings = settings
     app.state.store = store
@@ -89,6 +99,12 @@ async def lifespan(app: FastAPI):
         yield
 
     finally:
+        reconcile_task.cancel()
+        try:
+            await reconcile_task
+        except asyncio.CancelledError:
+            pass
+
         await store.close()
 
 

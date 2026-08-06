@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 
@@ -10,7 +9,14 @@ from virag.clients.tiler_client import TilerService
 
 log = logging.getLogger("virag.binding")
 
-_SAMPLE_SIZE = 5
+# The indexed metadata fields virag relies on: `name` for search, and the two enroll
+# markers reconcile queries by. All must be declared in the tiler's metadata schema
+# (deploy/tiler_metadata_schema.yaml) or reconcile's search would 400.
+REQUIRED_METADATA_FIELDS = {
+    "name": "text",
+    "virag_started_at": "number",
+    "virag_enrolled_at": "number",
+}
 
 
 class BindingError(RuntimeError):
@@ -77,33 +83,33 @@ async def enforce_binding(
     return tiler_rv
 
 
-async def warn_doc_id_overlap(store: QdrantStore, tiler: TilerService) -> None:
-    """Best-effort: sample a few enrolled doc_ids and warn if the tiler lacks them."""
-    try:
-        doc_ids = await store.sample_doc_ids(_SAMPLE_SIZE)
+async def enforce_metadata_schema(tiler: TilerService) -> None:
+    """Refuse to run unless the tiler declares every metadata field virag depends on.
 
-    except Exception as e:
-        log.warning("could not sample doc_ids for the overlap check: %r", e)
+    Fatal (BindingError): reconcile searches these keys, and an undeclared key would
+    make the tiler reject the search — so a missing field is a misconfiguration, not a
+    warning.
+    """
+    schema = await tiler.get_schema()
+    declared = {f.get("key"): f.get("type") for f in schema.get("fields", [])}
 
-        return
+    for key, expected_type in REQUIRED_METADATA_FIELDS.items():
+        actual_type = declared.get(key)
 
-    if not doc_ids:
-        return
+        if actual_type is None:
+            message = (
+                f"tiler metadata schema is missing required field {key!r}; "
+                f"declare it in tiler_metadata_schema.yaml"
+            )
+            log.critical("FATAL: %s", message)
 
-    results = await asyncio.gather(
-        *(tiler.doc_exists(doc_id) for doc_id in doc_ids),
-        return_exceptions=True,
-    )
+            raise BindingError(message)
 
-    missing = [doc_id for doc_id, exists in zip(doc_ids, results) if exists is False]
+        if actual_type != expected_type:
+            message = (
+                f"tiler metadata field {key!r} is declared {actual_type!r} "
+                f"but virag needs {expected_type!r}"
+            )
+            log.critical("FATAL: %s", message)
 
-    if missing:
-        log.warning(
-            "doc_id overlap: %d of %d sampled doc_ids are NOT in the tiler (%s); "
-            "qdrant and the tiler may be out of sync",
-            len(missing),
-            len(doc_ids),
-            missing,
-        )
-    else:
-        log.info("doc_id overlap: %d sampled doc_ids present in the tiler", len(doc_ids))
+            raise BindingError(message)

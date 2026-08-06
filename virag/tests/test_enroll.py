@@ -102,3 +102,75 @@ def test_enroll_bad_metadata_json_is_422(make_client):
 
     assert r.status_code == 422
     assert store.upserts == []
+
+
+def test_enroll_marks_pending_then_promotes(make_client):
+    client, store, _, tiler = _client(make_client)
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+    assert r.status_code == 200
+    assert store.deletes == ["doc-a"]                                # cleared prior partial on start
+    # first patch marks pending (enrolled_at 0), last patch promotes (enrolled_at > 0)
+    assert tiler.metadata_patches[0][1]["virag_enrolled_at"] == 0
+    assert tiler.metadata_patches[-1][1]["virag_enrolled_at"] > 0
+
+
+def test_enroll_streams_in_batches(make_client):
+    client, store, emb, _ = _client(make_client, n_tiles=3)
+    emb.chunk_size = 1                                               # force one tile per batch
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+    assert r.status_code == 200
+    assert r.json()["enrolled"] == 3
+    assert len(store.upserts) == 3                                   # one upsert per streamed batch
+
+
+def test_enroll_stream_error_rolls_back(make_client):
+    client, store, _, tiler = _client(make_client)
+
+    async def bad_stream(doc_type, *, document=None, url=None, metadata=None, force=False):
+        yield {"event": "begin", "doc_id": "doc-a", "doc_type": "PDF",
+               "source_url": None, "render_version": "rv-test"}
+        yield {"event": "error", "code": "INTERNAL", "message": "boom"}
+
+    tiler.tile_stream = bad_stream
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+    assert r.status_code == 502
+    assert store.upserts == []
+    assert store.deletes == ["doc-a", "doc-a"]                       # start clear + rollback
+
+
+def test_enroll_rolls_back_on_upsert_failure(make_client):
+    client, store, _, tiler = _client(make_client)
+
+    async def boom(*a, **k):
+        raise RuntimeError("qdrant down")
+
+    store.upsert = boom
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+    assert r.status_code == 500
+    assert store.deletes == ["doc-a", "doc-a"]                        # start clear + rollback
+    # pending is never promoted on failure — no patch sets a non-zero enrolled_at
+    assert all(p[1].get("virag_enrolled_at") == 0 for p in tiler.metadata_patches)

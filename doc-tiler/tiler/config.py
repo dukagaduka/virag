@@ -122,6 +122,11 @@ class Settings:
     nav_timeout_ms: int = 30000
     wait_network_idle: bool = True
 
+    # Incomplete-ingest sweeper: reap streaming ingests left incomplete this long
+    # (must exceed the longest render); 0 disables the sweeper.
+    incomplete_ttl_sec: int = 0
+    sweep_interval_sec: int = 300
+
     db_path: str = "/data/meta.sqlite"
     blob_dir: str = "/data/blobs"
     tmp_dir: str = ""  # defaults to <blob_dir>/../tmp
@@ -246,6 +251,8 @@ def load_settings() -> Settings:
         recycle_after=_env_int("TILER_RECYCLE_AFTER", 500),
         render_cache_size=_env_int("TILER_RENDER_CACHE_SIZE", 64),
         max_doc_bytes=_env_int("TILER_MAX_DOC_BYTES", 67_108_864),
+        incomplete_ttl_sec=_env_int("TILER_INCOMPLETE_TTL_SEC", 0),
+        sweep_interval_sec=_env_int("TILER_SWEEP_INTERVAL_SEC", 300),
         nav_timeout_ms=_env_int("TILER_NAV_TIMEOUT_MS", 30000),
         wait_network_idle=_env_bool("TILER_WAIT_NETWORK_IDLE", True),
         db_path=_env_str("TILER_DB_PATH", "/data/meta.sqlite"),

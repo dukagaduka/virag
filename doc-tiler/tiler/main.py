@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -109,11 +110,37 @@ async def lifespan(app: FastAPI):
     app.state.service = svc
     app.state.settings = settings
 
+    sweeper = asyncio.create_task(_run_sweeper(svc, settings))
+
     try:
         yield
     finally:
+        sweeper.cancel()
+        try:
+            await sweeper
+        except asyncio.CancelledError:
+            pass
+
         await svc.stop_pools()
         await svc.store.close()
+
+
+async def _run_sweeper(svc: TilerService, settings: Settings) -> None:
+    """Periodically reap incomplete ingests older than the TTL (0 = disabled)."""
+    if settings.incomplete_ttl_sec <= 0:
+        return
+
+    while True:
+        await asyncio.sleep(settings.sweep_interval_sec)
+
+        try:
+            await svc.sweep_incomplete(settings.incomplete_ttl_sec)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:  # noqa: BLE001 - a sweep must never crash the service
+            log.error("incomplete-ingest sweep failed: %r", exc)
 
 
 def create_app() -> FastAPI:

@@ -7,7 +7,7 @@ import hashlib
 
 import pytest
 
-from virag.binding import BindingError, enforce_binding, secret_hash
+from virag.binding import BindingError, enforce_binding, enforce_metadata_schema, secret_hash
 
 from conftest import FakeStore, FakeTiler
 
@@ -67,3 +67,31 @@ def test_render_version_drift_is_not_fatal():
 
     rv = asyncio.run(enforce_binding(store, tiler, expected))
     assert rv == "rv-NEW"        # returns the tiler's version, only warns on drift
+
+
+def test_metadata_schema_complete_ok():
+    tiler = FakeTiler()                                     # default schema has all three
+    asyncio.run(enforce_metadata_schema(tiler))             # does not raise
+
+
+def test_metadata_schema_missing_field_is_fatal():
+    tiler = FakeTiler()
+    tiler.schema = {"version": 1, "fields": [{"key": "name", "type": "text"}]}
+
+    with pytest.raises(BindingError):
+        asyncio.run(enforce_metadata_schema(tiler))
+
+
+def test_metadata_schema_wrong_type_is_fatal():
+    tiler = FakeTiler()
+    tiler.schema = {
+        "version": 1,
+        "fields": [
+            {"key": "name", "type": "text"},
+            {"key": "virag_started_at", "type": "text"},        # should be number
+            {"key": "virag_enrolled_at", "type": "number"},
+        ],
+    }
+
+    with pytest.raises(BindingError):
+        asyncio.run(enforce_metadata_schema(tiler))

@@ -28,6 +28,7 @@ from virag.settings import (
     EmbeddingsSettings,
     QdrantStoreSettings,
     RagSettings,
+    ReconcileSettings,
     Settings,
     TilerSettings,
     VLMSettings,
@@ -57,6 +58,7 @@ class FakeEmbeddings:
 
     def __init__(self, dim: int = 4):
         self.dim = dim
+        self.chunk_size = 16
         self.text_calls: list[list[str]] = []
         self.image_calls: list[list[str]] = []
 
@@ -75,7 +77,8 @@ class FakeStore:
         self._hits = hits or []
         self.upserts: list[dict] = []
         self.metadata: dict | None = None
-        self._sample: list[str] = []
+        self._doc_ids: set[str] = set()
+        self.deletes: list[str] = []
 
     async def query(self, vector, top_n):
         return self._hits[:top_n]
@@ -92,8 +95,12 @@ class FakeStore:
     async def set_collection_metadata(self, metadata: dict) -> None:
         self.metadata = dict(metadata)
 
-    async def sample_doc_ids(self, limit: int) -> list[str]:
-        return self._sample[:limit]
+    async def delete_by_doc(self, doc_id: str, *, wait: bool = True) -> None:
+        self.deletes.append(doc_id)
+        self._doc_ids.discard(doc_id)
+
+    async def iter_doc_ids(self) -> set[str]:
+        return set(self._doc_ids)
 
     async def close(self):
         pass
@@ -106,10 +113,32 @@ class FakeTiler:
         self._info = info or {"secret_hash": "", "render_version": "rv-test"}
         self.get_tile_calls: list[tuple] = []
         self.existing: set[str] = set()
+        self.metadata_patches: list[tuple] = []
+        self.schema: dict = {
+            "version": 1,
+            "fields": [
+                {"key": "name", "type": "text"},
+                {"key": "virag_started_at", "type": "number"},
+                {"key": "virag_enrolled_at", "type": "number"},
+            ],
+        }
+        self.docs: list[dict] = []
+        self.pending_docs: list[dict] = []
 
     async def tile(self, doc_type, *, document=None, url=None, metadata=None,
                    store=True, include_bytes=True, force=False):
         return self._result
+
+    async def tile_stream(self, doc_type, *, document=None, url=None, metadata=None, force=False):
+        res = self._result
+        yield {"event": "begin", "doc_id": res.doc_id, "doc_type": res.doc_type,
+               "source_url": res.source_url, "render_version": res.render_version}
+        for t in res.tiles:
+            yield {"event": "tile", "tile_num": t.tile_num, "width": t.width,
+                   "height": t.height, "image_hash": t.image_hash, "data": t.data}
+        yield {"event": "committed", "doc_id": res.doc_id, "doc_type": res.doc_type,
+               "source_url": res.source_url, "render_version": res.render_version,
+               "page_height": 0, "tile_count": res.tile_count}
 
     async def get_tile(self, doc_id, tile_num) -> bytes:
         self.get_tile_calls.append((doc_id, tile_num))
@@ -120,6 +149,16 @@ class FakeTiler:
 
     async def doc_exists(self, doc_id: str) -> bool:
         return doc_id in self.existing
+
+    async def patch_metadata(self, doc_id: str, patch: dict) -> None:
+        self.metadata_patches.append((doc_id, patch))
+
+    async def get_schema(self) -> dict:
+        return self.schema
+
+    async def iter_docs(self, *, filters=None) -> list[dict]:
+        # No filters = the Qdrant ⊆ Tiler listing; filters = the pending search.
+        return list(self.pending_docs if filters else self.docs)
 
 
 class FakeVLMResponse:
@@ -188,12 +227,14 @@ def make_settings(**overrides) -> Settings:
         rag_settings=rag,
         qdrant_settings=QdrantStoreSettings(
             base_url="http://qdrant", collection_name="c", vector_size=4, distance_type=Distance.COSINE,
+            chunk_byte_budget=24 * 1024 * 1024, max_batch_chunks=1024,
         ),
         embeddings_settings=EmbeddingsSettings(
             base_url="http://emb/v1", model_name="emb", api_key="k-emb", chunk_size=16, timeout=60,
         ),
         tiler_settings=TilerSettings(base_url="http://tiler", timeout=120),
         vlm_settings=VLMSettings(base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout=120),
+        reconcile_settings=ReconcileSettings(self_heal=True, interval_sec=0, pending_ttl_sec=3600),
     )
 
 

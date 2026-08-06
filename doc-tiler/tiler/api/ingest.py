@@ -2,15 +2,32 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
 
 from ..errors import bad_request
 from ..models import IngestManifest
 from .deps import ERROR_RESPONSES, check_declared_size, parse_metadata_field, read_capped, service
 
 router = APIRouter()
+
+
+def _validate_ingest_inputs(doc_type: str, document: UploadFile | None) -> str:
+    """Shared pre-flight for both ingest routes; returns the normalized doc_type."""
+    doc_type = (doc_type or "").strip().upper()
+    if doc_type not in ("PDF", "URL", "MHTML", "IMG"):
+        raise bad_request(
+            f"unknown doc_type {doc_type!r}; expected PDF, URL, MHTML or IMG", "UNKNOWN_DOC_TYPE"
+        )
+    if doc_type == "URL" and document is not None:
+        # A URL ingest fetches its own bytes; an attached file would be ambiguous.
+        raise bad_request(
+            "doc_type=URL takes 'url' only; do not attach a document", "AMBIGUOUS_INPUT"
+        )
+    return doc_type
 
 
 @router.post(
@@ -58,3 +75,42 @@ async def ingest_document(
         force=force,
     )
     return IngestManifest(**manifest)
+
+
+@router.post(
+    "/tile/stream",
+    responses=ERROR_RESPONSES,
+    summary="Ingest a document and stream its tiles as NDJSON, then a `committed` event.",
+    operation_id="ingestDocumentStream",
+)
+async def ingest_document_stream(
+    request: Request,
+    doc_type: Annotated[str, Form()],
+    document: Annotated[UploadFile | None, File()] = None,
+    url: Annotated[str | None, Form()] = None,
+    metadata: Annotated[str | None, Form()] = None,
+    force: Annotated[bool, Query()] = False,
+) -> StreamingResponse:
+    """Stream a stored ingest tile-by-tile (NDJSON), terminated by a `committed` event.
+
+    The doc is persisted incrementally and stays incomplete until the final tile, so a
+    broken stream leaves a swept-able partial. Errors surface as an in-stream `error`
+    event; the absence of `committed` means the ingest did not complete.
+    """
+    svc = service(request)
+    doc_type = _validate_ingest_inputs(doc_type, document)
+
+    check_declared_size(request, svc.settings.max_doc_bytes)
+    data = None
+    if document is not None and doc_type != "URL":
+        data = await read_capped(document, svc.settings.max_doc_bytes)
+
+    meta_obj = parse_metadata_field(metadata)
+
+    async def ndjson():
+        async for event in svc.ingest_stream(
+            doc_type=doc_type, data=data, url=url, metadata=meta_obj, force=force
+        ):
+            yield json.dumps(event).encode() + b"\n"
+
+    return StreamingResponse(ndjson(), media_type="application/x-ndjson")

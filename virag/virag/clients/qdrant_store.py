@@ -11,6 +11,10 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Batch,
     Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PayloadSchemaType,
     VectorParams
 )
 
@@ -169,15 +173,15 @@ class QdrantStore:
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(size=self.vector_size, distance=self.distance_type),
             )
-            
+
         else:
             vectors_info = (await self.qdrant.get_collection(
                 self.collection_name
             )).config.params.vectors
-            
+
             size = vectors_info.size # type: ignore
             distance_type = vectors_info.distance # type: ignore
-            
+
             assert size == self.vector_size, (
                 f"Vector size mismatch: collection `{self.collection_name}` has size {size}, "
                 f"but expected {self.vector_size}"
@@ -187,6 +191,18 @@ class QdrantStore:
                 f"Distance type mismatch: collection `{self.collection_name}` uses {distance_type}, "
                 f"but expected {self.distance_type}"
             )
+
+        await self._ensure_indexes()
+
+
+    async def _ensure_indexes(self):
+        # `doc_id` is filtered on for per-document delete and the Qdrant ⊆ Tiler
+        # reconcile; the index makes those filtered ops cheap. Idempotent.
+        await self.qdrant.create_payload_index(
+            collection_name=self.collection_name,
+            field_name="doc_id",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
             
             
     async def clear_collection(
@@ -217,6 +233,42 @@ class QdrantStore:
             collection_name=self.collection_name,
             metadata=metadata,
         )
+
+
+    async def delete_by_doc(self, doc_id: str, *, wait: bool = True) -> None:
+        """Delete every point belonging to one document — the enroll rollback + reconcile primitive."""
+        await self.qdrant.delete(
+            collection_name=self.collection_name,
+            wait=wait,
+            points_selector=Filter(
+                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+            ),
+        )
+
+
+    async def iter_doc_ids(self) -> set[str]:
+        """Scroll the whole collection and return the distinct doc_ids it holds."""
+        doc_ids: set[str] = set()
+        offset = None
+
+        while True:
+            points, offset = await self.qdrant.scroll(
+                collection_name=self.collection_name,
+                limit=1024,
+                offset=offset,
+                with_payload=["doc_id"],
+                with_vectors=False,
+            )
+
+            for point in points:
+                doc_id = (point.payload or {}).get("doc_id")
+                if doc_id:
+                    doc_ids.add(doc_id)
+
+            if offset is None:
+                break
+
+        return doc_ids
 
 
     async def sample_doc_ids(self, limit: int) -> list[str]:

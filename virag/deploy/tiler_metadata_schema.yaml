@@ -6,3 +6,12 @@ fields:
   - key: name
     type: text
 
+  # virag enroll-lifecycle markers (virag semantics; the tiler only indexes them).
+  # virag_enrolled_at: 0 while an enroll is pending, epoch seconds once Qdrant is
+  # confirmed. virag_started_at: epoch at enroll start, the reconcile anti-race gate.
+  - key: virag_started_at
+    type: number
+
+  - key: virag_enrolled_at
+    type: number
+

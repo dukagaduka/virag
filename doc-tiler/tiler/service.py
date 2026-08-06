@@ -13,7 +13,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, AsyncIterator, Callable, Sequence
 
 from . import media, metrics
 from .config import Settings
@@ -68,6 +68,8 @@ class TilerService:
         self.page_cache = AsyncLRU(max(2, settings.render_cache_size // 8), "page")
         self._cpu: concurrent.futures.ProcessPoolExecutor | None = None
         self.started_at = time.time()
+        # doc_ids with a streaming ingest in flight — the sweeper must not reap these.
+        self._inflight: set[str] = set()
 
 
     # ------------------------------------------------------------------ #
@@ -291,10 +293,11 @@ class TilerService:
 
         doc_id = sha256_hex(blob)
 
-        # Idempotency: identical bytes never re-render.
+        # Idempotency: identical bytes never re-render — but only a fully-written doc
+        # short-circuits; an incomplete (crashed/streaming) doc must be re-rendered.
         if store and not force:
             existing = await self.store.get_doc(doc_id)
-            if existing is not None:
+            if existing is not None and existing.complete:
                 metrics.INGESTS.labels(
                     doc_type=effective_type, stored="true", result="idempotent"
                 ).inc()
@@ -341,6 +344,215 @@ class TilerService:
                 for t in rendered.tiles
             ],
         }
+
+
+    # ------------------------------------------------------------------ #
+    # streaming ingest
+    # ------------------------------------------------------------------ #
+    async def _render_pdf_stream(self, blob: bytes) -> AsyncIterator[list[RenderedTile]]:
+        """Render a PDF group-by-group, yielding each group's tiles as it finishes."""
+        s = self.settings
+
+        pages = await self.run_cpu(cpu.pdf_page_count, blob)
+        if pages <= 0:
+            raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
+
+        chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.cpu_workers))))
+        groups = [list(range(i, min(i + chunk, pages))) for i in range(0, pages, chunk)]
+
+        tasks = [
+            asyncio.ensure_future(
+                self.run_cpu(cpu.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
+            )
+            for g in groups
+        ]
+
+        try:
+            for coro in asyncio.as_completed(tasks):
+                group = await coro
+                yield [
+                    RenderedTile(tile_num=num, height=h, jpeg=jpeg, image_hash=sha256_hex(jpeg))
+                    for num, h, jpeg in group
+                ]
+
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            raise
+
+
+    async def ingest_stream(
+        self,
+        *,
+        doc_type: str,
+        data: bytes | None,
+        url: str | None,
+        metadata: dict[str, Any] | None,
+        force: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream an ingest as NDJSON events: one per tile, then a terminal `committed`.
+
+        Tiles are written to the store as they render (the doc stays `complete=0` until
+        the last one), so a stream that dies mid-way leaves a swept-able partial and
+        never a servable half-doc. A failure surfaces as an `error` event; the absence
+        of `committed` is the client's signal to roll back.
+        """
+        source_url: str | None = None
+
+        try:
+            if doc_type == "URL":
+                if not url:
+                    raise bad_request("url is required when doc_type=URL", "MISSING_URL")
+                blob = await self._capture_url(url)
+                effective_type = "MHTML"
+                source_url = url
+                mime = "multipart/related"
+
+            else:
+                if data is None:
+                    raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
+                blob = data
+                effective_type = doc_type
+                mime = media.check_and_mime(doc_type, blob)
+
+            doc_id = sha256_hex(blob)
+
+            existing = None if force else await self.store.get_doc(doc_id)
+            if existing is not None and existing.complete:
+                metrics.INGESTS.labels(
+                    doc_type=effective_type, stored="true", result="idempotent"
+                ).inc()
+                async for event in self._stream_from_store(existing):
+                    yield event
+                return
+
+            if metadata is not None:
+                metadata = self.validate_metadata_payload(metadata)
+
+        except ApiError as exc:
+            yield {"event": "error", "code": exc.code, "message": exc.message}
+            return
+
+        self._inflight.add(doc_id)
+
+        try:
+            rel = await self.blobs.put(doc_id, blob)
+
+            await self.store.begin_doc(
+                doc_id=doc_id,
+                doc_type=effective_type,
+                blob_rel_path=rel,
+                source_url=source_url,
+                page_height=0,
+                tile_count=0,
+                mime_type=mime,
+                metadata=metadata,
+                render_version=self.settings.render_version,
+            )
+
+            # Emit identity up front so the consumer can build point ids / mark pending
+            # before any tile arrives.
+            yield {
+                "event": "begin",
+                "doc_id": doc_id,
+                "doc_type": effective_type,
+                "source_url": source_url,
+                "render_version": self.settings.render_version,
+            }
+
+            count = 0
+            page_height = 0
+
+            if effective_type == "PDF":
+                started = time.perf_counter()
+                async for group in self._render_pdf_stream(blob):
+                    await self.store.append_tiles(
+                        doc_id, [(t.tile_num, t.height, t.image_hash) for t in group]
+                    )
+                    for tile in group:
+                        count += 1
+                        yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg)}
+                metrics.RENDER_SECONDS.labels(doc_type=effective_type, path="ingest").observe(
+                    time.perf_counter() - started
+                )
+                metrics.RENDERS.labels(doc_type=effective_type, path="ingest").inc()
+                metrics.TILES.labels(doc_type=effective_type, path="ingest").inc(count)
+
+            else:
+                # IMG/MHTML render as a single unit (small); stream the transport only.
+                rendered = await self.render_document(effective_type, blob, path="ingest")
+                page_height = rendered.page_height
+                await self.store.append_tiles(
+                    doc_id, [(t.tile_num, t.height, t.image_hash) for t in rendered.tiles]
+                )
+                for tile in rendered.tiles:
+                    count += 1
+                    yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg)}
+
+            await self.store.finish_doc(doc_id, tile_count=count, page_height=page_height)
+            await self._invalidate(doc_id)
+            metrics.DOCS.set(await self.store.count_docs())
+            metrics.INGESTS.labels(doc_type=effective_type, stored="true", result="rendered").inc()
+
+            yield {
+                "event": "committed",
+                "doc_id": doc_id,
+                "doc_type": effective_type,
+                "source_url": source_url,
+                "render_version": self.settings.render_version,
+                "page_height": page_height,
+                "tile_count": count,
+            }
+
+        except ApiError as exc:
+            log.warning("streaming ingest failed for %s: %s", doc_id, exc.message)
+            yield {"event": "error", "code": exc.code, "message": exc.message}
+
+        except Exception as exc:  # noqa: BLE001 - the stream is already 200; report in-band
+            log.exception("streaming ingest crashed for %s", doc_id)
+            yield {"event": "error", "code": "INTERNAL", "message": repr(exc)}
+
+        finally:
+            self._inflight.discard(doc_id)
+
+
+    async def _stream_from_store(self, row: DocRow) -> AsyncIterator[dict[str, Any]]:
+        """Replay a fully-stored doc as the same NDJSON event stream (idempotent hit)."""
+        yield {
+            "event": "begin",
+            "doc_id": row.doc_id,
+            "doc_type": row.doc_type,
+            "source_url": row.source_url,
+            "render_version": row.render_version,
+        }
+
+        for tile in await self.store.get_tiles(row.doc_id):
+            jpeg, _ = await self.get_tile(row.doc_id, tile.tile_num, verify=True)
+            yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, jpeg)}
+
+        yield {
+            "event": "committed",
+            "doc_id": row.doc_id,
+            "doc_type": row.doc_type,
+            "source_url": row.source_url,
+            "render_version": row.render_version,
+            "page_height": row.page_height,
+            "tile_count": row.tile_count,
+        }
+
+
+    async def sweep_incomplete(self, ttl_seconds: int) -> int:
+        """Delete incomplete ingests older than the TTL, skipping any in flight. Returns the count."""
+        cutoff = int(time.time()) - ttl_seconds
+        stale = [d for d in await self.store.list_incomplete(cutoff) if d not in self._inflight]
+
+        for doc_id in stale:
+            await self.delete(doc_id)
+
+        if stale:
+            log.info("sweeper: removed %d incomplete ingest(s)", len(stale))
+
+        return len(stale)
 
 
     async def _capture_url(self, url: str) -> bytes:
@@ -427,6 +639,10 @@ class TilerService:
 
         if row is None:
             raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
+        if not row.complete:
+            raise not_found(
+                f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id
+            )
         if tile_num < 0 or tile_num >= row.tile_count:
             raise bad_request(
                 f"tile_num {tile_num} out of range (tile_count={row.tile_count})",
@@ -586,6 +802,8 @@ def summarize(rows: Sequence[DocRow]) -> list[dict[str, Any]]:
             "doc_id": r.doc_id,
             "doc_type": r.doc_type,
             "tile_count": r.tile_count,
+            "complete": r.complete,
+            "render_version": r.render_version,
             "created_at": r.created_at,
             "source_url": r.source_url,
             "metadata": r.metadata,

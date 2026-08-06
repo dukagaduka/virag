@@ -59,6 +59,13 @@ class VLMSettings:
 
 
 @dataclass(slots=True, frozen=True)
+class ReconcileSettings:
+    self_heal: bool
+    interval_sec: int
+    pending_ttl_sec: int
+
+
+@dataclass(slots=True, frozen=True)
 class Settings:
     host: str
     port: int
@@ -69,6 +76,7 @@ class Settings:
     embeddings_settings: EmbeddingsSettings
     tiler_settings: TilerSettings
     vlm_settings: VLMSettings
+    reconcile_settings: ReconcileSettings
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -216,6 +224,27 @@ class Settings:
             low=1
         )
 
+        # -----------------------------
+        # RECONCILE (enroll self-repair)
+        # -----------------------------
+
+        reconcile_self_heal = bool_coercion(
+            os.environ.get("VIRAG_SELF_HEAL", "true"),
+            "VIRAG_SELF_HEAL",
+        )
+
+        reconcile_interval_sec = int_coercion(
+            os.environ.get("VIRAG_RECONCILE_INTERVAL_SEC", "300"),
+            "VIRAG_RECONCILE_INTERVAL_SEC",
+            low=0,
+        )
+
+        reconcile_pending_ttl_sec = int_coercion(
+            os.environ.get("VIRAG_PENDING_TTL_SEC", "3600"),
+            "VIRAG_PENDING_TTL_SEC",
+            low=1,
+        )
+
 
         return cls(
             host=service_host,
@@ -250,7 +279,12 @@ class Settings:
                 model_name=vlm_model_name,
                 api_key=vlm_api_key,
                 timeout=vlm_timeout,
-            )
+            ),
+            reconcile_settings=ReconcileSettings(
+                self_heal=reconcile_self_heal,
+                interval_sec=reconcile_interval_sec,
+                pending_ttl_sec=reconcile_pending_ttl_sec,
+            ),
         )
 
 
@@ -262,6 +296,19 @@ def require_env(name: str) -> str:
         raise SettingsError(f"`{name}` environment variable is required.")
 
     return value
+
+
+def bool_coercion(value: str, name: str) -> bool:
+    """Convert a string to a boolean, accepting the usual truthy/falsy spellings."""
+    normalized = value.strip().lower()
+
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+
+    if normalized in ("0", "false", "no", "off"):
+        return False
+
+    raise SettingsError(f"`{name}` must be a boolean (got {value!r}).")
 
 
 def int_coercion(
