@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import uuid
 from typing import Sequence
 
@@ -8,12 +9,17 @@ import numpy as np
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
-    Batch, 
-    Distance, 
+    Batch,
+    Distance,
     VectorParams
 )
 
 from virag.settings import QdrantStoreSettings
+
+
+# Empirical cost of one JSON-serialized float (repr + separator); see enroll
+# 400s where 920x2048 vectors produced a ~40 MB body (~21.5 B/float measured).
+BYTES_PER_FLOAT_JSON = 24
 
 
 @dataclass(slots=True)
@@ -30,22 +36,28 @@ class QdrantStore:
         collection_name: str,
         vector_size: int,
         *,
-        distance_type: Distance = Distance.COSINE
+        distance_type: Distance = Distance.COSINE,
+        chunk_byte_budget: int = 24 * 1024 * 1024,
+        max_batch_chunks: int = 1024
     ) -> None:
-        
+
         # General connection params
         self.base_url = base_url
         self.collection_name = collection_name
-        
+
         # Internal collection params
         self.vector_size = vector_size
         self.distance_type = distance_type
-        
+
+        # Upsert batching limits
+        self.chunk_byte_budget = chunk_byte_budget
+        self.max_batch_chunks = max_batch_chunks
+
         self.qdrant = AsyncQdrantClient(
             url=self.base_url
         )
-        
-    
+
+
     @classmethod
     def from_settings(cls, qs: QdrantStoreSettings) -> QdrantStore:
         return cls(
@@ -53,6 +65,8 @@ class QdrantStore:
             collection_name=qs.collection_name,
             vector_size=qs.vector_size,
             distance_type=qs.distance_type,
+            chunk_byte_budget=qs.chunk_byte_budget,
+            max_batch_chunks=qs.max_batch_chunks,
         )
             
             
@@ -63,10 +77,8 @@ class QdrantStore:
         *,
         ids: Sequence[str] | None = None,
         wait: bool = True,
-        chunk_size: int = 1024,
     ):
 
-        assert isinstance(chunk_size, int) and chunk_size > 0, "`chunk_size` must be a positive integer"
         assert len(vectors) == len(payloads), "Sizes of `vectors` and `payloads` must be equal"
         assert ids is None or len(ids) == len(vectors), "Sizes of `ids` and `vectors` must be equal"
 
@@ -76,6 +88,8 @@ class QdrantStore:
                 do_size_check = False
             else:
                 raise ValueError(f"Every vector's size must equal {self.vector_size}")
+
+        chunk_size = self._chunk_size(payloads)
 
         for i in range(0, len(vectors), chunk_size):
             v_batch = vectors[i:i+chunk_size]
@@ -101,8 +115,25 @@ class QdrantStore:
                     payloads=list(p_batch),  # type: ignore
                 ),
             )
-            
-        
+
+
+    def _chunk_size(self, payloads: Sequence[dict]) -> int:
+        # Estimate the serialized cost of one point and derive how many fit
+        # into the byte budget, capped by `max_batch_chunks`. Payloads are
+        # homogeneous, so a single sample is enough to size the batch.
+        payload_bytes = (
+            len(json.dumps(payloads[0], default=str).encode("utf-8"))
+            if payloads
+            else 0
+        )
+
+        est_point_bytes = self.vector_size * BYTES_PER_FLOAT_JSON + payload_bytes
+
+        by_bytes = max(1, self.chunk_byte_budget // est_point_bytes)
+
+        return min(self.max_batch_chunks, by_bytes)
+
+
     async def query(
         self,
         vector: Sequence[float],

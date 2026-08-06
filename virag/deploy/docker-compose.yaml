@@ -25,7 +25,7 @@ services:
         # restart as a safety net) once qdrant is up (~1 s).
         condition: service_started
       embeddings-vllm-virag:
-        condition: service_started
+        condition: service_healthy
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
@@ -122,6 +122,17 @@ services:
 
     runtime: nvidia
     restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS -H "Authorization: Bearer ${VLLM_API_KEY}" http://localhost:8000/v1/models >/dev/null'
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
 
     networks:
       - virag

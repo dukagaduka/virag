@@ -31,6 +31,8 @@ class QdrantStoreSettings:
     collection_name: str
     vector_size: int
     distance_type: Distance
+    chunk_byte_budget: int
+    max_batch_chunks: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -134,6 +136,20 @@ class Settings:
                 f"Must be one of {[t.value for t in Distance]}."
             ) from e
 
+        qdrant_chunk_size_mb = int_coercion(
+            os.environ.get("QDRANT_CHUNK_SIZE", "24"),
+            "QDRANT_CHUNK_SIZE",
+            low=1,
+        )
+
+        qdrant_chunk_byte_budget = qdrant_chunk_size_mb * 1024 * 1024
+
+        qdrant_max_batch_chunks = int_coercion(
+            os.environ.get("QDRANT_MAX_BATCH_CHUNKS", "1024"),
+            "QDRANT_MAX_BATCH_CHUNKS",
+            low=1,
+        )
+
 
         # -----------------------------
         # EMBEDDINGS
@@ -215,6 +231,8 @@ class Settings:
                 collection_name=qdrant_collection_name,
                 vector_size=qdrant_vector_size,
                 distance_type=qdrant_distance_type,
+                chunk_byte_budget=qdrant_chunk_byte_budget,
+                max_batch_chunks=qdrant_max_batch_chunks,
             ),
             embeddings_settings=EmbeddingsSettings(
                 base_url=embeddings_base_url,
