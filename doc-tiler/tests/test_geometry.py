@@ -6,7 +6,12 @@ import random
 
 import pytest
 
-from tiler.render.geometry import resized_height, slice_strips, strip_for
+from tiler.render.geometry import (
+    resized_height,
+    slice_doc_strips,
+    slice_strips,
+    strip_for,
+)
 
 TH = 1024
 MIN = 28
@@ -62,6 +67,33 @@ def test_forward_and_reverse_agree_on_random_heights(overlap):
             # No coverage gap between consecutive strips.
             for a, b in zip(strips, strips[1:]):
                 assert b.offset <= a.offset + a.height
+
+
+@pytest.mark.parametrize("overlap", [0, 100, 300])
+def test_slice_doc_strips_numbers_globally_and_slices_per_page(overlap):
+    rng = random.Random(99 + overlap)
+    pdf_h = 600
+    page_heights = [rng.randint(1, 5000) for _ in range(40)]
+    layout = slice_doc_strips(page_heights, pdf_h, overlap, MIN)
+
+    # Contiguous global tile numbers, in page order.
+    assert [strip.tile_num for _, strip in layout] == list(range(len(layout)))
+    assert [page_no for page_no, _ in layout] == sorted(page_no for page_no, _ in layout)
+
+    # Each page's strips equal slicing that page in isolation (no stitching across pages).
+    by_page: dict[int, list] = {}
+    for page_no, strip in layout:
+        by_page.setdefault(page_no, []).append((strip.offset, strip.height))
+    for page_no, strips in by_page.items():
+        expected = slice_strips(page_heights[page_no], pdf_h, overlap, MIN)
+        assert strips == [(e.offset, e.height) for e in expected]
+        for off, h in strips:  # every strip stays inside its own page
+            assert off + h <= page_heights[page_no]
+
+
+def test_slice_doc_strips_edges():
+    assert slice_doc_strips([], 600, 0, MIN) == []
+    assert slice_doc_strips([20, 20], 600, 0, MIN) == []  # both pages below MIN → nothing
 
 
 def test_resized_height_is_proportional():

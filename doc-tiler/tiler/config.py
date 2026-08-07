@@ -108,6 +108,13 @@ class Settings:
     tile_overlap: int = 0
     min_tile_height: int = 28
 
+    # PDF strip slicing (off by default → each PDF page stays one tile). When on, each
+    # page is sliced into strips of pdf_tile_height (with pdf_tile_overlap), never across
+    # page boundaries — finer tiles improve retrieval recall on dense text pages.
+    pdf_slice: bool = False
+    pdf_tile_height: int = 1024
+    pdf_tile_overlap: int = 0
+
     # --- pixel tier (folded into render_version, soft-checked) ---
     jpeg_quality: int = 85
     pdf_dpi: int = 200
@@ -194,13 +201,22 @@ class Settings:
         }
 
     @property
+    def pdf_tier(self) -> dict[str, object]:
+        """PDF slicing params. Folded into render_version only when slicing is on, so
+        deployments with slicing off keep their existing render_version untouched."""
+        return {
+            "pdf_tile_height": self.pdf_tile_height,
+            "pdf_tile_overlap": self.pdf_tile_overlap,
+        }
+
+    @property
     def render_version(self) -> str:
-        """Stable short hash over the geometry tier plus the pixel tier."""
-        payload = json.dumps(
-            {"geometry": self.geometry, "pixel": self.pixel_tier},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        """Stable short hash over the geometry tier plus the pixel tier (and the PDF
+        slicing tier only when PDF slicing is enabled)."""
+        tiers: dict[str, object] = {"geometry": self.geometry, "pixel": self.pixel_tier}
+        if self.pdf_slice:
+            tiers["pdf"] = self.pdf_tier
+        payload = json.dumps(tiers, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
     @property
@@ -222,6 +238,19 @@ class Settings:
             raise ConfigError(
                 "TILER_MIN_TILE_HEIGHT must satisfy 0 < MIN <= TILER_TILE_HEIGHT"
             )
+        if self.pdf_slice:
+            if self.pdf_tile_height <= 0:
+                raise ConfigError(
+                    "TILER_PDF_TILE_HEIGHT must be positive when TILER_PDF_SLICE_ENABLE is set"
+                )
+            if not 0 <= self.pdf_tile_overlap < self.pdf_tile_height:
+                raise ConfigError(
+                    "TILER_PDF_TILE_OVERLAP must satisfy 0 <= OVERLAP < TILER_PDF_TILE_HEIGHT"
+                )
+            if self.min_tile_height > self.pdf_tile_height:
+                raise ConfigError(
+                    "TILER_MIN_TILE_HEIGHT must be <= TILER_PDF_TILE_HEIGHT when PDF slicing is on"
+                )
         if not 1 <= self.jpeg_quality <= 100:
             raise ConfigError("TILER_JPEG_QUALITY must be within 1..100")
         if self.pdf_dpi <= 0:
@@ -243,6 +272,9 @@ def load_settings() -> Settings:
         tile_height=_env_int("TILER_TILE_HEIGHT", 1024),
         tile_overlap=_env_int("TILER_TILE_OVERLAP", 0),
         min_tile_height=_env_int("TILER_MIN_TILE_HEIGHT", 28),
+        pdf_slice=_env_bool("TILER_PDF_SLICE_ENABLE", False),
+        pdf_tile_height=_env_int("TILER_PDF_TILE_HEIGHT", 1024),
+        pdf_tile_overlap=_env_int("TILER_PDF_TILE_OVERLAP", 0),
         jpeg_quality=_env_int("TILER_JPEG_QUALITY", 85),
         pdf_dpi=_env_int("TILER_PDF_DPI", 200),
         safe_fullpage_px=_env_int("TILER_SAFE_FULLPAGE_PX", 30000),

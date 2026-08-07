@@ -25,7 +25,7 @@ from .netguard import GuardProxy
 from .render import browser as web
 from .render import cpu
 from .render.browser import BrowserPool, BrowserUnavailable, RenderFailure, RenderTimeout
-from .render.geometry import Strip, slice_strips, strip_for
+from .render.geometry import Strip, slice_doc_strips, slice_strips, strip_for
 from .ssrf import BlockedTarget, validate_url
 from .store.blobs import BlobStore
 from .store.cache import AsyncLRU
@@ -48,10 +48,15 @@ class RenderedTile:
 
 @dataclass(frozen=True)
 class RenderedDoc:
-    """A rendered document: full-page height plus its ordered tiles."""
+    """A rendered document: full-page height plus its ordered tiles.
+
+    `page_heights` is set only for a sliced PDF (per-page resized heights, in page
+    order) — get_tile replays the same per-page slicing to reverse a global tile_num.
+    """
 
     page_height: int
     tiles: list[RenderedTile]
+    page_heights: list[int] | None = None
 
 
 class TilerService:
@@ -136,30 +141,59 @@ class TilerService:
 
 
     async def _render_pdf(self, blob: bytes) -> RenderedDoc:
-        """Rasterize a PDF to one tile per page, chunked across the CPU pool."""
+        """Rasterize a PDF, chunked across the CPU pool.
+
+        Default: one tile per page. With `pdf_slice` on: each page is sliced into
+        strips (never across pages) and tiles get a contiguous global tile_num in
+        page order; per-page heights are captured so get_tile can reverse-map.
+        """
         s = self.settings
 
         pages = await self.run_cpu(cpu.pdf_page_count, blob)
         if pages <= 0:
             raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
-        
+
         chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.cpu_workers))))
         groups = [list(range(i, min(i + chunk, pages))) for i in range(0, pages, chunk)]
 
+        if not s.pdf_slice:
+            results = await asyncio.gather(
+                *(
+                    self.run_cpu(cpu.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
+                    for g in groups
+                )
+            )
+            tiles = [
+                RenderedTile(tile_num=num, height=h, jpeg=jpeg, image_hash=sha256_hex(jpeg))
+                for group in results
+                for num, h, jpeg in group
+            ]
+            tiles.sort(key=lambda t: t.tile_num)
+
+            return RenderedDoc(page_height=0, tiles=tiles)  # page_height is 0 for PDF
+
         results = await asyncio.gather(
             *(
-                self.run_cpu(cpu.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
+                self.run_cpu(
+                    cpu.render_pdf_page_strips, blob, g, s.pdf_dpi, s.tile_width,
+                    s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height, s.jpeg_quality,
+                )
                 for g in groups
             )
         )
-        tiles = [
-            RenderedTile(tile_num=num, height=h, jpeg=jpeg, image_hash=sha256_hex(jpeg))
-            for group in results
-            for num, h, jpeg in group
-        ]
-        tiles.sort(key=lambda t: t.tile_num)
+        per_page = sorted((p for group in results for p in group), key=lambda x: x[0])
+        page_heights = [ph for _, ph, _ in per_page]
 
-        return RenderedDoc(page_height=0, tiles=tiles)  # page_height is 0 for PDF
+        tiles = []
+        running = 0
+        for _, _, strips in per_page:
+            for offset, sh, jpeg in strips:
+                tiles.append(
+                    RenderedTile(tile_num=running, height=sh, jpeg=jpeg, image_hash=sha256_hex(jpeg))
+                )
+                running += 1
+
+        return RenderedDoc(page_height=0, tiles=tiles, page_heights=page_heights)
 
 
     async def _render_img(self, blob: bytes) -> RenderedDoc:
@@ -323,6 +357,7 @@ class TilerService:
                 metadata=metadata,
                 render_version=self.settings.render_version,
                 tiles=[(t.tile_num, t.height, t.image_hash) for t in rendered.tiles],
+                page_heights=rendered.page_heights,
             )
             await self._invalidate(doc_id)
             metrics.DOCS.set(await self.store.count_docs())
@@ -349,8 +384,17 @@ class TilerService:
     # ------------------------------------------------------------------ #
     # streaming ingest
     # ------------------------------------------------------------------ #
-    async def _render_pdf_stream(self, blob: bytes) -> AsyncIterator[list[RenderedTile]]:
-        """Render a PDF group-by-group, yielding each group's tiles as it finishes."""
+    async def _render_pdf_stream(
+        self, blob: bytes
+    ) -> AsyncIterator[tuple[list[RenderedTile], list[int]]]:
+        """Render a PDF group-by-group, yielding `(tiles, page_heights_delta)`.
+
+        Default (page-per-tile): groups are consumed as they finish — order-independent,
+        since tile_num == page number — and page_heights_delta is empty. With `pdf_slice`
+        on: groups are consumed in page order so strip tile_nums form a contiguous global
+        index, and each group reports its pages' resized heights (in order) so get_tile
+        can reverse-map.
+        """
         s = self.settings
 
         pages = await self.run_cpu(cpu.pdf_page_count, blob)
@@ -360,21 +404,53 @@ class TilerService:
         chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.cpu_workers))))
         groups = [list(range(i, min(i + chunk, pages))) for i in range(0, pages, chunk)]
 
+        if not s.pdf_slice:
+            tasks = [
+                asyncio.ensure_future(
+                    self.run_cpu(cpu.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
+                )
+                for g in groups
+            ]
+            try:
+                for coro in asyncio.as_completed(tasks):
+                    group = await coro
+                    yield (
+                        [
+                            RenderedTile(tile_num=num, height=h, jpeg=jpeg, image_hash=sha256_hex(jpeg))
+                            for num, h, jpeg in group
+                        ],
+                        [],
+                    )
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                raise
+            return
+
+        # Sliced: consume in submission (page) order so strip tile_nums number globally.
         tasks = [
             asyncio.ensure_future(
-                self.run_cpu(cpu.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
+                self.run_cpu(
+                    cpu.render_pdf_page_strips, blob, g, s.pdf_dpi, s.tile_width,
+                    s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height, s.jpeg_quality,
+                )
             )
             for g in groups
         ]
-
+        running = 0
         try:
-            for coro in asyncio.as_completed(tasks):
-                group = await coro
-                yield [
-                    RenderedTile(tile_num=num, height=h, jpeg=jpeg, image_hash=sha256_hex(jpeg))
-                    for num, h, jpeg in group
-                ]
-
+            for task in tasks:
+                group = await task
+                tiles: list[RenderedTile] = []
+                heights: list[int] = []
+                for _, page_height, strips in group:
+                    heights.append(page_height)
+                    for offset, sh, jpeg in strips:
+                        tiles.append(
+                            RenderedTile(tile_num=running, height=sh, jpeg=jpeg, image_hash=sha256_hex(jpeg))
+                        )
+                        running += 1
+                yield (tiles, heights)
         except BaseException:
             for task in tasks:
                 task.cancel()
@@ -462,10 +538,12 @@ class TilerService:
 
             count = 0
             page_height = 0
+            page_heights_acc: list[int] = []
 
             if effective_type == "PDF":
                 started = time.perf_counter()
-                async for group in self._render_pdf_stream(blob):
+                async for group, heights in self._render_pdf_stream(blob):
+                    page_heights_acc.extend(heights)
                     await self.store.append_tiles(
                         doc_id, [(t.tile_num, t.height, t.image_hash) for t in group]
                     )
@@ -489,7 +567,12 @@ class TilerService:
                     count += 1
                     yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg)}
 
-            await self.store.finish_doc(doc_id, tile_count=count, page_height=page_height)
+            await self.store.finish_doc(
+                doc_id,
+                tile_count=count,
+                page_height=page_height,
+                page_heights=page_heights_acc or None,
+            )
             await self._invalidate(doc_id)
             metrics.DOCS.set(await self.store.count_docs())
             metrics.INGESTS.labels(doc_type=effective_type, stored="true", result="rendered").inc()
@@ -744,6 +827,16 @@ class TilerService:
 
         if row.doc_type == "PDF":
             blob = await self._read_blob(row)
+            if row.page_heights:  # sliced PDF: reverse a global strip tile_num
+                layout = slice_doc_strips(
+                    row.page_heights, s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height
+                )
+                page_no, strip = layout[tile_num]
+                _, jpeg = await self.run_cpu(
+                    cpu.crop_pdf_page_strip, blob, page_no, s.pdf_dpi, s.tile_width,
+                    strip.offset, strip.height, s.jpeg_quality,
+                )
+                return jpeg
             out = await self.run_cpu(
                 cpu.render_pdf_pages, blob, [tile_num], s.pdf_dpi, s.tile_width, s.jpeg_quality
             )

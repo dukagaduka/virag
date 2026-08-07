@@ -133,6 +133,97 @@ def render_pdf_pages(
         return out
 
 
+def render_pdf_page_strips(
+    blob: bytes,
+    page_nums: list[int] | None,
+    dpi: int,
+    width: int,
+    tile_height: int,
+    overlap: int,
+    min_tile_height: int,
+    quality: int,
+) -> list[tuple[int, int, list[tuple[int, int, bytes]]]]:
+    """Render pages and slice each into vertical strips (never across pages).
+
+    Returns `[(page_num, page_height, [(offset, strip_height, jpeg), ...])]`, pages in
+    the requested order. The crop box here MUST match `crop_pdf_page_strip` so a
+    regenerated strip is byte-identical to the one hashed at ingest.
+    """
+    try:
+        doc = fitz.open(stream=blob, filetype="pdf")
+    except Exception as exc:
+        raise DecodeError(f"cannot open PDF: {exc}") from exc
+
+    with doc:
+        if doc.needs_pass:
+            raise DecodeError("PDF is password protected")
+
+        pages = list(range(doc.page_count)) if page_nums is None else page_nums
+        out: list[tuple[int, int, list[tuple[int, int, bytes]]]] = []
+
+        for pno in pages:
+            if not 0 <= pno < doc.page_count:
+                raise DecodeError(f"page {pno} is out of range")
+
+            try:
+                pix = doc.load_page(pno).get_pixmap(dpi=dpi, alpha=False)
+            except Exception as exc:
+                raise DecodeError(f"cannot rasterize page {pno}: {exc}") from exc
+
+            img = _fit_width(Image.frombytes("RGB", (pix.width, pix.height), pix.samples), width)
+            page_height = img.height
+
+            strips = [
+                (s.offset, s.height, _to_jpeg(img.crop((0, s.offset, width, s.offset + s.height)), quality))
+                for s in slice_strips(page_height, tile_height, overlap, min_tile_height)
+            ]
+            out.append((pno, page_height, strips))
+
+        return out
+
+
+def crop_pdf_page_strip(
+    blob: bytes,
+    page_num: int,
+    dpi: int,
+    width: int,
+    offset: int,
+    height: int,
+    quality: int,
+) -> tuple[int, bytes]:
+    """Regenerate a single PDF strip: render its page, crop `[offset, offset+height]`.
+
+    The crop box mirrors `render_pdf_page_strips` exactly → byte-identical output.
+    """
+    try:
+        doc = fitz.open(stream=blob, filetype="pdf")
+    except Exception as exc:
+        raise DecodeError(f"cannot open PDF: {exc}") from exc
+
+    with doc:
+        if doc.needs_pass:
+            raise DecodeError("PDF is password protected")
+        if not 0 <= page_num < doc.page_count:
+            raise DecodeError(f"page {page_num} is out of range")
+
+        try:
+            pix = doc.load_page(page_num).get_pixmap(dpi=dpi, alpha=False)
+        except Exception as exc:
+            raise DecodeError(f"cannot rasterize page {page_num}: {exc}") from exc
+
+        img = _fit_width(Image.frombytes("RGB", (pix.width, pix.height), pix.samples), width)
+        top = min(max(offset, 0), img.height)
+        bottom = min(offset + height, img.height)
+
+        if bottom <= top:
+            raise DecodeError(
+                f"strip (page={page_num}, offset={offset}, height={height}) falls outside "
+                f"the rendered page (rendered_height={img.height})"
+            )
+
+        return bottom - top, _to_jpeg(img.crop((0, top, width, bottom)), quality)
+
+
 # --------------------------------------------------------------------------- #
 # Full-page sources: an IMG blob, or a full-page PNG screenshot.
 # --------------------------------------------------------------------------- #

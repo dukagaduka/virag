@@ -22,6 +22,9 @@ them, deploy against a fresh volume and re-ingest.
 | `TILER_TILE_HEIGHT` | `1024` | Max strip height (px). |
 | `TILER_TILE_OVERLAP` | `0` | Overlap between strips. `STEP = HEIGHT − OVERLAP`; `0 ≤ OVERLAP < HEIGHT`. |
 | `TILER_MIN_TILE_HEIGHT` | `28` | Drop final strips shorter than this. |
+| `TILER_PDF_SLICE_ENABLE` | `false` | Slice each PDF page into strips (within page bounds) instead of one tile per page. Off = one tile per page. On (or changing the sizes below) alters `render_version` → corpus re-renders. |
+| `TILER_PDF_TILE_HEIGHT` | `1024` | Strip height (px) for PDF slicing; used only when slicing is on. `0 < HEIGHT`. |
+| `TILER_PDF_TILE_OVERLAP` | `0` | Overlap between PDF strips; `0 ≤ OVERLAP < TILER_PDF_TILE_HEIGHT`. |
 
 ## Pixel tier — folded into `render_version` (soft check)
 

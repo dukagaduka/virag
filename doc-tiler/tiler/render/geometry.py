@@ -43,6 +43,28 @@ def slice_strips(
     return strips
 
 
+def slice_doc_strips(
+    page_heights: list[int], tile_height: int, overlap: int, min_tile_height: int
+) -> list[tuple[int, Strip]]:
+    """Global strip layout for a multi-page document, sliced per page (pages are
+    never stitched: slicing stays within one page's bounds).
+
+    Returns ``[(page_no, Strip(tile_num=<global>, offset, height))]`` with contiguous
+    global tile numbers assigned in page order. Ingest and get_tile both call this
+    with the same ``page_heights`` and params, so the forward and reverse mappings are
+    the same computation by construction — no separate inverse to keep in sync.
+    """
+    out: list[tuple[int, Strip]] = []
+    running = 0
+
+    for page_no, page_height in enumerate(page_heights):
+        for s in slice_strips(page_height, tile_height, overlap, min_tile_height):
+            out.append((page_no, Strip(tile_num=running, offset=s.offset, height=s.height)))
+            running += 1
+
+    return out
+
+
 def strip_for(
     tile_num: int, page_height: int, tile_height: int, overlap: int
 ) -> Strip:

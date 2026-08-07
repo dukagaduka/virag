@@ -5,7 +5,43 @@ from __future__ import annotations
 import base64
 import hashlib
 
-from conftest import make_pdf, pdf_form
+from conftest import base_env, make_pdf, pdf_form, running_app
+
+
+async def test_pdf_sliced_round_trip_identity(tmp_path):
+    """With PDF slicing on, each page yields several strips (contiguous global tile_num)
+    and every regenerated strip is byte-identical to the one hashed at ingest."""
+    pdf = make_pdf(pages=3)
+    env = base_env(
+        tmp_path,
+        TILER_PDF_SLICE_ENABLE="true",
+        TILER_PDF_TILE_HEIGHT="500",
+        TILER_PDF_TILE_OVERLAP="100",
+    )
+    async with running_app(env) as (client, _service):
+        r = await client.post("/tile", **pdf_form(pdf))
+        assert r.status_code == 200, r.text
+        manifest = r.json()
+
+        assert manifest["doc_type"] == "PDF"
+        assert manifest["page_height"] == 0
+        # A4@200dpi → ~1238px tall per page; at height 500/overlap 100 that is several
+        # strips, so slicing must produce strictly more tiles than pages.
+        assert manifest["tile_count"] > 3
+        assert [t["tile_num"] for t in manifest["tiles"]] == list(range(manifest["tile_count"]))
+
+        for tile in manifest["tiles"]:
+            assert tile["width"] == 875
+            assert 0 < tile["height"] <= 500
+            data = base64.b64decode(tile["data"])
+            assert hashlib.sha256(data).hexdigest() == tile["image_hash"]
+
+            got = await client.get(
+                "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+            )
+            assert got.status_code == 200, got.text
+            # reverse mapping reproduces the exact bytes hashed at ingest
+            assert hashlib.sha256(got.content).hexdigest() == tile["image_hash"]
 
 
 async def test_pdf_ingest_round_trip_identity(client, sample_pdf):

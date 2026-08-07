@@ -6,7 +6,41 @@ import base64
 import hashlib
 import json
 
-from conftest import pdf_form
+from conftest import base_env, pdf_form, running_app, make_pdf
+
+
+async def test_stream_sliced_round_trip(tmp_path):
+    """Streaming ingest with PDF slicing: strips stream with a contiguous global
+    tile_num (consumed in page order) and each regenerates byte-identically."""
+    pdf = make_pdf(pages=4)
+    env = base_env(
+        tmp_path,
+        TILER_PDF_SLICE_ENABLE="true",
+        TILER_PDF_TILE_HEIGHT="500",
+        TILER_PDF_TILE_OVERLAP="100",
+    )
+    async with running_app(env) as (client, _service):
+        r = await client.post("/tile/stream", **pdf_form(pdf))
+        assert r.status_code == 200, r.text
+        events = _events(r.content)
+
+        tiles = [e for e in events if e["event"] == "tile"]
+        committed = [e for e in events if e["event"] == "committed"]
+        assert len(committed) == 1
+        assert committed[0]["tile_count"] == len(tiles)
+        assert len(tiles) > 4  # slicing → more strips than pages
+
+        # tile_num is a contiguous global index in emission (page) order
+        assert [t["tile_num"] for t in tiles] == list(range(len(tiles)))
+
+        for t in tiles:
+            data = base64.b64decode(t["data"])
+            assert hashlib.sha256(data).hexdigest() == t["image_hash"]
+            got = await client.get(
+                "/get_tile", params={"doc_id": committed[0]["doc_id"], "tile_num": t["tile_num"]}
+            )
+            assert got.status_code == 200, got.text
+            assert hashlib.sha256(got.content).hexdigest() == t["image_hash"]
 
 
 def _events(body: bytes) -> list[dict]:

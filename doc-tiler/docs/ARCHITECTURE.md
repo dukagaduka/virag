@@ -207,11 +207,21 @@ this is pinned by a property test over random `H`. `page_height = H` stored.
 A page shorter than `MIN` yields **zero tiles** (the only strip is a sliver, and
 slivers are dropped); such a doc is stored with `tile_count = 0`.
 
-### 5.2 PDF — one tile per page
+### 5.2 PDF — one tile per page (default), or sliced (opt-in)
 
 Raster page `p` at `TILER_PDF_DPI` → `(w0, h0)` → proportional resize to width `W`
-(`new_h = round(h0 * W / w0)`, LANCZOS). `tile_num = p`, `height = new_h`, no slicing.
-`tile_count = pages`, `page_height = 0`.
+(`new_h = round(h0 * W / w0)`, LANCZOS).
+
+**Default (`TILER_PDF_SLICE_ENABLE=false`):** `tile_num = p`, `height = new_h`, no
+slicing. `tile_count = pages`, `page_height = 0`.
+
+**Sliced (`TILER_PDF_SLICE_ENABLE=true`):** each resized page is sliced into strips of
+`TILER_PDF_TILE_HEIGHT` (overlap `TILER_PDF_TILE_OVERLAP`) with the same `slice_strips`
+geometry as IMG/Web — **strictly within a page, never across pages**. Strips get a
+contiguous global `tile_num` in page order; the per-page resized heights are stored
+(`docs.page_heights`) so `get_tile` replays `slice_doc_strips(page_heights, …)` to
+reverse a `tile_num` back to `(page, offset, height)`. `page_height = 0` still (heights
+are per page now). The PDF slicing sizes join `render_version` only while slicing is on.
 
 ### 5.3 IMG
 

@@ -45,6 +45,7 @@ DDL = (
         blob_rel_path  TEXT NOT NULL,
         source_url     TEXT,
         page_height    INTEGER NOT NULL,
+        page_heights   TEXT,
         tile_count     INTEGER NOT NULL,
         mime_type      TEXT NOT NULL,
         metadata       TEXT,
@@ -108,11 +109,14 @@ class DocRow:
     created_at: int
     updated_at: int
     complete: bool = True
+    page_heights: list[int] | None = None
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> "DocRow":
-        """Build a DocRow from a SQLite row, decoding the metadata JSON."""
+        """Build a DocRow from a SQLite row, decoding the metadata and page-heights JSON."""
         raw = row["metadata"]
+        keys = row.keys()
+        raw_ph = row["page_heights"] if "page_heights" in keys else None
         return cls(
             doc_id=row["doc_id"],
             doc_type=row["doc_type"],
@@ -126,6 +130,7 @@ class DocRow:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             complete=bool(row["complete"]),
+            page_heights=json.loads(raw_ph) if raw_ph else None,
         )
 
 
@@ -207,8 +212,8 @@ def build_search_query(
         params.extend([created_at, created_at, doc_id])
 
     sql = (
-        "SELECT doc_id, doc_type, blob_rel_path, source_url, page_height, tile_count, "
-        "mime_type, metadata, render_version, complete, created_at, updated_at FROM docs"
+        "SELECT doc_id, doc_type, blob_rel_path, source_url, page_height, page_heights, "
+        "tile_count, mime_type, metadata, render_version, complete, created_at, updated_at FROM docs"
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -275,6 +280,10 @@ class MetaStore:
                 await self.db.execute(
                     "ALTER TABLE docs ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
                 )
+            # Migrate volumes created before PDF strip slicing: page_heights backfills to
+            # NULL, i.e. "not sliced" — get_tile then falls back to page-per-tile PDF.
+            if "page_heights" not in doc_columns:
+                await self.db.execute("ALTER TABLE docs ADD COLUMN page_heights TEXT")
             await self.db.commit()
 
     async def create_metadata_indexes(self, statements: Iterable[str]) -> list[str]:
@@ -402,24 +411,27 @@ class MetaStore:
         metadata: dict[str, Any] | None,
         render_version: str,
         tiles: Sequence[tuple[int, int, str]],
+        page_heights: list[int] | None = None,
     ) -> DocRow:
         """Single transaction: upsert the doc row and replace its tile rows."""
         now = int(time.time())
         meta_json = json.dumps(metadata, sort_keys=True) if metadata else None
+        page_heights_json = json.dumps(page_heights) if page_heights else None
         async with self._lock:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 await self.db.execute(
                     """
                     INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, page_height,
-                                      tile_count, mime_type, metadata, render_version, complete,
-                                      created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,1,?,?)
+                                      page_heights, tile_count, mime_type, metadata, render_version,
+                                      complete, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)
                     ON CONFLICT(doc_id) DO UPDATE SET
                         doc_type=excluded.doc_type,
                         blob_rel_path=excluded.blob_rel_path,
                         source_url=COALESCE(excluded.source_url, docs.source_url),
                         page_height=excluded.page_height,
+                        page_heights=excluded.page_heights,
                         tile_count=excluded.tile_count,
                         mime_type=excluded.mime_type,
                         metadata=COALESCE(excluded.metadata, docs.metadata),
@@ -433,6 +445,7 @@ class MetaStore:
                         blob_rel_path,
                         source_url,
                         page_height,
+                        page_heights_json,
                         tile_count,
                         mime_type,
                         meta_json,
@@ -529,13 +542,26 @@ class MetaStore:
             await self.db.commit()
 
 
-    async def finish_doc(self, doc_id: str, *, tile_count: int, page_height: int) -> None:
+    async def finish_doc(
+        self,
+        doc_id: str,
+        *,
+        tile_count: int,
+        page_height: int,
+        page_heights: list[int] | None = None,
+    ) -> None:
         """Close a streaming ingest: fix the final counts and flip the doc to complete."""
         async with self._lock:
             await self.db.execute(
-                "UPDATE docs SET tile_count = ?, page_height = ?, complete = 1, updated_at = ? "
-                "WHERE doc_id = ?",
-                (tile_count, page_height, int(time.time()), doc_id),
+                "UPDATE docs SET tile_count = ?, page_height = ?, page_heights = ?, "
+                "complete = 1, updated_at = ? WHERE doc_id = ?",
+                (
+                    tile_count,
+                    page_height,
+                    json.dumps(page_heights) if page_heights else None,
+                    int(time.time()),
+                    doc_id,
+                ),
             )
             await self.db.commit()
 
