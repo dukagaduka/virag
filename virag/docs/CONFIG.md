@@ -31,6 +31,18 @@ them per request (see [API.md](API.md)).
 | `VIRAG_SCORE_THRESHOLD` | no | *(none)* | Minimum Qdrant score; empty/unset = no threshold. Must parse as a float. |
 | `VIRAG_FRAMING_TEXT` | no | built-in prompt | Text prepended to retrieved tiles. Empty falls back to the built-in default ("The following image tiles are retrieved document context. Use them to answer the question."). |
 
+## Reconcile (enroll self-repair)
+
+virag keeps Qdrant a consistent subset of the tiler by reconciling at startup and on an
+interval — repairing partial/orphaned enrolls and propagating tiler deletes. See
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `VIRAG_SELF_HEAL` | no | `true` | On reconcile, re-embed a stale-pending doc from the tiler when the tiler doc is complete (else just drop its partial points and leave it for re-enroll). |
+| `VIRAG_RECONCILE_INTERVAL_SEC` | no | `300` | Seconds between periodic reconcile passes (≥ 0). `0` disables the loop — the one-shot startup pass still runs. |
+| `VIRAG_PENDING_TTL_SEC` | no | `3600` | A pending enroll older than this is treated as crashed/partial (≥ 1). Must exceed the longest enroll, or an in-flight enroll could be swept. |
+
 ## Qdrant
 
 | Variable | Required | Default | Meaning |
@@ -39,6 +51,12 @@ them per request (see [API.md](API.md)).
 | `QDRANT_COLLECTION_NAME` | no | `store-collection` | Collection to enroll into / query. |
 | `QDRANT_VECTOR_SIZE` | **yes** | — | Embedding dimensionality (≥ 1). Must match the embedding model. |
 | `QDRANT_DISTANCE_TYPE` | no | `Cosine` | One of `Cosine`, `Dot`, `Euclid`, `Manhattan`. |
+| `QDRANT_CHUNK_SIZE` | no | `24` | Per-upsert request body budget, in **megabytes** (≥ 1). `upsert` splits into sub-batches so no single request exceeds this; keep it under Qdrant's ~32 MB body limit. |
+| `QDRANT_MAX_BATCH_CHUNKS` | no | `1024` | Hard cap on points per upsert request (≥ 1), applied on top of the byte budget. |
+
+The configured `QDRANT_COLLECTION_NAME` is the name of a stable serving **alias**; virag
+serves through it while the physical collection it points to is versioned (`__v1`, `__v2`,
+…) so a `/revision` can blue-green swap it. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Embeddings (vLLM, OpenAI-compatible)
 

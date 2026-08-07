@@ -22,7 +22,7 @@ All metric names are prefixed `tiler_`.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `tiler_ingest_total` | counter | `doc_type`, `stored`, `result` | Ingest requests. `result` distinguishes success from error; `stored` reflects the `store` flag. |
-| `tiler_renders_total` | counter | `doc_type`, `path` | Document renders **actually performed**. A cache hit or an idempotency hit does **not** increment this — it is the anchor for the idempotency tests. `path` is `ingest` vs `get_tile`. |
+| `tiler_renders_total` | counter | `doc_type`, `path` | Document renders **actually performed**. A cache hit or an idempotency hit does **not** increment this — it is the anchor for the idempotency tests. `path` ∈ {`ingest` (both `POST /tile` and the `POST /tile/stream` ingest path), `get_tile`, `revise` (the `POST /revision` re-render path)}. |
 | `tiler_tiles_total` | counter | `doc_type`, `path` | Tiles produced. |
 | `tiler_render_seconds` | histogram | `doc_type`, `path` | Wall time of a full document render. Buckets: `0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120` s. |
 

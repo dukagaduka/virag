@@ -48,6 +48,45 @@ curl -s -X POST 'localhost:8080/tile?include_bytes=false' \
 > Base64 adds ~33% overhead; JSON+base64 is the canonical contract. A
 > `multipart/mixed` variant may be offered later via `Accept`.
 
+### `POST /tile/stream` — streaming ingest (NDJSON)
+
+Same form fields as `POST /tile` (`doc_type`, `document`, `url`, `metadata`) and the same
+`force` query flag — but **no `store` / `include_bytes`**: it always stores and always
+includes tile bytes. Instead of one manifest it returns `application/x-ndjson`
+(newline-delimited JSON), one event object per line, streamed as tiles render:
+
+- `{"event":"begin","doc_id","doc_type","source_url","render_version"}` — emitted first,
+  so a client can build point ids before any tile arrives.
+- `{"event":"tile","tile_num","width","height","image_hash","data"}` — one per tile;
+  `data` is base64 JPEG. For PDFs, tiles stream **group-by-group** as each group finishes
+  rendering, so their order is **not guaranteed monotonic**.
+- `{"event":"committed","doc_id","doc_type","source_url","render_version","page_height","tile_count"}`
+  — terminal **success** event.
+- `{"event":"error","code","message"}` — terminal **failure** event.
+
+The doc is persisted **incrementally**: it stays incomplete (`complete=0`, see below)
+until the final tile, then flips to complete and `committed` is emitted. Pre-flight errors
+(unknown `doc_type` → `400`, oversize → `413`, media mismatch → `415`) are returned as
+normal HTTP errors **before** the stream begins. Once the `200` stream has started, any
+failure is reported as an in-stream `error` event (the HTTP status is already `200`) — the
+**absence of a `committed` event** is the client's signal that the ingest did not complete.
+A stream that dies mid-way leaves a swept-able partial doc, never a servable half-doc.
+Idempotent like `/tile`: identical bytes of an already-**complete** doc replay the stored
+tiles as the same event stream without re-rendering (unless `force`).
+
+`POST /tile` (the single-manifest form above) is unchanged and remains available.
+
+### `POST /revision` — re-render stored docs in place
+
+Re-renders, from their stored original blobs, every stored doc whose `render_version`
+differs from the tiler's current one (or **all** docs when `force=true`), plus any doc
+left incomplete. Tiles are **atomically replaced in place** (`doc_id` is stable); after
+it, `/get_tile` reproduces at the current `render_version`. It does **not** touch any
+downstream (e.g. Qdrant) — it is only the tiler half of a revision.
+
+- Query flag: `force` (default `false`).
+- Response JSON: `{"revised":int,"skipped":int,"failed":[doc_id...],"render_version":string}`.
+
 ### `GET /get_tile?doc_id=&tile_num=&verify=` — regenerate one tile
 
 Deterministically regenerates a single tile from the stored original and returns
@@ -95,7 +134,8 @@ Body: `{filters?, limit, cursor}`.
   naming it. There is no fallback scan.
 - **No filters / omitted** → list all documents, newest first.
 - Cursor pagination on `(created_at, doc_id)`; response `{items: DocSummary[],
-  next_cursor}`.
+  next_cursor}`. Each `DocSummary` carries `complete` (bool — `false` while a streaming
+  ingest is still in flight or crashed) and `render_version` alongside the usual fields.
 
 ```bash
 curl -s -X POST localhost:8080/docs/search -H 'content-type: application/json' \
@@ -124,7 +164,7 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 |---|---|
 | `400` | Unknown `doc_type`, `tile_num` out of range, undeclared filter key, unsupported op, numeric op on a text field, bad cursor. |
 | `403` | SSRF policy block. |
-| `404` | Unknown `doc_id` (including `store=false` docs). |
+| `404` | Unknown `doc_id` (including `store=false` docs); `GET /get_tile` on an incomplete doc (`DOC_INCOMPLETE`). |
 | `405` | `DELETE` with `TILER_ALLOW_DELETE=false`. |
 | `409` | `image_hash` mismatch under `strict` policy. |
 | `413` | Upload exceeds `TILER_MAX_DOC_BYTES`. |

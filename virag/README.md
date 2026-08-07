@@ -43,7 +43,7 @@ Interactive API docs (live OpenAPI): <http://localhost:48000/docs>.
 
 | Doc | What's in it |
 |---|---|
-| [docs/API.md](docs/API.md) | The `/v1/chat/completions` `rag` trigger, `/enroll`, proxy routes, ops, error envelope. |
+| [docs/API.md](docs/API.md) | The `/v1/chat/completions` `rag` trigger, `/enroll`, `/revision`, proxy routes, ops, error envelope. |
 | [docs/CONFIG.md](docs/CONFIG.md) | Every environment variable, required vs default, with validation. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Routing, the retrieval pipeline, sources, clients, startup & binding. |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | The full-stack Compose (virag + tiler + Qdrant + vLLM), image, health & observability. |
@@ -68,14 +68,15 @@ are spliced into a streaming response.
 
 ```
 virag/
-  main.py            app, lifespan (clients, fatal dependency checks, binding), router order
+  main.py            app, lifespan (clients, fatal dependency checks, binding, reconcile), router order
   settings.py        Settings.from_env() — every env var and its validation
-  binding.py         the TILER_DB_SECRET triple-binding + doc_id overlap warning
+  binding.py         the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
+  reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic) and /revision re-embed
   errors.py          ApiError + the uniform {"error": {...}} envelope
-  api/               chat_completions, enroll, proxy, ops
+  api/               chat_completions, enroll, revision, proxy, ops
   clients/           embeddings_client, qdrant_store, tiler_client, vlm_client
 docs/                documentation (see the table above)
-deploy/              docker-compose.yaml + .env.example + vLLM serve script
+deploy/              docker-compose.yaml + .env.example + tiler metadata schema + vLLM serve script
 ```
 
 ## Development

@@ -6,9 +6,9 @@ single tile on demand from the stored original. Tiles are never persisted — th
 blob plus deterministic rendering is the source of truth. It also keeps
 operator-declared metadata with fast indexed search.
 
-**Scope:** ingest, blob storage, deterministic tiling, tile regeneration, original
-download, metadata search. **Not** in scope: embedding, the vector DB, retrieval, the
-LLM/VLM reader, the RAG gateway. The `(doc_id, tile_num)` pair returned with every tile
+**Scope:** ingest (one-shot or streaming), blob storage, deterministic tiling, tile
+regeneration, in-place re-render (revision), original download, metadata search. **Not**
+in scope: embedding, the vector DB, retrieval, the LLM/VLM reader, the RAG gateway. The `(doc_id, tile_num)` pair returned with every tile
 is the contract the embedding stage stores as its payload to later call `/get_tile`.
 
 ---

@@ -39,9 +39,12 @@ agree across all three:
   collection/volume. "No secret" is a deliberate posture, not a default to silently
   upgrade.
 
-There is also a best-effort **overlap check** at startup: virag samples a few enrolled
-`doc_id`s from Qdrant and warns if the tiler doesn't have them — an early signal that
-the two stores have drifted apart. It never blocks startup.
+virag also enforces the **`Qdrant ⊆ Tiler` invariant**: every Qdrant point is backed by
+a tiler tile. Reconcile (at startup and on an interval) deletes any Qdrant `doc_id` the
+tiler no longer has, so a query never returns a hit whose tile the tiler can't
+regenerate — and the integrity check below guarantees the bytes still match. (This
+replaces the older best-effort `doc_id` overlap warning.) See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the reconcile passes.
 
 ## 2. Tile-integrity check
 

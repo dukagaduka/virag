@@ -18,6 +18,7 @@ from virag.api import enroll as enroll_api
 from virag.api import chat_completions as chat_completions_api
 from virag.api import proxy as proxy_api
 from virag.api import ops as ops_api
+from virag.api import revision as revision_api
 
 
 log = logging.getLogger("virag")
@@ -121,6 +122,7 @@ def create_app() -> FastAPI:
 
     app.include_router(ops_api.router, tags=["ops"])
     app.include_router(enroll_api.router, tags=["enroll"])
+    app.include_router(revision_api.router, tags=["revision"])
     app.include_router(chat_completions_api.router, tags=["v1"])
     app.include_router(proxy_api.router, tags=["proxy"])
 

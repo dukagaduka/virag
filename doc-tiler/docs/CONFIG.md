@@ -65,6 +65,17 @@ Pillow and PyMuPDF versions are also folded into `render_version`.)
 | `TILER_URL_FETCH_ENABLED` | `true` | Allow `URL` input type. |
 | `TILER_URL_ALLOW_PRIVATE` | `false` | If `false`, SSRF-block private targets (see [SECURITY.md](SECURITY.md)). |
 
+## Incomplete-ingest sweeper
+
+A streaming ingest (`POST /tile/stream`) persists a doc incrementally and leaves it
+incomplete (`complete=0`) if it crashes mid-stream. This background task reclaims that
+storage. See [ARCHITECTURE.md](ARCHITECTURE.md) ("Incomplete-ingest sweeper").
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TILER_INCOMPLETE_TTL_SEC` | `0` | Delete incomplete docs older than this many seconds. `0` disables the sweeper. **Must exceed the longest render** so an in-flight ingest is never reaped (an active ingest is also excluded in memory). |
+| `TILER_SWEEP_INTERVAL_SEC` | `300` | How often (seconds) the sweeper runs. |
+
 ## State (inside the container / named volume)
 
 | Variable | Default | Meaning |

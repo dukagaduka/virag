@@ -17,8 +17,9 @@ tiles** for a pixel-based (screenshot) RAG embedder, and can **regenerate any si
 tile on demand** from the stored original. It also maintains **operator-declared
 metadata** with fast indexed search so a human can tell what is in the store.
 
-**In scope:** ingest, blob storage, deterministic tiling, tile regeneration, original
-download, metadata (declared-schema fast search), doc listing.
+**In scope:** ingest (one-shot or streaming), blob storage, deterministic tiling, tile
+regeneration, in-place re-render (revision), original download, metadata (declared-schema
+fast search), doc listing.
 
 **Out of scope:** embedding, Qdrant / vector search, retrieval, the LLM/VLM reader,
 the RAG gateway. The Tiler only produces and serves image bytes + identifiers +
@@ -132,6 +133,7 @@ CREATE TABLE IF NOT EXISTS docs (
     mime_type      TEXT NOT NULL,
     metadata       TEXT,                 -- raw JSON object (single source of truth); NULL if none
     render_version TEXT NOT NULL,        -- stamp (informational; geometry uniform by the startup guard)
+    complete       INTEGER NOT NULL DEFAULT 1,  -- 0 while a streaming ingest is mid-flight; see §9
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL
 );
@@ -152,6 +154,12 @@ Metadata is **not a table** — it lives in `docs.metadata` as JSON and is made
 searchable by expression indexes created at startup, one per declared field (see
 "Metadata: declared schema + expression indexes").
 `tiles.width` is not stored (always `TILER_TILE_WIDTH`).
+
+The `complete` column **auto-migrates** on existing volumes: an `ALTER TABLE docs ADD
+COLUMN complete INTEGER NOT NULL DEFAULT 1` runs at startup, and pre-existing rows
+backfill to `complete=1` (they were written atomically). A non-streaming `POST /tile`
+always writes `complete=1` (atomic full write); a streaming ingest writes the row
+`complete=0` and flips it on the final tile (see §9).
 
 Everything storage-related sits behind `BlobStore` / `MetaStore` interfaces, keeping
 the FS→S3 and SQLite→Postgres swaps to a driver change.
@@ -367,6 +375,39 @@ content rasterizes. Ingest and regeneration call the *same* functions in
   traceability, not identity.
 - `DELETE /doc/{doc_id}` (optional, flag-guarded by `TILER_ALLOW_DELETE`):
   cascade-delete rows + unlink blob.
+
+### Incomplete-doc lifecycle (streaming ingest)
+
+`POST /tile/stream` (see [API.md](API.md)) persists a doc **incrementally**: it writes the
+`docs` row as `complete=0`, appends `tiles` rows as they render, and flips the row to
+`complete=1` on the final tile. `POST /tile` (non-streaming) always writes `complete=1`
+(one atomic full write).
+
+- An **incomplete (`complete=0`) doc is not servable**: `GET /get_tile` on it returns
+  `404` with error code `DOC_INCOMPLETE`.
+- The **idempotency short-circuit only fires for complete docs** — an incomplete (crashed
+  or in-flight) doc is re-rendered rather than replayed. So a stream that dies mid-way
+  leaves a swept-able partial, never a servable half-doc.
+- `DocSummary` (search results) exposes `complete` and `render_version` so an operator can
+  see partials.
+
+### Incomplete-ingest sweeper (background)
+
+A background task (started in `lifespan`, interval `TILER_SWEEP_INTERVAL_SEC`) periodically
+deletes incomplete (`complete=0`) docs older than `TILER_INCOMPLETE_TTL_SEC`, **excluding
+any ingest currently in flight** (tracked in memory). Deletion is whole-doc (blob + rows).
+This reclaims storage from crashed/abandoned streaming ingests; because an incomplete doc
+was never fully enrolled downstream, reaping it is safe. The TTL defaults to `0` (disabled)
+and **must exceed the longest render** so an active render is never reaped.
+
+### Revision (re-render in place)
+
+`POST /revision` re-renders, from their stored original blobs, every doc whose stored
+`render_version` differs from the current one (or all docs with `force=true`), plus any
+incomplete doc. Tiles are replaced atomically in place — `doc_id` is stable — so after a
+pixel-tier change `get_tile` reproduces at the current `render_version`. It touches only
+the tiler's own tiles, never any downstream (Qdrant); the `/revision` render path is
+counted under `path="revise"` in the metrics.
 
 ---
 

@@ -67,6 +67,87 @@ paths:
         '502': { $ref: '#/components/responses/BadGateway' }
         '504': { $ref: '#/components/responses/GatewayTimeout' }
 
+  /tile/stream:
+    post:
+      operationId: ingestDocumentStream
+      summary: Ingest a document and stream its tiles as NDJSON, then a `committed` event.
+      description: >
+        Same form fields as /tile, but always stores and always includes tile bytes
+        (no store/include_bytes params). The response is newline-delimited JSON
+        (application/x-ndjson), one event object per line, streamed as tiles render: a
+        `begin` event first (identity, so a client can build point ids before tiles
+        arrive), a `tile` event per tile (for PDFs, streamed group-by-group as each group
+        finishes — order is not guaranteed monotonic), then a terminal `committed` event
+        on success. The doc is persisted incrementally and stays incomplete until the
+        final tile; a stream that dies mid-way leaves a swept-able partial, never a
+        servable half-doc. Pre-flight errors (unknown doc_type 400, oversize 413, media
+        mismatch 415) are normal HTTP errors returned before streaming begins; once the
+        200 stream has started, any failure is reported as an in-stream `error` event and
+        the absence of a `committed` event is the client's signal that ingest did not
+        complete. Identical bytes of an already-complete doc replay the stored tiles as
+        the same event stream without re-rendering (unless force).
+      parameters:
+        - { name: force, in: query, required: false, schema: { type: boolean, default: false }, description: Re-render even if this doc_id already exists (skip the idempotency replay). }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [doc_type]
+              properties:
+                doc_type: { $ref: '#/components/schemas/DocType' }
+                document:
+                  type: string
+                  format: binary
+                  description: Raw document bytes. Required unless doc_type=URL.
+                url:
+                  type: string
+                  format: uri
+                  description: Source URL. Required iff doc_type=URL.
+                metadata:
+                  type: string
+                  description: >
+                    JSON object serialized as a string. Declared keys (see
+                    /schema/metadata) become searchable; other keys are stored but not
+                    searchable.
+            encoding:
+              document: { contentType: application/octet-stream }
+      responses:
+        '200':
+          description: >
+            The tiling event stream (newline-delimited JSON). Each line is one
+            StreamEvent object. A terminal `committed` event means success; a terminal
+            `error` event (or a stream that ends without `committed`) means the ingest
+            did not complete.
+          content:
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/StreamEvent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMedia' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /revision:
+    post:
+      operationId: reviseDocuments
+      summary: Re-render stored docs whose render_version is stale (or all, with force).
+      description: >
+        Re-renders, from their stored original blobs, every stored doc whose
+        render_version differs from the tiler's current one (or all docs when force=true),
+        plus any doc left incomplete. Tiles are atomically replaced in place (doc_id is
+        stable), so after it get_tile reproduces at the current render_version. This is
+        the tiler half of a revision only — it does not touch any downstream (e.g. Qdrant).
+      parameters:
+        - { name: force, in: query, required: false, schema: { type: boolean, default: false }, description: Re-render every stored doc, not just stale/incomplete ones. }
+      responses:
+        '200':
+          description: Revision summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RevisionResult' }
+
   /get_tile:
     get:
       operationId: getTile
@@ -294,12 +375,85 @@ components:
       type: object
       required: [doc_id, doc_type, tile_count, created_at]
       properties:
-        doc_id:     { type: string }
-        doc_type:   { $ref: '#/components/schemas/StoredDocType' }
-        tile_count: { type: integer }
-        created_at: { type: integer, description: Unix epoch seconds. }
-        source_url: { type: [string, "null"], format: uri }
-        metadata:   { $ref: '#/components/schemas/MetadataObject' }
+        doc_id:         { type: string }
+        doc_type:       { $ref: '#/components/schemas/StoredDocType' }
+        tile_count:     { type: integer }
+        complete:       { type: boolean, default: true, description: False while a streaming ingest is still in flight (or crashed); such a doc is not servable via /get_tile. }
+        render_version: { type: [string, "null"], description: The render_version stamped on the doc at ingest. }
+        created_at:     { type: integer, description: Unix epoch seconds. }
+        source_url:     { type: [string, "null"], format: uri }
+        metadata:       { $ref: '#/components/schemas/MetadataObject' }
+
+    StreamEvent:
+      description: >
+        One line of the /tile/stream NDJSON response. The `event` field discriminates:
+        `begin` (identity, emitted first), `tile` (one per tile; data is base64 JPEG),
+        `committed` (terminal success), `error` (terminal failure).
+      oneOf:
+        - $ref: '#/components/schemas/StreamBegin'
+        - $ref: '#/components/schemas/StreamTile'
+        - $ref: '#/components/schemas/StreamCommitted'
+        - $ref: '#/components/schemas/StreamError'
+      discriminator:
+        propertyName: event
+        mapping:
+          begin:     '#/components/schemas/StreamBegin'
+          tile:      '#/components/schemas/StreamTile'
+          committed: '#/components/schemas/StreamCommitted'
+          error:     '#/components/schemas/StreamError'
+
+    StreamBegin:
+      type: object
+      required: [event, doc_id, doc_type, render_version]
+      properties:
+        event:          { type: string, enum: [begin] }
+        doc_id:         { type: string, description: sha256(blob) hex. }
+        doc_type:       { $ref: '#/components/schemas/StoredDocType' }
+        source_url:     { type: [string, "null"], format: uri }
+        render_version: { type: string }
+
+    StreamTile:
+      type: object
+      required: [event, tile_num, width, height, image_hash, data]
+      properties:
+        event:      { type: string, enum: [tile] }
+        tile_num:   { type: integer, minimum: 0 }
+        width:      { type: integer, description: Always TILE_WIDTH (875). }
+        height:     { type: integer, description: Actual tile height in px. }
+        image_hash: { type: string, description: sha256 of the JPEG bytes. }
+        data:       { type: string, format: byte, description: Base64 JPEG bytes (always present on the stream). }
+
+    StreamCommitted:
+      type: object
+      required: [event, doc_id, doc_type, render_version, page_height, tile_count]
+      properties:
+        event:          { type: string, enum: [committed] }
+        doc_id:         { type: string }
+        doc_type:       { $ref: '#/components/schemas/StoredDocType' }
+        source_url:     { type: [string, "null"], format: uri }
+        render_version: { type: string }
+        page_height:    { type: integer, description: Full-page height for web/mhtml/img; 0 for PDF. }
+        tile_count:     { type: integer }
+
+    StreamError:
+      type: object
+      required: [event, code, message]
+      properties:
+        event:   { type: string, enum: [error] }
+        code:    { type: string, description: Machine-readable error code (see Error). }
+        message: { type: string }
+
+    RevisionResult:
+      type: object
+      required: [revised, skipped, failed, render_version]
+      properties:
+        revised:        { type: integer, description: Docs re-rendered. }
+        skipped:        { type: integer, description: Docs already at the current render_version (force=false). }
+        failed:
+          type: array
+          items: { type: string }
+          description: doc_ids whose re-render failed.
+        render_version: { type: string, description: The current render_version tiles were reproduced at. }
 
     DocList:
       type: object
@@ -378,7 +532,7 @@ components:
                 Machine-readable error code. Non-exhaustive vocabulary:
                 UNKNOWN_DOC_TYPE, AMBIGUOUS_INPUT, MISSING_URL, MISSING_FILE,
                 PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA, SSRF_BLOCKED, UNKNOWN_DOC,
-                MISSING_BLOB, UNKNOWN_TILE, TILE_OUT_OF_RANGE, RANGE_NOT_SATISFIABLE,
+                DOC_INCOMPLETE, MISSING_BLOB, UNKNOWN_TILE, TILE_OUT_OF_RANGE, RANGE_NOT_SATISFIABLE,
                 DELETE_DISABLED, UNDECLARED_FILTER_KEY, INVALID_METADATA_JSON,
                 METADATA_SCHEMA_VIOLATION, RENDER_MISMATCH, DECODE_FAILED,
                 EMPTY_DOCUMENT, BROWSER_UNAVAILABLE, RENDER_TIMEOUT, UPSTREAM_FAILURE,

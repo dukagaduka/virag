@@ -21,7 +21,7 @@ The stack (`deploy/docker-compose.yaml`) is four services on one bridge network:
 | Service | Role | Notes |
 |---|---|---|
 | `virag` | the gateway | built from this repo; waits for its backends to be healthy. |
-| `tiler-virag` | doc-tiler | built from `../../doc-tiler`; mounts the metadata schema. |
+| `tiler-virag` | doc-tiler | built from `../../doc-tiler`; mounts `tiler_metadata_schema.yaml` (see below). |
 | `qdrant-virag` | Qdrant | vector store. |
 | `embeddings-vllm-virag` | vLLM embeddings | GPU (`runtime: nvidia`); runs `serve_vllm_embeddings.sh`. |
 
@@ -33,7 +33,9 @@ load and retries until its dependency checks pass.
 
 Two layers of variables live in `.env` (from [`.env.example`](../deploy/.env.example)):
 
-- **Application settings** read by virag at startup — `VIRAG_*`, `QDRANT_*`,
+- **Application settings** read by virag at startup — `VIRAG_*` (including the reconcile
+  knobs `VIRAG_SELF_HEAL` / `VIRAG_RECONCILE_INTERVAL_SEC` / `VIRAG_PENDING_TTL_SEC`),
+  `QDRANT_*` (including the upsert-batching `QDRANT_CHUNK_SIZE` / `QDRANT_MAX_BATCH_CHUNKS`),
   `EMBEDDINGS_*`/`VLLM_*`, `TILER_*`, `VLM_*`, `TILER_DB_SECRET`. See
   [CONFIG.md](CONFIG.md). Required: `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`,
   `VLM_MODEL_NAME`.
@@ -45,6 +47,16 @@ Two layers of variables live in `.env` (from [`.env.example`](../deploy/.env.exa
 Set `TILER_DB_SECRET` to the **same** value it has on the tiler and (implicitly) the
 Qdrant collection — one secret, three consumers — *before* first boot. See
 [SECURITY.md](SECURITY.md).
+
+## Tiler metadata schema
+
+virag stamps enroll-lifecycle markers on the tiler's indexed metadata and reconcile
+searches them, so the tiler must declare **three** indexed fields:
+`name` (text), `virag_started_at` (number), and `virag_enrolled_at` (number). The Compose
+file mounts `deploy/tiler_metadata_schema.yaml` into the tiler at
+`/config/metadata_schema.yaml` for exactly this. At startup virag reads the tiler's
+`GET /schema/metadata` and **refuses to boot** (fatal) if any of the three is missing or
+wrong-typed — so keep this schema in sync with the tiler.
 
 ## Image
 
@@ -75,8 +87,8 @@ backends), so scale horizontally with more containers behind a load balancer if 
   metrics endpoint; operational visibility is the log stream. Notable lines: the
   `ready: …` summary at startup (all backends + `render_version`), per-request `rag
   query` / `rag retrieved` / `rag injected` counts, `integrity:` warnings when a tile's
-  hash doesn't match its Qdrant payload, and `doc_id overlap` warnings when Qdrant and
-  the tiler look out of sync.
+  hash doesn't match its Qdrant payload, and `reconcile:` lines when a pass deletes
+  dangling Qdrant points, clears stale-pending enrolls, or self-heals a doc.
 
 ## Startup ordering & the embeddings model
 

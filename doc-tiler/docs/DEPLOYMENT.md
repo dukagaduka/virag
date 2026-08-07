@@ -87,6 +87,13 @@ with a different geometry — or a different `TILER_DB_SECRET` — is a fatal st
 (see [ARCHITECTURE.md](ARCHITECTURE.md) and [SECURITY.md](SECURITY.md)). To change
 either, deploy against a fresh volume and re-ingest.
 
+**Reclaiming crashed streaming ingests.** `POST /tile/stream` persists a doc incrementally
+and leaves it incomplete if the stream dies. Set `TILER_INCOMPLETE_TTL_SEC` (default `0` =
+disabled) to have a background sweeper delete incomplete docs older than that TTL — set it
+**above your longest render** so an in-flight ingest is never reaped — running every
+`TILER_SWEEP_INTERVAL_SEC` (default `300`). See [CONFIG.md](CONFIG.md) and
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Running as a non-root user
 
 Nothing in the container runs as root — blobs are written by uid **10001**.

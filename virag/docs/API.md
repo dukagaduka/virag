@@ -111,6 +111,13 @@ document is then named by its content hash (`doc_id`). Point ids are determinist
 than duplicating them. A document that produces zero tiles enrolls nothing (reported as
 `enrolled: 0`).
 
+**Streaming ingest.** Internally, `/enroll` consumes the tiler's tile stream and embeds
+and upserts tiles in batches as they arrive — it never buffers the whole document in
+memory, so arbitrarily large documents (e.g. a 920-page PDF) enroll fully without hitting
+a render timeout. The request/response contract above is unchanged. On any failure
+mid-enroll the document's partial points are rolled back out of Qdrant; the tiler doc is
+left in place and marked pending so [reconcile](ARCHITECTURE.md) heals or sweeps it later.
+
 Response:
 
 ```json
@@ -121,6 +128,30 @@ Response:
 curl -s -X POST localhost:8080/enroll \
      -F doc_type=PDF -F document=@report.pdf \
      -F 'metadata={"name":"2024 Annual Report","project":"atlas"}' | jq
+```
+
+---
+
+## `POST /revision`
+
+Re-embed the **whole corpus** into a fresh vector collection and swap it in with no
+downtime. Use it after an embedding-model change (or after the tiler's own `/revision`
+re-render) so the vectors are rebuilt against the new model.
+
+virag serves through a stable Qdrant **alias**; `/revision` builds a new physical
+collection alongside the live one, re-embeds every *complete* tiler doc into it (fetching
+tiles from the tiler), then **atomically** repoints the alias to the new collection and
+drops the old one. The live collection keeps serving the entire time — no empty window.
+
+This is long-running (it re-embeds the entire corpus). Incomplete tiler docs are skipped
+(they aren't servable; leave them for a tiler `/revision`). Response:
+
+```json
+{"reembedded": 128, "skipped": 2, "collection": "store-collection__v2"}
+```
+
+```bash
+curl -s -X POST localhost:8080/revision | jq
 ```
 
 ---

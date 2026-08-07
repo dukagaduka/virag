@@ -510,7 +510,7 @@ class TilerService:
 
         except Exception as exc:  # noqa: BLE001 - the stream is already 200; report in-band
             log.exception("streaming ingest crashed for %s", doc_id)
-            yield {"event": "error", "code": "INTERNAL", "message": repr(exc)}
+            yield {"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)}
 
         finally:
             self._inflight.discard(doc_id)
@@ -539,6 +539,65 @@ class TilerService:
             "page_height": row.page_height,
             "tile_count": row.tile_count,
         }
+
+
+    async def revise(self, *, force: bool = False) -> dict[str, Any]:
+        """Re-render stored docs whose render_version is stale (or incomplete), from their blobs.
+
+        This is the tiler half of a revision: it refreshes tiles in place (doc_id is
+        stable) so `get_tile` reproduces again after a render_version change. It does not
+        touch Qdrant — virag's own /revision re-embeds afterwards.
+        """
+        current = self.settings.render_version
+        revised = 0
+        skipped = 0
+        failed: list[str] = []
+        cursor: str | None = None
+
+        while True:
+            rows, cursor = await self.store.search([], self.schema, limit=100, cursor=cursor)
+
+            for row in rows:
+                if not (force or not row.complete or row.render_version != current):
+                    skipped += 1
+                    continue
+
+                try:
+                    await self._revise_one(row, current)
+                    revised += 1
+
+                except ApiError as exc:
+                    log.warning("revise failed for %s: %s", row.doc_id, exc.message)
+                    failed.append(row.doc_id)
+
+            if not cursor:
+                break
+
+        if revised:
+            metrics.DOCS.set(await self.store.count_docs())
+
+        log.info("revision: revised=%d skipped=%d failed=%d", revised, skipped, len(failed))
+        return {"revised": revised, "skipped": skipped, "failed": failed, "render_version": current}
+
+
+    async def _revise_one(self, row: DocRow, render_version: str) -> None:
+        """Re-render one stored doc and atomically replace its tiles at the new render_version."""
+        blob = await self._read_blob(row)
+        rendered = await self.render_document(row.doc_type, blob, path="revise")
+
+        await self.store.upsert_doc(
+            doc_id=row.doc_id,
+            doc_type=row.doc_type,
+            blob_rel_path=row.blob_rel_path,
+            source_url=row.source_url,
+            page_height=rendered.page_height,
+            tile_count=len(rendered.tiles),
+            mime_type=row.mime_type,
+            metadata=row.metadata,
+            render_version=render_version,
+            tiles=[(t.tile_num, t.height, t.image_hash) for t in rendered.tiles],
+        )
+        await self._invalidate(row.doc_id)
 
 
     async def sweep_incomplete(self, ttl_seconds: int) -> int:

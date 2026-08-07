@@ -111,10 +111,15 @@ Four typed async clients, each built from its settings block and given a
   `input` field (batchable); images go through chat-style `messages`/`image_url` with
   a `data:` URI, one request per image. (These are two different vLLM request shapes;
   conflating them is a common bug.)
-- **`TilerService`** — doc-tiler client: `tile()`, `get_tile()`, `get_info()` (for
-  binding), `doc_exists()`.
-- **`QdrantStore`** — collection create, `upsert` (optional deterministic ids),
-  `query`, and collection-level metadata (used by the binding).
+- **`TilerService`** — doc-tiler client: `tile()`, `tile_stream()` (the NDJSON stream
+  `/enroll` consumes), `get_tile()`, `get_info()` (for binding), `get_schema()` (metadata
+  schema guard), `patch_metadata()` (the enroll pending markers), `search_docs()` /
+  `iter_docs()` (reconcile), `doc_exists()`.
+- **`QdrantStore`** — collection lifecycle behind a serving alias over versioned physical
+  collections, `upsert` (optional deterministic ids, byte-budget sub-batching), `query`,
+  `delete_by_doc` / `iter_doc_ids` (reconcile), the revision blue-green swap
+  (`create_revision_collection` / `swap_alias`), and collection-level metadata (used by
+  the binding).
 - **`VLMClient`** — the upstream generator: `complete()` (buffered passthrough,
   any status) and `stream()` (an async context manager yielding the live SSE
   response). `check_connection()` also probes vision support with a 1×1 PNG.
@@ -130,24 +135,87 @@ Four typed async clients, each built from its settings block and given a
 - **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): virag, the tiler,
   and the Qdrant collection must share one secret hash, or startup fails. A fresh
   collection is bound on first run; tiler `render_version` drift is a warning.
-- `warn_doc_id_overlap` — best-effort: sample a few enrolled `doc_id`s and warn if the
-  tiler doesn't have them (Qdrant and the tiler drifting out of sync).
+- **Metadata-schema guard** (`enforce_metadata_schema`) — reconcile searches the tiler's
+  indexed metadata, so the tiler must declare the three fields virag depends on:
+  `name` (text), `virag_started_at` (number), `virag_enrolled_at` (number). A missing or
+  wrong-typed field is **fatal** (`BindingError`) — the tiler is misconfigured. See
+  §9.
+- **Reconcile** — one `reconcile()` pass runs before serving (repairing any partial or
+  orphaned enrolls left by an earlier crash), then a background task repeats it on
+  `VIRAG_RECONCILE_INTERVAL_SEC`. This replaces the old best-effort `doc_id` overlap
+  warning. See §9.
 
 `/ready` reports `503` until all four clients are attached to `app.state`; `/health`
 is a bare liveness probe.
 
-## 8. Module layout
+## 8. Enrollment & the Qdrant ⊆ Tiler invariant
+
+`/enroll` (`api/enroll.py`) is internally **streaming**. It calls the tiler's
+`POST /tile/stream` and consumes the NDJSON event stream, accumulating tiles into
+embedding batches of `EMBEDDINGS_CHUNK_SIZE`, embedding each batch, and upserting its
+vectors to Qdrant as it goes — bounded memory, never the whole document at once. The HTTP
+contract is unchanged (see [API.md](API.md)); what changed is that it no longer buffers a
+whole multi-MB manifest and no longer hits a render timeout, so arbitrarily large
+documents enroll fully.
+
+- **Deterministic point ids.** A point's id is `uuid5(namespace, "{doc_id}:{tile_num}")`,
+  so re-enrolling a document overwrites its own points in place rather than duplicating.
+- **Byte-budget batching.** `QdrantStore.upsert` splits into sub-batches so no single
+  request exceeds Qdrant's body limit: `QDRANT_CHUNK_SIZE` (per-request body budget in MB)
+  and `QDRANT_MAX_BATCH_CHUNKS` (hard cap on points per request).
+- **The invariant `Qdrant ⊆ Tiler`.** Every Qdrant point is backed by a tiler tile,
+  enforced by write order (the tiler persists a tile, *then* virag writes its point) and
+  by reconcile. A query therefore never returns a hit whose tile the tiler can't
+  regenerate.
+- **Pending markers.** At the start of an enroll virag stamps the tiler's indexed
+  metadata with `virag_started_at` (epoch at start) and `virag_enrolled_at` (`0` while
+  pending); on success it sets `virag_enrolled_at` to the epoch. On any mid-enroll failure
+  the partial points are rolled back out of Qdrant; the tiler doc stays in place and
+  pending for reconcile to heal or sweep.
+
+## 9. Reconcile, the collection scheme & revision
+
+**Collection scheme.** virag serves through a stable Qdrant **alias** whose name is the
+configured `QDRANT_COLLECTION_NAME`. The alias points to a versioned physical collection
+(`<name>__v1`, `__v2`, …); all point operations go through the alias. On startup, if a
+legacy plain collection named `QDRANT_COLLECTION_NAME` exists (from before this scheme),
+its points are copied into `__v1` (count-verified before the source is dropped), the plain
+collection is deleted, and the alias is created — no data loss.
+
+**Reconcile** (`reconcile.py`) runs once at startup and then on
+`VIRAG_RECONCILE_INTERVAL_SEC` (0 disables the loop; the startup pass still runs). Two
+passes:
+
+1. *Enforce `Qdrant ⊆ Tiler`.* List every tiler `doc_id` (`POST /docs/search`) and every
+   Qdrant `doc_id` (scroll), and delete from Qdrant any `doc_id` the tiler no longer has.
+   This is also how a document deleted from the tiler gets its stale points removed
+   (delete-propagation) — on the next reconcile pass.
+2. *Clear stale pending.* Find docs with `virag_enrolled_at == 0` **and**
+   `virag_started_at < now − VIRAG_PENDING_TTL_SEC` (the TTL gate skips in-flight
+   enrolls), delete their partial points, and — if `VIRAG_SELF_HEAL` is on and the tiler
+   doc is complete — re-embed the doc from the tiler to restore it. An incomplete tiler
+   doc is left for a tiler `/revision`.
+
+**Revision** (`POST /revision` → `revise()`) is a full re-embed with a blue-green swap.
+It builds a new physical collection `__vN+1`, re-embeds every complete tiler doc into it,
+then atomically repoints the serving alias to the new collection and drops the old one.
+The live collection serves throughout — no downtime, no empty window. Use it after an
+embedding-model change (or the tiler's `/revision` re-render).
+
+## 10. Module layout
 
 ```
 virag/
-  main.py            # app, lifespan (clients, dependency checks, binding), router order
+  main.py            # app, lifespan (clients, dependency checks, binding, reconcile), router order
   settings.py        # Settings.from_env() — every env var and its validation
-  binding.py         # the TILER_DB_SECRET triple-binding + doc_id overlap warning
+  binding.py         # the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
+  reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and /revision re-embed
   errors.py          # ApiError + the uniform {"error": {...}} envelope
   utils.py           # non-domain helpers (error_body)
   api/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
-    enroll.py            # /enroll: tile → embed → upsert
+    enroll.py            # /enroll: streaming tile → embed → upsert
+    revision.py          # /revision: full re-embed + blue-green alias swap
     proxy.py             # reverse proxy for /tiler, /embed, /qdrant, /v1/*
     ops.py               # /health, /ready
   clients/

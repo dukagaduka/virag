@@ -83,11 +83,18 @@ class FakeStore:
     async def query(self, vector, top_n):
         return self._hits[:top_n]
 
-    async def upsert(self, vectors, payloads, ids=None):
-        self.upserts.append({"vectors": vectors, "payloads": payloads, "ids": ids})
+    async def upsert(self, vectors, payloads, ids=None, wait=True, collection=None):
+        self.upserts.append({"vectors": vectors, "payloads": payloads, "ids": ids, "collection": collection})
 
     async def create_collection(self):
         pass
+
+    async def create_revision_collection(self) -> str:
+        self.revision_collection = "c__v2"
+        return self.revision_collection
+
+    async def swap_alias(self, new_physical: str) -> None:
+        self.swapped_to = new_physical
 
     async def get_collection_metadata(self) -> dict:
         return self.metadata or {}

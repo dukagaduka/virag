@@ -95,12 +95,20 @@ async def _clear_stale_pending(
 
 
 async def _reembed_doc(
-    store: QdrantStore, tiler: TilerService, embeddings: EmbeddingsClient, summary: dict
+    store: QdrantStore,
+    tiler: TilerService,
+    embeddings: EmbeddingsClient,
+    summary: dict,
+    *,
+    collection: str | None = None,
+    mark_enrolled: bool = True,
 ) -> None:
-    """Re-embed a complete tiler doc into Qdrant, then clear its pending marker.
+    """Re-embed a complete tiler doc into Qdrant (self-heal, or a revision target).
 
     Tiles are pulled via get_tile and embedded in batches; the point ids match enroll's
     (`point_id(doc_id, tile_num)`), so this restores exactly what a fresh enroll would.
+    `collection` targets a specific physical collection (a revision build); `mark_enrolled`
+    clears the pending marker (self-heal) — a revision leaves it untouched.
     """
     doc_id = summary["doc_id"]
     tile_count = summary["tile_count"]
@@ -131,7 +139,7 @@ async def _reembed_doc(
         ]
         ids = [point_id(doc_id, n) for n in batch]
 
-        await store.upsert(vectors, payloads, ids=ids)
+        await store.upsert(vectors, payloads, ids=ids, collection=collection)
         batch.clear()
 
     for tile_num in range(tile_count):
@@ -140,7 +148,35 @@ async def _reembed_doc(
             await flush()
 
     await flush()
-    await tiler.patch_metadata(doc_id, {"virag_enrolled_at": int(time.time())})
+
+    if mark_enrolled:
+        await tiler.patch_metadata(doc_id, {"virag_enrolled_at": int(time.time())})
+
+
+async def revise(store: QdrantStore, tiler: TilerService, embeddings: EmbeddingsClient) -> dict:
+    """Re-embed the whole corpus into a fresh collection, then blue-green swap the alias.
+
+    The live collection keeps serving until the new one is fully built and the alias flips
+    atomically — no empty window. Use after an embedding-model change (or a tiler /revision).
+    """
+    new_collection = await store.create_revision_collection()
+    log.info("revision: building %s", new_collection)
+
+    reembedded = 0
+    skipped = 0
+
+    for doc in await tiler.iter_docs():
+        if not doc.get("complete"):
+            skipped += 1  # incomplete docs aren't servable; leave them for tiler /revision
+            continue
+
+        await _reembed_doc(store, tiler, embeddings, doc, collection=new_collection, mark_enrolled=False)
+        reembedded += 1
+
+    await store.swap_alias(new_collection)
+
+    log.info("revision: re-embedded=%d skipped=%d, alias now → %s", reembedded, skipped, new_collection)
+    return {"reembedded": reembedded, "skipped": skipped, "collection": new_collection}
 
 
 async def run_periodic(

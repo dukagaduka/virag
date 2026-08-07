@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from virag.api.enroll import point_id
-from virag.reconcile import reconcile
+from virag.reconcile import reconcile, revise
 from virag.settings import ReconcileSettings
 
 from conftest import FakeEmbeddings, FakeStore, FakeTiler
@@ -44,6 +44,23 @@ def test_reconcile_self_heals_complete_pending():
     assert ("doc-a", {"virag_enrolled_at": tiler.metadata_patches[-1][1]["virag_enrolled_at"]}) \
         == tiler.metadata_patches[-1]
     assert tiler.metadata_patches[-1][1]["virag_enrolled_at"] > 0
+
+
+def test_revise_reembeds_into_new_collection_then_swaps():
+    store, tiler, emb = FakeStore(), FakeTiler(), FakeEmbeddings()
+    tiler.docs = [
+        {"doc_id": "doc-a", "doc_type": "PDF", "tile_count": 2, "complete": True,
+         "render_version": "rv", "source_url": None, "metadata": {"name": "A"}},
+        {"doc_id": "doc-b", "doc_type": "PDF", "tile_count": 1, "complete": False,   # skipped
+         "render_version": "rv", "source_url": None, "metadata": {"name": "B"}},
+    ]
+
+    out = asyncio.run(revise(store, tiler, emb))
+
+    assert out["reembedded"] == 1 and out["skipped"] == 1
+    assert store.swapped_to == "c__v2"                          # alias flipped to the built collection
+    assert all(u["collection"] == "c__v2" for u in store.upserts)   # built the new one, not the alias
+    assert tiler.metadata_patches == []                         # revision never touches pending markers
 
 
 def test_reconcile_leaves_incomplete_for_reenroll():
