@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, nullcontext
 
 import httpx
 
@@ -15,6 +16,9 @@ _PROBE_IMAGE = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 )
 
+# Fixed linear backoff between transient-connection retries (seconds * attempt).
+_RETRY_BACKOFF_SEC = 0.5
+
 
 class VLMClient:
     def __init__(
@@ -23,12 +27,19 @@ class VLMClient:
         model_name: str,
         api_key: str,
         timeout: float | httpx.Timeout,
+        max_concurrency: int = 0,
+        max_retries: int = 3,
     ):
 
-        self.base_url   = base_url
-        self.model_name = model_name
-        self.api_key    = api_key
-        self.timeout    = timeout
+        self.base_url    = base_url
+        self.model_name  = model_name
+        self.api_key     = api_key
+        self.timeout     = timeout
+        self.max_retries = max_retries
+
+        # 0 (or less) = unlimited; otherwise cap concurrent upstream calls so a fragile
+        # or remote VLM isn't buried under simultaneous multimodal requests.
+        self._semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency > 0 else None
 
 
     @property
@@ -46,6 +57,12 @@ class VLMClient:
         return {"Authorization": f"Bearer {self.api_key}"}
 
 
+    def _guard(self):
+        """Limit concurrent upstream calls when a ceiling is configured; a no-op
+        otherwise. Held for the whole call, including the entire streaming lifetime."""
+        return self._semaphore if self._semaphore is not None else nullcontext()
+
+
     @classmethod
     def from_settings(cls, vs: VLMSettings) -> VLMClient:
         return cls(
@@ -53,6 +70,8 @@ class VLMClient:
             model_name=vs.model_name,
             api_key=vs.api_key,
             timeout=vs.timeout,
+            max_concurrency=vs.max_concurrency,
+            max_retries=vs.max_retries,
         )
 
 
@@ -142,42 +161,75 @@ class VLMClient:
 
     async def complete(self, body: dict) -> httpx.Response:
         """Forward a non-streaming chat-completion request and return the upstream
-        response verbatim (any status) so the route can passthrough. Only an
+        response verbatim (any status) so the route can passthrough. Transient
+        connection errors are retried up to `max_retries`; only a persistently
         unreachable upstream is turned into an ApiError."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                return await client.post(
-                    self.route,
-                    json=body,
-                    headers=self.auth_header,
-                )
+        async with self._guard():
+            last_exc: httpx.RequestError | None = None
 
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=502,
-                    message=f"Cannot reach {self.route} during chat completion",
-                    details={"error": repr(e)},
-                ) from e
+            for attempt in range(self.max_retries + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        return await client.post(
+                            self.route,
+                            json=body,
+                            headers=self.auth_header,
+                        )
+
+                except httpx.RequestError as e:
+                    last_exc = e
+
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(_RETRY_BACKOFF_SEC * (attempt + 1))
+
+            raise ApiError(
+                status_code=502,
+                message=f"Cannot reach {self.route} during chat completion",
+                details={"error": repr(last_exc), "attempts": self.max_retries + 1},
+            ) from last_exc
 
 
     @asynccontextmanager
     async def stream(self, body: dict):
         """Open a streaming chat-completion request and yield the live upstream
         response. The caller inspects `status_code` before relaying, then iterates
-        `aiter_bytes()`. Only an unreachable upstream is turned into an ApiError."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                async with client.stream(
-                    "POST",
-                    self.route,
-                    json=body,
-                    headers=self.auth_header,
-                ) as response:
-                    yield response
+        `aiter_bytes()`. The upstream slot (semaphore) is held for the entire stream.
 
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=502,
-                    message=f"Cannot reach {self.route} during streaming chat completion",
-                    details={"error": repr(e)},
-                ) from e
+        A transient failure while *opening* the stream — before any byte reaches the
+        caller — is retried up to `max_retries`. Once bytes are flowing, mid-stream
+        errors surface in the caller (not here), so a retry can never replay a
+        partially-consumed response."""
+        async with self._guard():
+            last_exc: httpx.RequestError | None = None
+
+            for attempt in range(self.max_retries + 1):
+                yielded = False
+
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        async with client.stream(
+                            "POST",
+                            self.route,
+                            json=body,
+                            headers=self.auth_header,
+                        ) as response:
+                            yielded = True
+                            yield response
+                            return
+
+                except httpx.RequestError as e:
+                    # Reached only on a pre-yield open failure. If we already handed the
+                    # response to the caller, never retry — re-raise so teardown is honest.
+                    if yielded:
+                        raise
+
+                    last_exc = e
+
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(_RETRY_BACKOFF_SEC * (attempt + 1))
+
+            raise ApiError(
+                status_code=502,
+                message=f"Cannot reach {self.route} during streaming chat completion",
+                details={"error": repr(last_exc), "attempts": self.max_retries + 1},
+            ) from last_exc

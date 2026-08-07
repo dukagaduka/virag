@@ -56,6 +56,8 @@ class VLMSettings:
     model_name: str
     api_key: str
     timeout: int
+    max_concurrency: int
+    max_retries: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -219,9 +221,21 @@ class Settings:
         )
 
         vlm_timeout = int_coercion(
-            os.environ.get("VLM_TIMEOUT_SEC", "120"),
+            os.environ.get("VLM_TIMEOUT_SEC", "480"),
             "VLM_TIMEOUT_SEC",
-            low=1
+            low=480
+        )
+
+        vlm_max_concurrency = int_coercion(
+            os.environ.get("VLM_MAX_CONCURRENCY", "0"),
+            "VLM_MAX_CONCURRENCY",
+            low=0,
+        )
+
+        vlm_max_retries = int_coercion(
+            os.environ.get("VLM_MAX_RETRIES", "3"),
+            "VLM_MAX_RETRIES",
+            low=0,
         )
 
         # -----------------------------
@@ -279,6 +293,8 @@ class Settings:
                 model_name=vlm_model_name,
                 api_key=vlm_api_key,
                 timeout=vlm_timeout,
+                max_concurrency=vlm_max_concurrency,
+                max_retries=vlm_max_retries,
             ),
             reconcile_settings=ReconcileSettings(
                 self_heal=reconcile_self_heal,

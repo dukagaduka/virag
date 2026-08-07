@@ -82,7 +82,9 @@ serves through it while the physical collection it points to is versioned (`__v1
 | `VLM_BASE_URL` | **yes** | — | Vision model endpoint. The `/v1` suffix is required. |
 | `VLM_MODEL_NAME` | **yes** | — | Model name; used for the startup vision probe. Callers still pass their own `model` in the request body (passed through). |
 | `VLM_API_KEY` | no | `dummy` | Bearer key for the VLM (injected on chat completions and the `/v1` proxy). |
-| `VLM_TIMEOUT_SEC` | no | `120` | Per-request timeout (≥ 1). |
+| `VLM_TIMEOUT_SEC` | no | `480` | Per-read deadline on the VLM stream (max silence between chunks; covers a long prefill/TTFT on big pixel-RAG prompts), not total generation time (≥ 480). |
+| `VLM_MAX_CONCURRENCY` | no | `0` | Max concurrent upstream chat-completion calls; `0` = unlimited (≥ 0). Cap it to shield a fragile/remote VLM from concurrent multimodal load; excess calls queue. Held for the whole stream. |
+| `VLM_MAX_RETRIES` | no | `3` | Retries for a transient connection error while *opening* an upstream call, before any bytes stream (≥ 0). Never replays a partially-streamed response. |
 
 ---
 
