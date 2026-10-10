@@ -8,11 +8,12 @@ happens in the render workers.
 from __future__ import annotations
 
 from .errors import unprocessable, unsupported_media
+from .models import DocType
 
 MIME_BY_TYPE = {
-    "PDF": "application/pdf",
-    "MHTML": "multipart/related",
-    "IMG": "application/octet-stream",
+    DocType.PDF: "application/pdf",
+    DocType.MHTML: "multipart/related",
+    DocType.IMG: "application/octet-stream",
 }
 
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
@@ -55,34 +56,34 @@ def looks_like_mhtml(data: bytes) -> bool:
     )
 
 
-def check_and_mime(doc_type: str, data: bytes) -> str:
+def check_and_mime(doc_type: DocType, data: bytes) -> str:
     """Validate the payload against the declared type; return the stored mime type."""
     if not data:
         raise unprocessable("document is empty", "EMPTY_DOCUMENT")
 
-    if doc_type == "PDF":
+    if doc_type == DocType.PDF:
         if not data.lstrip()[:5].startswith(b"%PDF-"):
             raise unsupported_media(
                 "declared doc_type=PDF but the payload does not start with %PDF-",
-                declared="PDF",
+                declared=DocType.PDF,
             )
         return "application/pdf"
 
-    if doc_type == "MHTML":
+    if doc_type == DocType.MHTML:
         if not looks_like_mhtml(data):
             raise unsupported_media(
                 "declared doc_type=MHTML but the payload has no MIME/MHTML headers",
-                declared="MHTML",
+                declared=DocType.MHTML,
             )
         return "multipart/related"
 
-    if doc_type == "IMG":
+    if doc_type == DocType.IMG:
         mime = sniff_image_mime(data)
         if mime is None:
             raise unsupported_media(
                 "declared doc_type=IMG but the payload is not a supported raster image "
                 "(png/jpeg/gif/bmp/tiff/webp)",
-                declared="IMG",
+                declared=DocType.IMG,
             )
         return mime
 

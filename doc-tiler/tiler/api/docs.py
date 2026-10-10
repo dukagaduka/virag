@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import AsyncIterator
 
+import anyio
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -42,8 +43,6 @@ def _parse_range(header: str, size: int) -> tuple[int, int] | None:
 
 async def _stream(path, start: int, end: int) -> AsyncIterator[bytes]:
     """Yield bytes of `path` from `start` to `end` inclusive, in chunks."""
-    import anyio  # noqa: PLC0415
-
     remaining = end - start + 1
     async with await anyio.open_file(path, "rb") as fh:
         await fh.seek(start)

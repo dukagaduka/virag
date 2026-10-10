@@ -9,24 +9,30 @@ from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..errors import bad_request
-from ..models import IngestManifest
+from ..models import DocType, IngestManifest
 from .deps import ERROR_RESPONSES, check_declared_size, parse_metadata_field, read_capped, service
 
 router = APIRouter()
 
 
-def _validate_ingest_inputs(doc_type: str, document: UploadFile | None) -> str:
+def _validate_ingest_inputs(doc_type: str, document: UploadFile | None) -> DocType:
     """Shared pre-flight for both ingest routes; returns the normalized doc_type."""
-    doc_type = (doc_type or "").strip().upper()
-    if doc_type not in ("PDF", "URL", "MHTML", "IMG"):
+    raw = (doc_type or "").strip().upper()
+
+    try:
+        doc_type = DocType(raw)
+
+    except ValueError:
         raise bad_request(
-            f"unknown doc_type {doc_type!r}; expected PDF, URL, MHTML or IMG", "UNKNOWN_DOC_TYPE"
-        )
-    if doc_type == "URL" and document is not None:
+            f"unknown doc_type {raw!r}; expected PDF, URL, MHTML or IMG", "UNKNOWN_DOC_TYPE"
+        ) from None
+
+    if doc_type == DocType.URL and document is not None:
         # A URL ingest fetches its own bytes; an attached file would be ambiguous.
         raise bad_request(
             "doc_type=URL takes 'url' only; do not attach a document", "AMBIGUOUS_INPUT"
         )
+    
     return doc_type
 
 
@@ -49,21 +55,13 @@ async def ingest_document(
 ) -> IngestManifest:
     """Ingest a document, tile it, optionally store it, and return the tiles."""
     svc = service(request)
-    doc_type = (doc_type or "").strip().upper()
-    if doc_type not in ("PDF", "URL", "MHTML", "IMG"):
-        raise bad_request(
-            f"unknown doc_type {doc_type!r}; expected PDF, URL, MHTML or IMG", "UNKNOWN_DOC_TYPE"
-        )
+    doc_type = _validate_ingest_inputs(doc_type, document)
 
     check_declared_size(request, svc.settings.max_doc_bytes)
+
     data = None
-    if document is not None and doc_type != "URL":
+    if document is not None and doc_type != DocType.URL:
         data = await read_capped(document, svc.settings.max_doc_bytes)
-    if doc_type == "URL" and document is not None:
-        # A URL ingest fetches its own bytes; an attached file would be ambiguous.
-        raise bad_request(
-            "doc_type=URL takes 'url' only; do not attach a document", "AMBIGUOUS_INPUT"
-        )
 
     manifest = await svc.ingest(
         doc_type=doc_type,
@@ -74,6 +72,7 @@ async def ingest_document(
         include_bytes=include_bytes,
         force=force,
     )
+    
     return IngestManifest(**manifest)
 
 
@@ -102,7 +101,7 @@ async def ingest_document_stream(
 
     check_declared_size(request, svc.settings.max_doc_bytes)
     data = None
-    if document is not None and doc_type != "URL":
+    if document is not None and doc_type != DocType.URL:
         data = await read_capped(document, svc.settings.max_doc_bytes)
 
     meta_obj = parse_metadata_field(metadata)

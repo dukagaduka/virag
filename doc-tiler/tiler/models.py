@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-DocTypeIn = Literal["PDF", "URL", "MHTML", "IMG"]
-StoredDocType = Literal["PDF", "MHTML", "IMG"]
+
+
+class DocType(StrEnum):
+    """Declared document type. A stored doc is never URL: a URL ingest is stored as MHTML."""
+
+    PDF = "PDF"
+    URL = "URL"
+    MHTML = "MHTML"
+    IMG = "IMG"
+
+
 SearchOp = Literal["eq", "ne", "gt", "gte", "lt", "lte"]
 
 
@@ -25,7 +35,7 @@ class IngestManifest(BaseModel):
     """Result of an ingest: doc identity plus the produced tiles."""
 
     doc_id: str
-    doc_type: StoredDocType
+    doc_type: DocType
     source_url: str | None = None
     render_version: str
     stored: bool
@@ -38,7 +48,7 @@ class DocSummary(BaseModel):
     """A document as listed in search results."""
 
     doc_id: str
-    doc_type: StoredDocType
+    doc_type: DocType
     tile_count: int
     complete: bool = True
     render_version: str | None = None

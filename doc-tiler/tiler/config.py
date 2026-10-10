@@ -8,6 +8,7 @@ import multiprocessing
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
+from importlib.metadata import version
 from pathlib import Path
 
 # Pixel-tier constants that are not env-tunable but do change output bytes.
@@ -81,8 +82,7 @@ def chromium_build_id() -> str:
                 for browser in data.get("browsers", []):
                     if browser.get("name") == "chromium":
                         return f"chromium-{browser.get('revision')}"
-        from importlib.metadata import version  # noqa: PLC0415
-
+                    
         return f"playwright-{version('playwright')}"
     except Exception:  # pragma: no cover - playwright missing entirely
         return "chromium-unknown"
@@ -91,8 +91,6 @@ def chromium_build_id() -> str:
 def _lib_version(module: str, dist: str) -> str:
     """Installed version of a distribution, or 'unknown' if unavailable."""
     try:
-        from importlib.metadata import version  # noqa: PLC0415
-
         return version(dist)
     except Exception:  # pragma: no cover
         return "unknown"
@@ -122,7 +120,7 @@ class Settings:
     # --- runtime ---
     safe_fullpage_px: int = 30000
     n_browsers: int = 0  # 0 => min(cpu, 4)
-    n_cpu_workers: int = 0  # 0 => cpu count
+    n_render_workers: int = 0  # 0 => cpu count
     recycle_after: int = 500
     render_cache_size: int = 64
     max_doc_bytes: int = 67_108_864
@@ -162,9 +160,9 @@ class Settings:
         return self.n_browsers or min(_cpu_count(), 4)
 
     @property
-    def cpu_workers(self) -> int:
+    def render_workers(self) -> int:
         """Process-pool size; defaults to the CPU count."""
-        return self.n_cpu_workers or _cpu_count()
+        return self.n_render_workers or _cpu_count()
 
     @property
     def chromium_revision(self) -> str:
@@ -279,7 +277,7 @@ def load_settings() -> Settings:
         pdf_dpi=_env_int("TILER_PDF_DPI", 200),
         safe_fullpage_px=_env_int("TILER_SAFE_FULLPAGE_PX", 30000),
         n_browsers=_env_int("TILER_N_BROWSERS", 0),
-        n_cpu_workers=_env_int("TILER_N_CPU_WORKERS", 0),
+        n_render_workers=_env_int("TILER_N_RENDER_WORKERS", 0),
         recycle_after=_env_int("TILER_RECYCLE_AFTER", 500),
         render_cache_size=_env_int("TILER_RENDER_CACHE_SIZE", 64),
         max_doc_bytes=_env_int("TILER_MAX_DOC_BYTES", 67_108_864),

@@ -33,7 +33,7 @@ def base_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "TILER_BLOB_DIR": str(tmp_path / "blobs"),
         "TILER_TMP_DIR": str(tmp_path / "tmp"),
         "TILER_METADATA_SCHEMA_PATH": str(write_schema(tmp_path)),
-        "TILER_N_CPU_WORKERS": "2",
+        "TILER_N_RENDER_WORKERS": "2",
         "TILER_N_BROWSERS": "1",
         "TILER_BROWSER_ENABLED": "false",
         "TILER_URL_FETCH_ENABLED": "false",

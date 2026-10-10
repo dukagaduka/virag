@@ -8,11 +8,12 @@ the single place that knows how ingest and regeneration must agree.
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import logging
 import math
+import multiprocessing
 import time
-from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Sequence
 
 from . import media, metrics
@@ -21,11 +22,13 @@ from .errors import ApiError, bad_gateway, bad_request, conflict, forbidden, gat
 from .errors import not_found, unprocessable
 from .hashing import sha256_hex
 from .meta.schema import MetadataSchema, MetadataViolation, validate_metadata
+from .models import DocType
 from .netguard import GuardProxy
 from .render import browser as web
-from .render import cpu
+from .render import render
 from .render.browser import BrowserPool, BrowserUnavailable, RenderFailure, RenderTimeout
 from .render.geometry import Strip, slice_doc_strips, slice_strips, strip_for
+from .render.types import RenderedDoc, RenderedTile
 from .ssrf import BlockedTarget, validate_url
 from .store.blobs import BlobStore
 from .store.cache import AsyncLRU
@@ -34,29 +37,6 @@ from .store.meta import DocRow, MetaStore, TileRow
 log = logging.getLogger("tiler.service")
 
 MAX_PDF_CHUNK = 16  # pages per process-pool task: bounds pickle size per hop
-
-
-@dataclass(frozen=True)
-class RenderedTile:
-    """One finished tile: its bytes, dimensions and content hash."""
-
-    tile_num: int
-    height: int
-    jpeg: bytes
-    image_hash: str
-
-
-@dataclass(frozen=True)
-class RenderedDoc:
-    """A rendered document: full-page height plus its ordered tiles.
-
-    `page_heights` is set only for a sliced PDF (per-page resized heights, in page
-    order) — get_tile replays the same per-page slicing to reverse a global tile_num.
-    """
-
-    page_height: int
-    tiles: list[RenderedTile]
-    page_heights: list[int] | None = None
 
 
 class TilerService:
@@ -71,7 +51,7 @@ class TilerService:
         self.guard_proxy: GuardProxy | None = None
         self.tile_cache = AsyncLRU(settings.render_cache_size, "tile")
         self.page_cache = AsyncLRU(max(2, settings.render_cache_size // 8), "page")
-        self._cpu: concurrent.futures.ProcessPoolExecutor | None = None
+        self._render_pool: concurrent.futures.ProcessPoolExecutor | None = None
         self.started_at = time.time()
         # doc_ids with a streaming ingest in flight — the sweeper must not reap these.
         self._inflight: set[str] = set()
@@ -81,50 +61,50 @@ class TilerService:
     # lifecycle
     # ------------------------------------------------------------------ #
     async def start_pools(self) -> None:
-        """Start the CPU process pool, SSRF proxy and browser pool."""
-        import multiprocessing  # noqa: PLC0415
-
+        """Start the render process pool, SSRF proxy and browser pool."""
         # 'spawn': the parent runs an event loop and Playwright threads; forking
         # those into workers is a well-known source of deadlocks.
-        self._cpu = concurrent.futures.ProcessPoolExecutor(
-            max_workers=self.settings.cpu_workers,
+        self._render_pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=self.settings.render_workers,
             mp_context=multiprocessing.get_context("spawn"),
         )
+        
         if self.settings.url_fetch_enabled and not self.settings.url_allow_private:
             self.guard_proxy = GuardProxy(allow_private=False)
             await self.guard_proxy.start()
+
         if self.settings.browser_enabled:
             await self.browser.start(per_context_proxy=self.guard_proxy is not None)
 
 
     async def stop_pools(self) -> None:
-        """Tear down the browser, proxy and CPU pool on shutdown."""
+        """Tear down the browser, proxy and render pool on shutdown."""
         await self.browser.stop()
 
         if self.guard_proxy is not None:
             await self.guard_proxy.stop()
 
-        if self._cpu is not None:
-            self._cpu.shutdown(wait=False, cancel_futures=True)
-            self._cpu = None
+        if self._render_pool is not None:
+            self._render_pool.shutdown(wait=False, cancel_futures=True)
+            self._render_pool = None
 
 
-    async def run_cpu(self, fn: Callable[..., Any], *args: Any) -> Any:
-        """Dispatch CPU-bound work to the process pool so the event loop never blocks."""
-        if self._cpu is None:
-            raise RuntimeError("CPU pool is not running")
+    async def run_render(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Dispatch render work to the process pool so the event loop never blocks."""
+        if self._render_pool is None:
+            raise RuntimeError("render pool is not running")
         
         loop = asyncio.get_running_loop()
         metrics.INFLIGHT.labels(layer="cpu").inc()
 
         try:
-            return await loop.run_in_executor(self._cpu, fn, *args)
+            return await loop.run_in_executor(self._render_pool, fn, *args)
         
-        except cpu.DecodeError as exc:
+        except render.DecodeError as exc:
             raise unprocessable(str(exc), "DECODE_FAILED") from exc
         
         except concurrent.futures.process.BrokenProcessPool as exc:  # pragma: no cover
-            log.error("CPU pool broke: %s", exc)
+            log.error("render pool broke: %s", exc)
             raise bad_gateway("render worker crashed", "WORKER_CRASH") from exc
         
         finally:
@@ -141,7 +121,7 @@ class TilerService:
 
 
     async def _render_pdf(self, blob: bytes) -> RenderedDoc:
-        """Rasterize a PDF, chunked across the CPU pool.
+        """Rasterize a PDF, chunked across the render pool.
 
         Default: one tile per page. With `pdf_slice` on: each page is sliced into
         strips (never across pages) and tiles get a contiguous global tile_num in
@@ -149,24 +129,24 @@ class TilerService:
         """
         s = self.settings
 
-        pages = await self.run_cpu(cpu.pdf_page_count, blob)
+        pages = await self.run_render(render.pdf_page_count, blob)
         if pages <= 0:
             raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
 
-        chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.cpu_workers))))
+        chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.render_workers))))
         groups = [list(range(i, min(i + chunk, pages))) for i in range(0, pages, chunk)]
 
         if not s.pdf_slice:
             results = await asyncio.gather(
                 *(
-                    self.run_cpu(cpu.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
+                    self.run_render(render.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
                     for g in groups
                 )
             )
             tiles = [
-                RenderedTile(tile_num=num, height=h, jpeg=jpeg, image_hash=sha256_hex(jpeg))
+                RenderedTile.build(t.tile_num, t.height, t.jpeg)
                 for group in results
-                for num, h, jpeg in group
+                for t in group
             ]
             tiles.sort(key=lambda t: t.tile_num)
 
@@ -174,23 +154,21 @@ class TilerService:
 
         results = await asyncio.gather(
             *(
-                self.run_cpu(
-                    cpu.render_pdf_page_strips, blob, g, s.pdf_dpi, s.tile_width,
+                self.run_render(
+                    render.render_pdf_page_strips, blob, g, s.pdf_dpi, s.tile_width,
                     s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height, s.jpeg_quality,
                 )
                 for g in groups
             )
         )
-        per_page = sorted((p for group in results for p in group), key=lambda x: x[0])
-        page_heights = [ph for _, ph, _ in per_page]
+        per_page = sorted((p for group in results for p in group), key=lambda p: p.page_num)
+        page_heights = [p.page_height for p in per_page]
 
         tiles = []
         running = 0
-        for _, _, strips in per_page:
-            for offset, sh, jpeg in strips:
-                tiles.append(
-                    RenderedTile(tile_num=running, height=sh, jpeg=jpeg, image_hash=sha256_hex(jpeg))
-                )
+        for page in per_page:
+            for strip in page.strips:
+                tiles.append(RenderedTile.build(running, strip.height, strip.jpeg))
                 running += 1
 
         return RenderedDoc(page_height=0, tiles=tiles, page_heights=page_heights)
@@ -199,8 +177,8 @@ class TilerService:
     async def _render_img(self, blob: bytes) -> RenderedDoc:
         """Resize an image to tile width and slice it into vertical strips."""
         s = self.settings
-        page_height, raw = await self.run_cpu(
-            cpu.tile_full_page,
+        page = await self.run_render(
+            render.tile_full_page,
             blob,
             s.tile_width,
             s.tile_height,
@@ -210,11 +188,8 @@ class TilerService:
         )
 
         return RenderedDoc(
-            page_height=page_height,
-            tiles=[
-                RenderedTile(tile_num=n, height=h, jpeg=j, image_hash=sha256_hex(j))
-                for n, h, j in raw
-            ],
+            page_height=page.page_height,
+            tiles=[RenderedTile.build(i, st.height, st.jpeg) for i, st in enumerate(page.strips)],
         )
     
 
@@ -224,9 +199,10 @@ class TilerService:
         rendered = await self._browser_call(
             web.render_mhtml_document, self.browser, s, blob, self._strips_for
         )
+
         if rendered.full_png is not None:
-            page_height, raw = await self.run_cpu(
-                cpu.tile_full_page,
+            page = await self.run_render(
+                render.tile_full_page,
                 rendered.full_png,
                 s.tile_width,
                 s.tile_height,
@@ -234,43 +210,42 @@ class TilerService:
                 s.min_tile_height,
                 s.jpeg_quality,
             )
-            tiles = [
-                RenderedTile(tile_num=n, height=h, jpeg=j, image_hash=sha256_hex(j))
-                for n, h, j in raw
-            ]
+            tiles = [RenderedTile.build(i, st.height, st.jpeg) for i, st in enumerate(page.strips)]
 
-            return RenderedDoc(page_height=page_height, tiles=tiles)
+            return RenderedDoc(page_height=page.page_height, tiles=tiles)
 
         # Very tall page: clip-captured strips, one per tile.
         pngs = rendered.strip_pngs or []
         encoded = await asyncio.gather(
-            *(self.run_cpu(cpu.encode_strip, png, s.tile_width, s.jpeg_quality) for png in pngs)
+            *(self.run_render(render.encode_strip, png, s.tile_width, s.jpeg_quality) for png in pngs)
         )
-        tiles = [
-            RenderedTile(tile_num=i, height=h, jpeg=j, image_hash=sha256_hex(j))
-            for i, (h, j) in enumerate(encoded)
-        ]
+        tiles = [RenderedTile.build(i, e.height, e.jpeg) for i, e in enumerate(encoded)]
+
         return RenderedDoc(page_height=rendered.css_height, tiles=tiles)
 
 
-    async def render_document(self, effective_type: str, blob: bytes, path: str) -> RenderedDoc:
+    async def render_document(self, effective_type: DocType, blob: bytes, path: str) -> RenderedDoc:
         """Render any supported doc type to tiles, recording render metrics."""
         started = time.perf_counter()
+
         try:
-            if effective_type == "PDF":
+            if effective_type == DocType.PDF:
                 doc = await self._render_pdf(blob)
-            elif effective_type == "IMG":
+            elif effective_type == DocType.IMG:
                 doc = await self._render_img(blob)
-            elif effective_type == "MHTML":
+            elif effective_type == DocType.MHTML:
                 doc = await self._render_mhtml(blob)
             else:  # pragma: no cover - guarded upstream
                 raise bad_request(f"unsupported doc_type {effective_type!r}")
+            
         finally:
             metrics.RENDER_SECONDS.labels(doc_type=effective_type, path=path).observe(
                 time.perf_counter() - started
             )
+
         metrics.RENDERS.labels(doc_type=effective_type, path=path).inc()
         metrics.TILES.labels(doc_type=effective_type, path=path).inc(len(doc.tiles))
+
         return doc
 
 
@@ -295,7 +270,7 @@ class TilerService:
     async def ingest(
         self,
         *,
-        doc_type: str,
+        doc_type: DocType,
         data: bytes | None,
         url: str | None,
         metadata: dict[str, Any] | None,
@@ -309,11 +284,12 @@ class TilerService:
             metadata = None
 
         source_url: str | None = None
-        if doc_type == "URL":
+        if doc_type == DocType.URL:
             if not url:
                 raise bad_request("url is required when doc_type=URL", "MISSING_URL")
+            
             blob = await self._capture_url(url)
-            effective_type = "MHTML"
+            effective_type = DocType.MHTML
             source_url = url
             mime = "multipart/related"
 
@@ -331,10 +307,12 @@ class TilerService:
         # short-circuits; an incomplete (crashed/streaming) doc must be re-rendered.
         if store and not force:
             existing = await self.store.get_doc(doc_id)
+
             if existing is not None and existing.complete:
                 metrics.INGESTS.labels(
                     doc_type=effective_type, stored="true", result="idempotent"
                 ).inc()
+
                 return await self._manifest_from_store(existing, include_bytes)
 
         if store and metadata is not None:
@@ -346,6 +324,7 @@ class TilerService:
             # Blob first: a blob without a row is inert and dedups away, whereas a row
             # without a blob would make /get_tile permanently fail.
             rel = await self.blobs.put(doc_id, blob)
+
             await self.store.upsert_doc(
                 doc_id=doc_id,
                 doc_type=effective_type,
@@ -356,10 +335,11 @@ class TilerService:
                 mime_type=mime,
                 metadata=metadata,
                 render_version=self.settings.render_version,
-                tiles=[(t.tile_num, t.height, t.image_hash) for t in rendered.tiles],
+                tiles=rendered.tiles,
                 page_heights=rendered.page_heights,
             )
             await self._invalidate(doc_id)
+
             metrics.DOCS.set(await self.store.count_docs())
 
         metrics.INGESTS.labels(
@@ -397,70 +377,71 @@ class TilerService:
         """
         s = self.settings
 
-        pages = await self.run_cpu(cpu.pdf_page_count, blob)
+        pages = await self.run_render(render.pdf_page_count, blob)
         if pages <= 0:
             raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
 
-        chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.cpu_workers))))
+        chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.render_workers))))
         groups = [list(range(i, min(i + chunk, pages))) for i in range(0, pages, chunk)]
 
         if not s.pdf_slice:
             tasks = [
                 asyncio.ensure_future(
-                    self.run_cpu(cpu.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
+                    self.run_render(render.render_pdf_pages, blob, g, s.pdf_dpi, s.tile_width, s.jpeg_quality)
                 )
                 for g in groups
             ]
+
             try:
                 for coro in asyncio.as_completed(tasks):
                     group = await coro
-                    yield (
-                        [
-                            RenderedTile(tile_num=num, height=h, jpeg=jpeg, image_hash=sha256_hex(jpeg))
-                            for num, h, jpeg in group
-                        ],
-                        [],
-                    )
+                    yield ([RenderedTile.build(t.tile_num, t.height, t.jpeg) for t in group], [])
+
             except BaseException:
                 for task in tasks:
                     task.cancel()
                 raise
+
             return
 
         # Sliced: consume in submission (page) order so strip tile_nums number globally.
         tasks = [
             asyncio.ensure_future(
-                self.run_cpu(
-                    cpu.render_pdf_page_strips, blob, g, s.pdf_dpi, s.tile_width,
+                self.run_render(
+                    render.render_pdf_page_strips, blob, g, s.pdf_dpi, s.tile_width,
                     s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height, s.jpeg_quality,
                 )
             )
             for g in groups
         ]
+
         running = 0
         try:
             for task in tasks:
                 group = await task
                 tiles: list[RenderedTile] = []
                 heights: list[int] = []
-                for _, page_height, strips in group:
-                    heights.append(page_height)
-                    for offset, sh, jpeg in strips:
-                        tiles.append(
-                            RenderedTile(tile_num=running, height=sh, jpeg=jpeg, image_hash=sha256_hex(jpeg))
-                        )
+
+                for page in group:
+                    heights.append(page.page_height)
+
+                    for strip in page.strips:
+                        tiles.append(RenderedTile.build(running, strip.height, strip.jpeg))
                         running += 1
+
                 yield (tiles, heights)
+
         except BaseException:
             for task in tasks:
                 task.cancel()
+
             raise
 
 
     async def ingest_stream(
         self,
         *,
-        doc_type: str,
+        doc_type: DocType,
         data: bytes | None,
         url: str | None,
         metadata: dict[str, Any] | None,
@@ -476,17 +457,19 @@ class TilerService:
         source_url: str | None = None
 
         try:
-            if doc_type == "URL":
+            if doc_type == DocType.URL:
                 if not url:
                     raise bad_request("url is required when doc_type=URL", "MISSING_URL")
+                
                 blob = await self._capture_url(url)
-                effective_type = "MHTML"
+                effective_type = DocType.MHTML
                 source_url = url
                 mime = "multipart/related"
 
             else:
                 if data is None:
                     raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
+                
                 blob = data
                 effective_type = doc_type
                 mime = media.check_and_mime(doc_type, blob)
@@ -498,8 +481,10 @@ class TilerService:
                 metrics.INGESTS.labels(
                     doc_type=effective_type, stored="true", result="idempotent"
                 ).inc()
+
                 async for event in self._stream_from_store(existing):
                     yield event
+
                 return
 
             if metadata is not None:
@@ -540,16 +525,18 @@ class TilerService:
             page_height = 0
             page_heights_acc: list[int] = []
 
-            if effective_type == "PDF":
+            if effective_type == DocType.PDF:
                 started = time.perf_counter()
+
                 async for group, heights in self._render_pdf_stream(blob):
                     page_heights_acc.extend(heights)
-                    await self.store.append_tiles(
-                        doc_id, [(t.tile_num, t.height, t.image_hash) for t in group]
-                    )
+
+                    await self.store.append_tiles(doc_id, group)
+
                     for tile in group:
                         count += 1
                         yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg)}
+
                 metrics.RENDER_SECONDS.labels(doc_type=effective_type, path="ingest").observe(
                     time.perf_counter() - started
                 )
@@ -560,9 +547,9 @@ class TilerService:
                 # IMG/MHTML render as a single unit (small); stream the transport only.
                 rendered = await self.render_document(effective_type, blob, path="ingest")
                 page_height = rendered.page_height
-                await self.store.append_tiles(
-                    doc_id, [(t.tile_num, t.height, t.image_hash) for t in rendered.tiles]
-                )
+
+                await self.store.append_tiles(doc_id, rendered.tiles)
+
                 for tile in rendered.tiles:
                     count += 1
                     yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg)}
@@ -574,6 +561,7 @@ class TilerService:
                 page_heights=page_heights_acc or None,
             )
             await self._invalidate(doc_id)
+
             metrics.DOCS.set(await self.store.count_docs())
             metrics.INGESTS.labels(doc_type=effective_type, stored="true", result="rendered").inc()
 
@@ -678,7 +666,7 @@ class TilerService:
             mime_type=row.mime_type,
             metadata=row.metadata,
             render_version=render_version,
-            tiles=[(t.tile_num, t.height, t.image_hash) for t in rendered.tiles],
+            tiles=rendered.tiles,
         )
         await self._invalidate(row.doc_id)
 
@@ -733,8 +721,6 @@ class TilerService:
         self, tile_num: int, height: int, image_hash: str, jpeg: bytes | None
     ) -> dict[str, Any]:
         """Build one tile's manifest entry, base64-encoding its bytes when present."""
-        import base64  # noqa: PLC0415
-
         meta: dict[str, Any] = {
             "tile_num": tile_num,
             "width": self.settings.tile_width,  # always TILE_WIDTH
@@ -802,50 +788,61 @@ class TilerService:
         before = self.tile_cache.hits
         jpeg = await self.tile_cache.get_or_create(key, lambda: self._regenerate(row, tile_num))
         outcome = "hit" if self.tile_cache.hits > before else "miss"
+
         metrics.CACHE.labels(cache="tile", outcome=outcome).inc()
 
         if verify:
             actual = sha256_hex(jpeg)
+
             if actual != tile_row.image_hash:
                 metrics.MISMATCHES.labels(doc_type=row.doc_type).inc()
+
                 message = (
                     f"regenerated tile ({doc_id}, {tile_num}) hashes to {actual} but "
                     f"{tile_row.image_hash} was stored at ingest"
                 )
+
                 if self.settings.render_mismatch_policy == "strict":
                     log.warning("%s — refusing (strict policy)", message)
                     raise conflict(message, "RENDER_MISMATCH", doc_id=doc_id, tile_num=tile_num)
+                
                 log.warning("%s — serving anyway (lenient policy)", message)
+
         return jpeg, tile_row
 
 
     async def _regenerate(self, row: DocRow, tile_num: int) -> bytes:
         """Re-render one tile from the stored blob, dispatched by doc type."""
         s = self.settings
+
         metrics.RENDERS.labels(doc_type=row.doc_type, path="regenerate").inc()
         metrics.TILES.labels(doc_type=row.doc_type, path="regenerate").inc()
 
-        if row.doc_type == "PDF":
+        if row.doc_type == DocType.PDF:
             blob = await self._read_blob(row)
+
             if row.page_heights:  # sliced PDF: reverse a global strip tile_num
                 layout = slice_doc_strips(
                     row.page_heights, s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height
                 )
                 page_no, strip = layout[tile_num]
-                _, jpeg = await self.run_cpu(
-                    cpu.crop_pdf_page_strip, blob, page_no, s.pdf_dpi, s.tile_width,
+                cropped = await self.run_render(
+                    render.crop_pdf_page_strip, blob, page_no, s.pdf_dpi, s.tile_width,
                     strip.offset, strip.height, s.jpeg_quality,
                 )
-                return jpeg
-            out = await self.run_cpu(
-                cpu.render_pdf_pages, blob, [tile_num], s.pdf_dpi, s.tile_width, s.jpeg_quality
-            )
-            return out[0][2]
 
-        if row.doc_type == "IMG":
+                return cropped.jpeg
+            
+            out = await self.run_render(
+                render.render_pdf_pages, blob, [tile_num], s.pdf_dpi, s.tile_width, s.jpeg_quality
+            )
+
+            return out[0].jpeg
+
+        if row.doc_type == DocType.IMG:
             blob = await self._read_blob(row)
-            _, jpeg = await self.run_cpu(
-                cpu.crop_one_tile,
+            cropped = await self.run_render(
+                render.crop_one_tile,
                 blob,
                 s.tile_width,
                 tile_num,
@@ -854,7 +851,8 @@ class TilerService:
                 s.tile_overlap,
                 s.jpeg_quality,
             )
-            return jpeg
+
+            return cropped.jpeg
 
         # MHTML / URL
         if row.page_height > s.safe_fullpage_px:
@@ -863,16 +861,19 @@ class TilerService:
             png = await self._browser_call(
                 web.render_mhtml_region, self.browser, s, blob, strip
             )
-            _, jpeg = await self.run_cpu(cpu.encode_strip, png, s.tile_width, s.jpeg_quality)
-            return jpeg
+            encoded = await self.run_render(render.encode_strip, png, s.tile_width, s.jpeg_quality)
+
+            return encoded.jpeg
 
         before = self.page_cache.hits
         png = await self.page_cache.get_or_create(row.doc_id, lambda: self._full_page(row))
+
         metrics.CACHE.labels(
             cache="page", outcome="hit" if self.page_cache.hits > before else "miss"
         ).inc()
-        _, jpeg = await self.run_cpu(
-            cpu.crop_one_tile,
+
+        cropped = await self.run_render(
+            render.crop_one_tile,
             png,
             s.tile_width,
             tile_num,
@@ -881,7 +882,8 @@ class TilerService:
             s.tile_overlap,
             s.jpeg_quality,
         )
-        return jpeg
+
+        return cropped.jpeg
 
 
     async def _full_page(self, row: DocRow) -> bytes:
@@ -913,10 +915,12 @@ class TilerService:
     async def delete(self, doc_id: str) -> bool:
         """Delete a document's rows, blob and cached tiles; return whether it existed."""
         removed = await self.store.delete_doc(doc_id)
+
         if removed:
             await self.blobs.delete(doc_id)
             await self._invalidate(doc_id)
             metrics.DOCS.set(await self.store.count_docs())
+
         return removed
 
 
@@ -924,26 +928,31 @@ class TilerService:
         """Probe the DB, blob store and browser for the readiness endpoint."""
         checks: dict[str, Any] = {}
         ok = True
+        
         try:
             await self.store.db.execute("SELECT 1")
             checks["db"] = "ok"
         except Exception as exc:
             checks["db"] = f"error: {exc}"
             ok = False
+
         try:
             await asyncio.to_thread(self.blobs.ensure_root)
             checks["blobs"] = "ok"
         except Exception as exc:
             checks["blobs"] = f"error: {exc}"
             ok = False
+
         if self.settings.browser_enabled:
             checks["browser"] = "ok" if self.browser.available else (
                 f"unavailable: {self.browser.start_error}"
             )
             if not self.browser.available:
                 ok = False
+
         else:
             checks["browser"] = "disabled"
+
         return ok, checks
 
 

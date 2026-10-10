@@ -123,7 +123,7 @@ mkdir -p ./data && sudo chown -R 10001:10001 ./data
 - **Readiness:** `GET /readyz` — checks DB, blob dir, Chromium pool; `503` when not
   ready. The Compose healthcheck uses it.
 - Run **one** uvicorn worker per container (`--workers 1`). Concurrency comes from the
-  event loop plus the browser/CPU pools, not from workers — multiple workers would each
+  event loop plus the browser/render pools, not from workers — multiple workers would each
   spawn their own Chromium pool and SQLite writer and fight over the volume. **Scale
   horizontally with more containers**, sharing the blob store and DB behind their
   interfaces.

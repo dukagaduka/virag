@@ -240,7 +240,10 @@ def make_settings(**overrides) -> Settings:
             base_url="http://emb/v1", model_name="emb", api_key="k-emb", chunk_size=16, timeout=60,
         ),
         tiler_settings=TilerSettings(base_url="http://tiler", timeout=120),
-        vlm_settings=VLMSettings(base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout=120),
+        vlm_settings=VLMSettings(
+            base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout=120,
+            max_concurrency=0, max_retries=0,
+        ),
         reconcile_settings=ReconcileSettings(self_heal=True, interval_sec=0, pending_ttl_sec=3600),
     )
 

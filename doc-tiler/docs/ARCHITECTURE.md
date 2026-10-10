@@ -68,13 +68,13 @@ Chromium RAM/CPU).
 - Recycle a Chromium process after `TILER_RECYCLE_AFTER` renders; detect crashed
   contexts and replace the process.
 
-### Layer 3 — CPU (PDF raster, PIL resize/slice, hashing), CPU-bound
+### Layer 3 — Render workers (PDF raster, PIL resize/slice, hashing), CPU-bound
 
 Done inline it blocks the loop; in threads the GIL kills parallelism. So:
-`ProcessPoolExecutor(max_workers=TILER_N_CPU_WORKERS)` — separate processes, true
+`ProcessPoolExecutor(max_workers=TILER_N_RENDER_WORKERS)` — separate processes, true
 multi-core. Dispatch via `loop.run_in_executor(process_pool, fn, ...)` and `await`.
 
-The CPU pool uses the **`spawn`** start method: the parent runs an event loop and
+The render pool uses the **`spawn`** start method: the parent runs an event loop and
 Playwright threads, and forking those into workers deadlocks.
 
 ### Why not simpler
@@ -372,7 +372,7 @@ the live page — is what gets tiled, so ingest and `/get_tile` render the same 
 Tall pages (> `TILER_SAFE_FULLPAGE_PX`) are captured per-strip via
 `page.screenshot(clip=...)` with a viewport-relative clip, scrolling into view so lazy
 content rasterizes. Ingest and regeneration call the *same* functions in
-`render/cpu.py`.
+`render/render.py`.
 
 ---
 
@@ -433,7 +433,7 @@ tiler/
   preflight.py       # standalone startup validation (runs before uvicorn)
   media.py  metrics.py  errors.py  models.py       # mime sniff, Prometheus, error envelope, pydantic
   api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  ops.py
-  render/ browser.py  cpu.py  geometry.py          # cpu = PDF raster/PIL/hash; geometry = tiling forward+reverse
+  render/ browser.py  render.py  geometry.py  types.py  # render = PDF raster/PIL/hash; geometry = tiling forward+reverse; types = worker/tile result dataclasses
   store/  blobs.py  meta.py  cache.py
   meta/   schema.py                                # load schema, meta_expr(), CREATE INDEX loop
   ssrf.py  netguard.py  hashing.py                 # URL policy + pinning proxy + sha256

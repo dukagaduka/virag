@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..config import Settings
+from ..metrics import BROWSER_RECYCLES
 from .geometry import Strip
 
 log = logging.getLogger("tiler.browser")
@@ -109,6 +110,7 @@ class BrowserPool:
         """Start Playwright and launch Chromium; record any failure instead of raising."""
         self.per_context_proxy = per_context_proxy
         try:
+            # imported lazily: playwright is optional (PDF/IMG-only deployments run without it)
             from playwright.async_api import async_playwright  # noqa: PLC0415
 
             self._pw = await async_playwright().start()
@@ -172,8 +174,7 @@ class BrowserPool:
                     await self._cond.wait()
 
                 needs_recycle = (
-                    self._browser is None
-                    or not self._browser.is_connected()
+                    not self.available
                     or self._renders >= self._s.recycle_after
                 )
 
@@ -225,8 +226,6 @@ class BrowserPool:
 
     async def _recycle(self) -> None:
         """Close the current Chromium and launch a replacement."""
-        from ..metrics import BROWSER_RECYCLES  # noqa: PLC0415
-
         log.info("recycling Chromium after %d renders", self._renders)
 
         BROWSER_RECYCLES.inc()

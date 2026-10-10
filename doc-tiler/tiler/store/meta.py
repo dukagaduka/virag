@@ -8,6 +8,7 @@ persistence goes through `MetaStore`, so SQLite → Postgres stays a driver swap
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import time
@@ -16,7 +17,9 @@ from typing import Any, Iterable, Sequence
 
 import aiosqlite
 
-from ..meta.schema import Field, MetadataSchema, meta_expr
+from ..meta.schema import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
+from ..models import DocType
+from ..render.types import RenderedTile
 
 PRAGMAS = (
     "PRAGMA journal_mode=WAL",
@@ -98,7 +101,7 @@ class DocRow:
     """A row from the `docs` table with metadata parsed to a dict."""
 
     doc_id: str
-    doc_type: str
+    doc_type: DocType
     blob_rel_path: str
     source_url: str | None
     page_height: int
@@ -117,9 +120,10 @@ class DocRow:
         raw = row["metadata"]
         keys = row.keys()
         raw_ph = row["page_heights"] if "page_heights" in keys else None
+
         return cls(
             doc_id=row["doc_id"],
-            doc_type=row["doc_type"],
+            doc_type=DocType(row["doc_type"]),
             blob_rel_path=row["blob_rel_path"],
             source_url=row["source_url"],
             page_height=row["page_height"],
@@ -164,6 +168,7 @@ def decode_cursor(cursor: str) -> tuple[int, str]:
         pad = "=" * (-len(cursor) % 4)
         created_at, _, doc_id = base64.urlsafe_b64decode(cursor + pad).decode().partition(":")
         return int(created_at), doc_id
+    
     except Exception as exc:
         raise SearchError(f"invalid cursor: {exc}") from exc
 
@@ -187,6 +192,7 @@ def build_search_query(
                 "only declared (indexed) keys are searchable",
                 f.key,
             )
+        
         op = (f.op or "eq").lower()
         if op not in OPS:
             raise SearchError(f"unsupported op {f.op!r}; expected one of {sorted(OPS)}", f.key)
@@ -196,8 +202,7 @@ def build_search_query(
                 f"{field.type!r}",
                 f.key,
             )
-        from ..meta.schema import MetadataViolation, coerce_filter_value  # noqa: PLC0415
-
+        
         try:
             value = coerce_filter_value(f.value, field)
         except MetadataViolation as exc:
@@ -217,6 +222,7 @@ def build_search_query(
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
+
     sql += " ORDER BY created_at DESC, doc_id DESC LIMIT ?"
     params.append(limit + 1)  # one extra row tells us whether a next page exists
     
@@ -231,17 +237,17 @@ class MetaStore:
         self._db: aiosqlite.Connection | None = None
         self._lock: Any = None
 
+
     @property
     def db(self) -> aiosqlite.Connection:
         """The open connection; raises if the store is not connected."""
         if self._db is None:
             raise RuntimeError("MetaStore is not connected")
         return self._db
+    
 
     async def connect(self) -> None:
         """Open the connection and apply the startup pragmas."""
-        import asyncio  # noqa: PLC0415
-
         self._lock = asyncio.Lock()
         connection = aiosqlite.connect(self.db_path)
         # aiosqlite runs SQLite on a plain (non-daemon) thread; if startup aborts
@@ -249,9 +255,12 @@ class MetaStore:
         connection.daemon = True
         self._db = await connection
         self._db.row_factory = aiosqlite.Row
+
         for pragma in PRAGMAS:
             await self._db.execute(pragma)
+
         await self._db.commit()
+
 
     async def close(self) -> None:
         """Close the connection if open."""
@@ -259,11 +268,13 @@ class MetaStore:
             await self._db.close()
             self._db = None
 
+
     async def create_tables(self) -> None:
         """Create the base tables and indexes if they do not exist."""
         async with self._lock:
             for stmt in DDL:
                 await self.db.execute(stmt)
+
             # Migrate volumes created before the binding secret existed: the column
             # backfills to '' (an empty slot), matching a tiler run without a secret.
             cur = await self.db.execute("PRAGMA table_info(service_meta)")
@@ -272,6 +283,7 @@ class MetaStore:
                 await self.db.execute(
                     "ALTER TABLE service_meta ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''"
                 )
+
             # Migrate volumes created before streaming ingest: pre-existing docs were
             # written atomically, so they backfill to complete=1.
             cur = await self.db.execute("PRAGMA table_info(docs)")
@@ -280,11 +292,14 @@ class MetaStore:
                 await self.db.execute(
                     "ALTER TABLE docs ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
                 )
+
             # Migrate volumes created before PDF strip slicing: page_heights backfills to
             # NULL, i.e. "not sliced" — get_tile then falls back to page-per-tile PDF.
             if "page_heights" not in doc_columns:
                 await self.db.execute("ALTER TABLE docs ADD COLUMN page_heights TEXT")
+
             await self.db.commit()
+
 
     async def create_metadata_indexes(self, statements: Iterable[str]) -> list[str]:
         """Create the given metadata expression indexes.
@@ -293,12 +308,16 @@ class MetaStore:
         reindex step.
         """
         created = []
+
         async with self._lock:
             for stmt in statements:
                 await self.db.execute(stmt)
                 created.append(stmt)
+
             await self.db.commit()
+
         return created
+
 
     async def drop_stale_metadata_indexes(self, keep: set[str]) -> list[str]:
         """Drop `idx_meta_*` indexes for fields that are no longer declared."""
@@ -307,14 +326,18 @@ class MetaStore:
         )
         rows = await cur.fetchall()
         dropped = []
+
         async with self._lock:
             for row in rows:
                 if row["name"] not in keep:
                     await self.db.execute(f"DROP INDEX IF EXISTS {row['name']}")
                     dropped.append(row["name"])
+
             if dropped:
                 await self.db.commit()
+
         return dropped
+
 
     # ------------------------------------------------------------------ #
     # service_meta
@@ -323,8 +346,10 @@ class MetaStore:
         """Return the singleton service-config row, or None if uninitialized."""
         cur = await self.db.execute("SELECT * FROM service_meta WHERE id = 1")
         row = await cur.fetchone()
+
         if row is None:
             return None
+        
         return ServiceMeta(
             tile_width=row["tile_width"],
             tile_height=row["tile_height"],
@@ -335,6 +360,7 @@ class MetaStore:
             secret_hash=row["secret_hash"],
         )
 
+
     async def init_service_meta(
         self,
         geometry: dict[str, int],
@@ -343,6 +369,7 @@ class MetaStore:
     ) -> ServiceMeta:
         """Insert the singleton service-config row for a fresh database."""
         now = int(time.time())
+
         async with self._lock:
             await self.db.execute(
                 "INSERT INTO service_meta (id, tile_width, tile_height, tile_overlap, "
@@ -358,9 +385,11 @@ class MetaStore:
                 ),
             )
             await self.db.commit()
+
         return ServiceMeta(
             render_version=render_version, initialized_at=now, secret_hash=secret_hash, **geometry
         )
+
 
     async def update_render_version(self, render_version: str) -> None:
         """Update the stored render version on the service-config row."""
@@ -370,6 +399,7 @@ class MetaStore:
             )
             await self.db.commit()
 
+
     # ------------------------------------------------------------------ #
     # docs / tiles
     # ------------------------------------------------------------------ #
@@ -377,7 +407,9 @@ class MetaStore:
         """Return the doc row for `doc_id`, or None if absent."""
         cur = await self.db.execute("SELECT * FROM docs WHERE doc_id = ?", (doc_id,))
         row = await cur.fetchone()
+
         return DocRow.from_row(row) if row else None
+
 
     async def get_tiles(self, doc_id: str) -> list[TileRow]:
         """Return all tile rows for a doc, ordered by tile number."""
@@ -388,6 +420,7 @@ class MetaStore:
         )
         return [TileRow(**dict(r)) for r in await cur.fetchall()]
 
+
     async def get_tile(self, doc_id: str, tile_num: int) -> TileRow | None:
         """Return a single tile row, or None if absent."""
         cur = await self.db.execute(
@@ -396,13 +429,15 @@ class MetaStore:
             (doc_id, tile_num),
         )
         row = await cur.fetchone()
+
         return TileRow(**dict(row)) if row else None
+
 
     async def upsert_doc(
         self,
         *,
         doc_id: str,
-        doc_type: str,
+        doc_type: DocType,
         blob_rel_path: str,
         source_url: str | None,
         page_height: int,
@@ -410,13 +445,14 @@ class MetaStore:
         mime_type: str,
         metadata: dict[str, Any] | None,
         render_version: str,
-        tiles: Sequence[tuple[int, int, str]],
+        tiles: Sequence[RenderedTile],
         page_heights: list[int] | None = None,
     ) -> DocRow:
         """Single transaction: upsert the doc row and replace its tile rows."""
         now = int(time.time())
         meta_json = json.dumps(metadata, sort_keys=True) if metadata else None
         page_heights_json = json.dumps(page_heights) if page_heights else None
+
         async with self._lock:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
@@ -457,21 +493,25 @@ class MetaStore:
                 await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
                 await self.db.executemany(
                     "INSERT INTO tiles (doc_id, tile_num, height, image_hash) VALUES (?,?,?,?)",
-                    [(doc_id, num, height, image_hash) for num, height, image_hash in tiles],
+                    [(doc_id, t.tile_num, t.height, t.image_hash) for t in tiles],
                 )
                 await self.db.commit()
+
             except BaseException:
                 await self.db.rollback()
                 raise
+
         row = await self.get_doc(doc_id)
         assert row is not None
+
         return row
+
 
     async def begin_doc(
         self,
         *,
         doc_id: str,
-        doc_type: str,
+        doc_type: DocType,
         blob_rel_path: str,
         source_url: str | None,
         page_height: int,
@@ -487,6 +527,7 @@ class MetaStore:
         """
         now = int(time.time())
         meta_json = json.dumps(metadata, sort_keys=True) if metadata else None
+
         async with self._lock:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
@@ -524,12 +565,13 @@ class MetaStore:
                 )
                 await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
                 await self.db.commit()
+
             except BaseException:
                 await self.db.rollback()
                 raise
 
 
-    async def append_tiles(self, doc_id: str, tiles: Sequence[tuple[int, int, str]]) -> None:
+    async def append_tiles(self, doc_id: str, tiles: Sequence[RenderedTile]) -> None:
         """Insert a batch of tile rows for an in-progress streaming ingest."""
         if not tiles:
             return
@@ -537,7 +579,7 @@ class MetaStore:
         async with self._lock:
             await self.db.executemany(
                 "INSERT OR REPLACE INTO tiles (doc_id, tile_num, height, image_hash) VALUES (?,?,?,?)",
-                [(doc_id, num, height, image_hash) for num, height, image_hash in tiles],
+                [(doc_id, t.tile_num, t.height, t.image_hash) for t in tiles],
             )
             await self.db.commit()
 
@@ -585,6 +627,7 @@ class MetaStore:
             )
             await self.db.commit()
 
+
     async def delete_doc(self, doc_id: str) -> bool:
         """Delete a doc (cascading to its tiles); return whether it existed."""
         async with self._lock:
@@ -592,17 +635,20 @@ class MetaStore:
             await self.db.commit()
             return cur.rowcount > 0
 
+
     async def optimize(self) -> None:
         """Refresh planner statistics (cheap; a no-op when nothing changed)."""
         async with self._lock:
             await self.db.execute("PRAGMA optimize")
             await self.db.commit()
 
+
     async def count_docs(self) -> int:
         """Return the total number of stored documents."""
         cur = await self.db.execute("SELECT COUNT(*) AS n FROM docs")
         row = await cur.fetchone()
         return int(row["n"])
+
 
     # ------------------------------------------------------------------ #
     async def search(
@@ -617,11 +663,14 @@ class MetaStore:
         cur = await self.db.execute(sql, params)
         rows = [DocRow.from_row(r) for r in await cur.fetchall()]
         next_cursor = None
+
         if len(rows) > limit:
             rows = rows[:limit]
             last = rows[-1]
             next_cursor = encode_cursor(last.created_at, last.doc_id)
+
         return rows, next_cursor
+
 
     async def explain(self, sql: str, params: Sequence[Any]) -> list[str]:
         """Return the query plan detail lines for a SQL statement."""

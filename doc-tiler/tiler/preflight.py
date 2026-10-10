@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 
 from .config import ConfigError, load_settings
 from .guard import GeometryMismatch, enforce
 from .main import configure_logging
 from .meta.schema import SchemaError, index_statements, load_schema
+from .store.blobs import BlobStore
 from .store.meta import MetaStore
 
 log = logging.getLogger("tiler.preflight")
@@ -25,12 +27,8 @@ async def _run() -> int:
     settings = load_settings()
     schema = load_schema(settings.metadata_schema_path)
 
-    import os  # noqa: PLC0415
-
     os.makedirs(os.path.dirname(os.path.abspath(settings.db_path)) or ".", exist_ok=True)
     os.makedirs(settings.temp_dir, exist_ok=True)
-
-    from .store.blobs import BlobStore  # noqa: PLC0415
 
     BlobStore(settings.blob_dir).ensure_root()
 

@@ -93,10 +93,12 @@ def load_schema(path: str | Path) -> MetadataSchema:
             "metadata schema %s not found — no metadata keys are searchable", p
         )
         return EMPTY_SCHEMA
+    
     try:
         raw = yaml.safe_load(p.read_text()) or {}
     except yaml.YAMLError as exc:
         raise SchemaError(f"cannot parse {p}: {exc}") from exc
+    
     return parse_schema(raw, source=str(p))
 
 
@@ -113,25 +115,31 @@ def parse_schema(raw: Any, source: str = "<inline>") -> MetadataSchema:
 
     fields: list[Field] = []
     seen: set[str] = set()
+
     for entry in entries:
         if not isinstance(entry, dict):
             raise SchemaError(f"{source}: each field must be a mapping, got {entry!r}")
+        
         key = entry.get("key")
         if not isinstance(key, str) or not _KEY_RE.match(key):
             raise SchemaError(
                 f"{source}: field key {key!r} must match {_KEY_RE.pattern} "
                 "(dotted identifiers only)"
             )
+        
         if key in seen:
             raise SchemaError(f"{source}: duplicate field key {key!r}")
+        
         ftype = entry.get("type")
         if ftype not in FIELD_TYPES:
             raise SchemaError(
                 f"{source}: field {key!r} has type {ftype!r}; expected one of {FIELD_TYPES}"
             )
+        
         required = bool(entry.get("required", False))
         seen.add(key)
         fields.append(Field(key=key, type=ftype, required=required))
+
     return MetadataSchema(version=version, fields=tuple(fields))
 
 
@@ -148,6 +156,7 @@ def _dig(obj: Any, key: str) -> Any:
         if not isinstance(cur, dict) or part not in cur:
             return _MISSING
         cur = cur[part]
+
     return cur
 
 
@@ -168,6 +177,7 @@ def coerce_text(value: Any, key: str) -> str:
         raise MetadataViolation(
             f"field {key!r} is declared 'text' but got {type(value).__name__}", key
         )
+    
     return str(value)
 
 
@@ -195,14 +205,17 @@ def validate_metadata(metadata: Any, schema: MetadataSchema) -> dict[str, Any]:
         raise MetadataViolation("metadata must be a JSON object")
 
     out = _deep_copy(metadata)
+
     for field in schema.fields:
         value = _dig(out, field.key)
+        
         if value is _MISSING or value is None:
             if field.required:
                 raise MetadataViolation(
                     f"required metadata field {field.key!r} is missing", field.key
                 )
             continue
+
         coerced = (
             coerce_text(value, field.key)
             if field.type == "text"
@@ -210,6 +223,7 @@ def validate_metadata(metadata: Any, schema: MetadataSchema) -> dict[str, Any]:
         )
         if coerced is not value:
             _set_path(out, field.key, coerced)
+
     return out
 
 

@@ -69,7 +69,7 @@ async def info(request: Request) -> dict[str, Any]:
         },
         "pools": {
             "browsers": svc.settings.browsers,
-            "cpu_workers": svc.settings.cpu_workers,
+            "render_workers": svc.settings.render_workers,
             "browser_available": svc.browser.available,
         },
         "cache": {"tile": svc.tile_cache.stats(), "page": svc.page_cache.stats()},

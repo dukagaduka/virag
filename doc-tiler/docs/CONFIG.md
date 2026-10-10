@@ -54,7 +54,7 @@ Pillow and PyMuPDF versions are also folded into `render_version`.)
 | Variable | Default | Meaning |
 |---|---|---|
 | `TILER_N_BROWSERS` | `min(cpu, 4)` | Max concurrent Chromium renders (semaphore). |
-| `TILER_N_CPU_WORKERS` | `cpu_count` | Process-pool size (PDF raster / PIL / hashing). |
+| `TILER_N_RENDER_WORKERS` | `cpu_count` | Process-pool size (PDF raster / PIL / hashing). |
 | `TILER_RECYCLE_AFTER` | `500` | Recycle a Chromium process after N renders. |
 | `TILER_RENDER_CACHE_SIZE` | `64` | LRU capacity for `get_tile`. |
 

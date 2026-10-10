@@ -25,9 +25,11 @@ class AsyncLRU:
         self.misses = 0
         self.coalesced = 0
 
+
     def peek(self, key: Hashable) -> Any | None:
         """Return the cached value without affecting LRU order, or None."""
         return self._data.get(key)
+
 
     async def get_or_create(
         self, key: Hashable, factory: Callable[[], Awaitable[Any]]
@@ -43,12 +45,14 @@ class AsyncLRU:
                     self._data.move_to_end(key)
                     self.hits += 1
                     return self._data[key]
+                
                 pending = self._inflight.get(key)
                 if pending is None:
                     self.misses += 1
                     fut: asyncio.Future = asyncio.get_running_loop().create_future()
                     self._inflight[key] = fut
                     break
+
                 self.coalesced += 1
 
             # Someone else is already producing this key: wait for their result.
@@ -85,16 +89,19 @@ class AsyncLRU:
 
         return value
 
+
     async def invalidate(self, predicate: Callable[[Hashable], bool]) -> None:
         """Drop every cached key for which `predicate` returns true."""
         async with self._lock:
             for key in [k for k in self._data if predicate(k)]:
                 self._data.pop(key, None)
 
+
     async def clear(self) -> None:
         """Drop all cached values."""
         async with self._lock:
             self._data.clear()
+
 
     def stats(self) -> dict[str, int]:
         """Return current size and hit/miss/coalesce counters."""

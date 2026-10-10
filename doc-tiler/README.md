@@ -76,7 +76,7 @@ tiler/            the service package
   config.py       env, geometry/pixel tiers, render_version
   guard.py        startup geometry + binding-secret guard
   api/            ingest, tiles, docs, metadata, search, ops
-  render/         geometry (forward+reverse), cpu (PDF/PIL), browser (Chromium)
+  render/         geometry (forward+reverse), render (PDF/PIL), browser (Chromium), types
   store/          blobs (content-addressed FS), meta (SQLite), cache (async LRU)
   meta/schema.py  declared schema, meta_expr(), validation
   ssrf.py netguard.py   URL policy + the pinning proxy

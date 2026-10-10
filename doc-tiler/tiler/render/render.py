@@ -1,4 +1,4 @@
-"""CPU-bound rendering primitives (PDF raster, image resize/slice, JPEG encode).
+"""Rendering primitives (PDF raster, image resize/slice, JPEG encode).
 
 Every function here must stay importable and picklable: they run inside
 `ProcessPoolExecutor` workers, never on the event loop. No app state, no I/O
@@ -18,6 +18,7 @@ from PIL import Image, ImageOps
 
 from ..config import JPEG_PROGRESSIVE, JPEG_SUBSAMPLING
 from .geometry import resized_height, slice_strips, strip_for
+from .types import EncodedImage, EncodedPage, EncodedStrip, EncodedTile
 
 # Guard against decompression-bomb DoS while still allowing very tall pages.
 Image.MAX_IMAGE_PIXELS = 512_000_000
@@ -102,8 +103,8 @@ def render_pdf_pages(
     dpi: int,
     width: int,
     quality: int,
-) -> list[tuple[int, int, bytes]]:
-    """Return `[(page_num, height, jpeg)]` for the requested pages (all when None)."""
+) -> list[EncodedTile]:
+    """Render the requested pages (all when None), one tile per page, tile_num == page_num."""
     try:
         doc = fitz.open(stream=blob, filetype="pdf")
     except Exception as exc:
@@ -114,7 +115,7 @@ def render_pdf_pages(
             raise DecodeError("PDF is password protected")
         
         pages = list(range(doc.page_count)) if page_nums is None else page_nums
-        out: list[tuple[int, int, bytes]] = []
+        out: list[EncodedTile] = []
 
         for pno in pages:
             if not 0 <= pno < doc.page_count:
@@ -128,7 +129,7 @@ def render_pdf_pages(
             img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             img = _fit_width(img, width)
 
-            out.append((pno, img.height, _to_jpeg(img, quality)))
+            out.append(EncodedTile(tile_num=pno, height=img.height, jpeg=_to_jpeg(img, quality)))
 
         return out
 
@@ -142,11 +143,10 @@ def render_pdf_page_strips(
     overlap: int,
     min_tile_height: int,
     quality: int,
-) -> list[tuple[int, int, list[tuple[int, int, bytes]]]]:
+) -> list[EncodedPage]:
     """Render pages and slice each into vertical strips (never across pages).
 
-    Returns `[(page_num, page_height, [(offset, strip_height, jpeg), ...])]`, pages in
-    the requested order. The crop box here MUST match `crop_pdf_page_strip` so a
+    Returns one `EncodedPage` per requested page, in the requested order. The crop box here MUST match `crop_pdf_page_strip` so a
     regenerated strip is byte-identical to the one hashed at ingest.
     """
     try:
@@ -159,7 +159,7 @@ def render_pdf_page_strips(
             raise DecodeError("PDF is password protected")
 
         pages = list(range(doc.page_count)) if page_nums is None else page_nums
-        out: list[tuple[int, int, list[tuple[int, int, bytes]]]] = []
+        out: list[EncodedPage] = []
 
         for pno in pages:
             if not 0 <= pno < doc.page_count:
@@ -174,10 +174,14 @@ def render_pdf_page_strips(
             page_height = img.height
 
             strips = [
-                (s.offset, s.height, _to_jpeg(img.crop((0, s.offset, width, s.offset + s.height)), quality))
+                EncodedStrip(
+                    offset=s.offset,
+                    height=s.height,
+                    jpeg=_to_jpeg(img.crop((0, s.offset, width, s.offset + s.height)), quality),
+                )
                 for s in slice_strips(page_height, tile_height, overlap, min_tile_height)
             ]
-            out.append((pno, page_height, strips))
+            out.append(EncodedPage(page_num=pno, page_height=page_height, strips=strips))
 
         return out
 
@@ -190,7 +194,7 @@ def crop_pdf_page_strip(
     offset: int,
     height: int,
     quality: int,
-) -> tuple[int, bytes]:
+) -> EncodedImage:
     """Regenerate a single PDF strip: render its page, crop `[offset, offset+height]`.
 
     The crop box mirrors `render_pdf_page_strips` exactly → byte-identical output.
@@ -221,7 +225,10 @@ def crop_pdf_page_strip(
                 f"the rendered page (rendered_height={img.height})"
             )
 
-        return bottom - top, _to_jpeg(img.crop((0, top, width, bottom)), quality)
+        return EncodedImage(
+            height=bottom - top,
+            jpeg=_to_jpeg(img.crop((0, top, width, bottom)), quality),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -239,19 +246,20 @@ def tile_full_page(
     overlap: int,
     min_tile_height: int,
     quality: int,
-) -> tuple[int, list[tuple[int, int, bytes]]]:
-    """Slice a full-page source into strips → `(page_height, [(tile_num, height, jpeg)])`."""
+) -> EncodedPage:
+    """Slice a full-page source into strips; strip order is the tile_num order."""
     img = _fit_width(_open_image(data), width)
     page_height = img.height
-    tiles = [
-        (
-            s.tile_num,
-            s.height,
-            _to_jpeg(img.crop((0, s.offset, width, s.offset + s.height)), quality),
+    strips = [
+        EncodedStrip(
+            offset=s.offset,
+            height=s.height,
+            jpeg=_to_jpeg(img.crop((0, s.offset, width, s.offset + s.height)), quality),
         )
         for s in slice_strips(page_height, tile_height, overlap, min_tile_height)
     ]
-    return page_height, tiles
+
+    return EncodedPage(page_num=0, page_height=page_height, strips=strips)
 
 
 def crop_one_tile(
@@ -262,8 +270,8 @@ def crop_one_tile(
     tile_height: int,
     overlap: int,
     quality: int,
-) -> tuple[int, bytes]:
-    """Crop and encode a single tile by its index → `(height, jpeg)`."""
+) -> EncodedImage:
+    """Crop and encode a single tile by its index."""
     img = _fit_width(_open_image(data), width)
     strip = strip_for(tile_num, page_height, tile_height, overlap)
     top = min(max(strip.offset, 0), img.height)
@@ -275,11 +283,14 @@ def crop_one_tile(
             f"(page_height={page_height}, rendered={img.height})"
         )
     
-    return bottom - top, _to_jpeg(img.crop((0, top, width, bottom)), quality)
+    return EncodedImage(
+        height=bottom - top,
+        jpeg=_to_jpeg(img.crop((0, top, width, bottom)), quality),
+    )
 
 
-def encode_strip(data: bytes, width: int, quality: int) -> tuple[int, bytes]:
-    """Encode an already-cropped capture (tall-page clip path) → `(height, jpeg)`."""
+def encode_strip(data: bytes, width: int, quality: int) -> EncodedImage:
+    """Encode an already-cropped capture (tall-page clip path)."""
     img = _flatten(_open_image(data))
 
     if img.width > width:
@@ -290,4 +301,4 @@ def encode_strip(data: bytes, width: int, quality: int) -> tuple[int, bytes]:
         padded.paste(img, (0, 0))
         img = padded
 
-    return img.height, _to_jpeg(img, quality)
+    return EncodedImage(height=img.height, jpeg=_to_jpeg(img, quality))

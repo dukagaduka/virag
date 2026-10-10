@@ -27,19 +27,27 @@ def slice_strips(
     final one, which is what keeps the reverse mapping consistent.
     """
     step = tile_height - overlap
+
     if step <= 0:
         raise ValueError("TILE_OVERLAP must be < TILE_HEIGHT")
+    
     strips: list[Strip] = []
+
     if page_height <= 0:
         return strips
+    
     offset = 0
+
     while True:
         h = min(tile_height, page_height - offset)
+
         if h >= min_tile_height:
             strips.append(Strip(tile_num=len(strips), offset=offset, height=h))
         if offset + tile_height >= page_height:
             break
+        
         offset += step
+
     return strips
 
 

@@ -105,4 +105,4 @@ async def test_info_endpoint(client):
         "min_tile_height": 28,
     }
     assert body["render_version"]
-    assert body["pools"]["cpu_workers"] == 2
+    assert body["pools"]["render_workers"] == 2

@@ -336,12 +336,8 @@ components:
   schemas:
     DocType:
       type: string
+      description: Declared document type. A stored doc is never URL (a URL ingest is stored as MHTML).
       enum: [PDF, URL, MHTML, IMG]
-
-    StoredDocType:
-      type: string
-      description: Effective stored type (URL is stored as MHTML).
-      enum: [PDF, MHTML, IMG]
 
     TileMeta:
       type: object
@@ -361,7 +357,7 @@ components:
       required: [doc_id, doc_type, render_version, stored, page_height, tile_count, tiles]
       properties:
         doc_id:         { type: string, description: sha256(blob) hex. }
-        doc_type:       { $ref: '#/components/schemas/StoredDocType' }
+        doc_type:       { $ref: '#/components/schemas/DocType' }
         source_url:     { type: [string, "null"], format: uri }
         render_version: { type: string }
         stored:         { type: boolean }
@@ -376,7 +372,7 @@ components:
       required: [doc_id, doc_type, tile_count, created_at]
       properties:
         doc_id:         { type: string }
-        doc_type:       { $ref: '#/components/schemas/StoredDocType' }
+        doc_type:       { $ref: '#/components/schemas/DocType' }
         tile_count:     { type: integer }
         complete:       { type: boolean, default: true, description: False while a streaming ingest is still in flight (or crashed); such a doc is not servable via /get_tile. }
         render_version: { type: [string, "null"], description: The render_version stamped on the doc at ingest. }
@@ -408,7 +404,7 @@ components:
       properties:
         event:          { type: string, enum: [begin] }
         doc_id:         { type: string, description: sha256(blob) hex. }
-        doc_type:       { $ref: '#/components/schemas/StoredDocType' }
+        doc_type:       { $ref: '#/components/schemas/DocType' }
         source_url:     { type: [string, "null"], format: uri }
         render_version: { type: string }
 
@@ -429,7 +425,7 @@ components:
       properties:
         event:          { type: string, enum: [committed] }
         doc_id:         { type: string }
-        doc_type:       { $ref: '#/components/schemas/StoredDocType' }
+        doc_type:       { $ref: '#/components/schemas/DocType' }
         source_url:     { type: [string, "null"], format: uri }
         render_version: { type: string }
         page_height:    { type: integer, description: Full-page height for web/mhtml/img; 0 for PDF. }
