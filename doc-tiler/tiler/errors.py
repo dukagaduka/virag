@@ -13,6 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 class ApiError(Exception):
     """Domain error carrying the wire status + machine-readable code."""
 
+
     def __init__(
         self,
         status_code: int,
@@ -20,17 +21,21 @@ class ApiError(Exception):
         message: str,
         details: dict[str, Any] | None = None,
     ) -> None:
+
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.details = details
 
+
     def body(self) -> dict[str, Any]:
         """Render this error as the JSON body sent to the client."""
         error: dict[str, Any] = {"code": self.code, "message": self.message}
+
         if self.details:
             error["details"] = self.details
+
         return {"error": error}
 
 
@@ -108,6 +113,7 @@ def install_error_handlers(app: Any) -> None:
     async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
         """Wrap a raw Starlette HTTP exception in the error envelope."""
         code = _STATUS_CODES.get(exc.status_code, "ERROR")
+
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"code": code, "message": str(exc.detail)}},
@@ -147,8 +153,11 @@ def _jsonable(value: Any) -> Any:
     """Recursively coerce a value into JSON-serialisable primitives."""
     if isinstance(value, dict):
         return {k: _jsonable(v) for k, v in value.items()}
+
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
+
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
+
     return str(value)

@@ -10,6 +10,7 @@ import sys as _sys
 
 try:
     import pysqlite3 as _pysqlite3
+
 except ImportError:
     pass
 else:

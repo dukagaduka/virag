@@ -38,7 +38,7 @@ def _flatten(img: Image.Image) -> Image.Image:
         canvas.paste(rgba, mask=rgba.split()[-1])
 
         return canvas
-    
+
     return img.convert("RGB") if img.mode != "RGB" else img
 
 
@@ -66,7 +66,7 @@ def _open_image(data: bytes) -> Image.Image:
 
     except Exception as exc:
         raise DecodeError(f"cannot decode image: {exc}") from exc
-    
+
     # Normalise EXIF rotation at decode so ingest and get_tile agree.
     return ImageOps.exif_transpose(img) or img
 
@@ -75,7 +75,7 @@ def _fit_width(img: Image.Image, width: int) -> Image.Image:
     """Proportionally resize an image to exactly `width` (no-op if already that wide)."""
     if img.width == width:
         return img
-    
+
     new_h = resized_height(img.width, img.height, width)
 
     return img.resize((width, new_h), Image.LANCZOS)
@@ -90,9 +90,12 @@ def pdf_page_count(blob: bytes) -> int:
         with fitz.open(stream=blob, filetype="pdf") as doc:
             if doc.needs_pass:
                 raise DecodeError("PDF is password protected")
+
             return doc.page_count
+
     except DecodeError:
         raise
+
     except Exception as exc:
         raise DecodeError(f"cannot open PDF: {exc}") from exc
 
@@ -107,25 +110,27 @@ def render_pdf_pages(
     """Render the requested pages (all when None), one tile per page, tile_num == page_num."""
     try:
         doc = fitz.open(stream=blob, filetype="pdf")
+
     except Exception as exc:
         raise DecodeError(f"cannot open PDF: {exc}") from exc
-    
+
     with doc:
         if doc.needs_pass:
             raise DecodeError("PDF is password protected")
-        
+
         pages = list(range(doc.page_count)) if page_nums is None else page_nums
         out: list[EncodedTile] = []
 
         for pno in pages:
             if not 0 <= pno < doc.page_count:
                 raise DecodeError(f"page {pno} is out of range")
-            
+
             try:
                 pix = doc.load_page(pno).get_pixmap(dpi=dpi, alpha=False)
+
             except Exception as exc:
                 raise DecodeError(f"cannot rasterize page {pno}: {exc}") from exc
-            
+
             img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             img = _fit_width(img, width)
 
@@ -151,6 +156,7 @@ def render_pdf_page_strips(
     """
     try:
         doc = fitz.open(stream=blob, filetype="pdf")
+
     except Exception as exc:
         raise DecodeError(f"cannot open PDF: {exc}") from exc
 
@@ -167,6 +173,7 @@ def render_pdf_page_strips(
 
             try:
                 pix = doc.load_page(pno).get_pixmap(dpi=dpi, alpha=False)
+
             except Exception as exc:
                 raise DecodeError(f"cannot rasterize page {pno}: {exc}") from exc
 
@@ -201,17 +208,20 @@ def crop_pdf_page_strip(
     """
     try:
         doc = fitz.open(stream=blob, filetype="pdf")
+
     except Exception as exc:
         raise DecodeError(f"cannot open PDF: {exc}") from exc
 
     with doc:
         if doc.needs_pass:
             raise DecodeError("PDF is password protected")
+
         if not 0 <= page_num < doc.page_count:
             raise DecodeError(f"page {page_num} is out of range")
 
         try:
             pix = doc.load_page(page_num).get_pixmap(dpi=dpi, alpha=False)
+
         except Exception as exc:
             raise DecodeError(f"cannot rasterize page {page_num}: {exc}") from exc
 
@@ -276,13 +286,13 @@ def crop_one_tile(
     strip = strip_for(tile_num, page_height, tile_height, overlap)
     top = min(max(strip.offset, 0), img.height)
     bottom = min(strip.offset + strip.height, img.height)
-    
+
     if bottom <= top:
         raise DecodeError(
             f"tile {tile_num} falls outside the rendered page "
             f"(page_height={page_height}, rendered={img.height})"
         )
-    
+
     return EncodedImage(
         height=bottom - top,
         jpeg=_to_jpeg(img.crop((0, top, width, bottom)), quality),

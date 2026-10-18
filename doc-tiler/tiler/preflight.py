@@ -34,11 +34,13 @@ async def _run() -> int:
 
     store = MetaStore(settings.db_path)
     await store.connect()
+
     try:
         await store.create_tables()
         await enforce(store, settings)
         await store.create_metadata_indexes(index_statements(schema))
         docs = await store.count_docs()
+
     finally:
         await store.close()
 
@@ -49,19 +51,24 @@ async def _run() -> int:
         docs,
         [f.key for f in schema.fields],
     )
+
     return 0
 
 
 def main() -> int:
     """Run preflight, returning 0 on success or 1 on any fatal problem."""
     configure_logging()
+
     try:
         return asyncio.run(_run())
+
     except GeometryMismatch:
         return 1  # already logged at CRITICAL by the guard
+
     except (ConfigError, SchemaError) as exc:
         log.critical("FATAL: %s", exc)
         return 1
+
     except Exception as exc:  # storage/permission problems
         log.critical("FATAL: preflight failed: %s: %s", type(exc).__name__, exc)
         return 1

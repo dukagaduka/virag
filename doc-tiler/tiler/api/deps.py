@@ -36,14 +36,14 @@ def check_doc_id(doc_id: str) -> str:
     if not is_doc_id(doc_id):
         # A malformed id can never exist in the store; 404 keeps the contract simple.
         raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
-    
+
     return doc_id
 
 
 def check_declared_size(request: Request, limit: int) -> None:
     """Reject oversized uploads from the Content-Length header before reading them."""
     raw = request.headers.get("content-length")
-    
+
     if raw and raw.isdigit() and int(raw) > limit:
         raise too_large(
             f"request body of {raw} bytes exceeds TILER_MAX_DOC_BYTES={limit}",
@@ -64,7 +64,7 @@ async def read_capped(upload: UploadFile, limit: int) -> bytes:
             raise too_large(
                 f"document exceeds TILER_MAX_DOC_BYTES={limit}", read_bytes=total, limit=limit
             )
-        
+
         chunks.append(chunk)
 
     return b"".join(chunks)
@@ -74,13 +74,14 @@ def parse_metadata_field(raw: str | None) -> dict[str, Any] | None:
     """Parse the optional metadata form field into a JSON object, or None."""
     if raw is None or raw == "":
         return None
-    
+
     try:
         value = json.loads(raw)
+
     except json.JSONDecodeError as exc:
         raise unprocessable(f"metadata is not valid JSON: {exc}", "INVALID_METADATA_JSON") from exc
-    
+
     if not isinstance(value, dict):
         raise unprocessable("metadata must be a JSON object", "INVALID_METADATA_JSON")
-    
+
     return value

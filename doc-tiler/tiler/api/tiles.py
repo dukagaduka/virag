@@ -27,6 +27,7 @@ async def get_tile(
     """Regenerate a single tile from the stored original and return it as JPEG."""
     svc = service(request)
     jpeg, tile_row = await svc.get_tile(doc_id, tile_num, verify)
+
     return Response(
         content=jpeg,
         media_type="image/jpeg",

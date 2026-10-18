@@ -30,12 +30,12 @@ def slice_strips(
 
     if step <= 0:
         raise ValueError("TILE_OVERLAP must be < TILE_HEIGHT")
-    
+
     strips: list[Strip] = []
 
     if page_height <= 0:
         return strips
-    
+
     offset = 0
 
     while True:
@@ -43,9 +43,10 @@ def slice_strips(
 
         if h >= min_tile_height:
             strips.append(Strip(tile_num=len(strips), offset=offset, height=h))
+
         if offset + tile_height >= page_height:
             break
-        
+
         offset += step
 
     return strips
@@ -93,5 +94,5 @@ def resized_height(src_width: int, src_height: int, target_width: int) -> int:
     """Height after proportionally resizing to `target_width`. Never returns 0."""
     if src_width <= 0 or src_height <= 0:
         raise ValueError("source dimensions must be positive")
-    
+
     return max(1, round(src_height * target_width / src_width))

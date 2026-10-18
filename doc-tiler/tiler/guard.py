@@ -24,6 +24,7 @@ class GeometryMismatch(RuntimeError):
     interpreter from exiting at all, turning a fast fatal into a hang.
     """
 
+
     def __init__(self, message: str):
         super().__init__(message)
         self.message = message
@@ -57,6 +58,7 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
             geometry["min_tile_height"],
             render_version,
         )
+
         return meta
 
     stored = (row.tile_width, row.tile_height, row.tile_overlap, row.min_tile_height)
@@ -66,6 +68,7 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
         geometry["tile_overlap"],
         geometry["min_tile_height"],
     )
+
     if stored != current:
         message = (
             "FATAL: DB initialised with W=%d H=%d OVERLAP=%d MIN=%d; env has "
@@ -97,5 +100,5 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
             render_version,
             settings.render_mismatch_policy,
         )
-        
+
     return row

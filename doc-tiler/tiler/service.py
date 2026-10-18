@@ -42,6 +42,7 @@ MAX_PDF_CHUNK = 16  # pages per process-pool task: bounds pickle size per hop
 class TilerService:
     """Owns the pools, stores and caches; runs ingest and tile regeneration."""
 
+
     def __init__(self, settings: Settings, schema: MetadataSchema):
         self.settings = settings
         self.schema = schema
@@ -68,7 +69,7 @@ class TilerService:
             max_workers=self.settings.render_workers,
             mp_context=multiprocessing.get_context("spawn"),
         )
-        
+
         if self.settings.url_fetch_enabled and not self.settings.url_allow_private:
             self.guard_proxy = GuardProxy(allow_private=False)
             await self.guard_proxy.start()
@@ -93,20 +94,20 @@ class TilerService:
         """Dispatch render work to the process pool so the event loop never blocks."""
         if self._render_pool is None:
             raise RuntimeError("render pool is not running")
-        
+
         loop = asyncio.get_running_loop()
         metrics.INFLIGHT.labels(layer="cpu").inc()
 
         try:
             return await loop.run_in_executor(self._render_pool, fn, *args)
-        
+
         except render.DecodeError as exc:
             raise unprocessable(str(exc), "DECODE_FAILED") from exc
-        
+
         except concurrent.futures.process.BrokenProcessPool as exc:  # pragma: no cover
             log.error("render pool broke: %s", exc)
             raise bad_gateway("render worker crashed", "WORKER_CRASH") from exc
-        
+
         finally:
             metrics.INFLIGHT.labels(layer="cpu").dec()
 
@@ -117,6 +118,7 @@ class TilerService:
     def _strips_for(self, page_height: int) -> list[Strip]:
         """Slice a full-page height into tile strips using the configured geometry."""
         s = self.settings
+
         return slice_strips(page_height, s.tile_height, s.tile_overlap, s.min_tile_height)
 
 
@@ -130,6 +132,7 @@ class TilerService:
         s = self.settings
 
         pages = await self.run_render(render.pdf_page_count, blob)
+
         if pages <= 0:
             raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
 
@@ -166,6 +169,7 @@ class TilerService:
 
         tiles = []
         running = 0
+
         for page in per_page:
             for strip in page.strips:
                 tiles.append(RenderedTile.build(running, strip.height, strip.jpeg))
@@ -191,7 +195,7 @@ class TilerService:
             page_height=page.page_height,
             tiles=[RenderedTile.build(i, st.height, st.jpeg) for i, st in enumerate(page.strips)],
         )
-    
+
 
     async def _render_mhtml(self, blob: bytes) -> RenderedDoc:
         """Render a stored MHTML archive to tiles via the browser pool."""
@@ -237,7 +241,7 @@ class TilerService:
                 doc = await self._render_mhtml(blob)
             else:  # pragma: no cover - guarded upstream
                 raise bad_request(f"unsupported doc_type {effective_type!r}")
-            
+
         finally:
             metrics.RENDER_SECONDS.labels(doc_type=effective_type, path=path).observe(
                 time.perf_counter() - started
@@ -252,14 +256,19 @@ class TilerService:
     async def _browser_call(self, fn: Callable[..., Any], *args: Any) -> Any:
         """Run a browser render, mapping its failures to HTTP errors."""
         metrics.INFLIGHT.labels(layer="browser").inc()
+
         try:
             return await fn(*args)
+
         except BrowserUnavailable as exc:
             raise bad_gateway(f"Chromium is unavailable: {exc}", "BROWSER_UNAVAILABLE") from exc
+
         except RenderTimeout as exc:
             raise gateway_timeout(f"render timed out: {exc}") from exc
+
         except RenderFailure as exc:
             raise bad_gateway(f"render failed: {exc}") from exc
+
         finally:
             metrics.INFLIGHT.labels(layer="browser").dec()
 
@@ -284,10 +293,11 @@ class TilerService:
             metadata = None
 
         source_url: str | None = None
+
         if doc_type == DocType.URL:
             if not url:
                 raise bad_request("url is required when doc_type=URL", "MISSING_URL")
-            
+
             blob = await self._capture_url(url)
             effective_type = DocType.MHTML
             source_url = url
@@ -296,7 +306,7 @@ class TilerService:
         else:
             if data is None:
                 raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
-            
+
             blob = data
             effective_type = doc_type
             mime = media.check_and_mime(doc_type, blob)
@@ -378,6 +388,7 @@ class TilerService:
         s = self.settings
 
         pages = await self.run_render(render.pdf_page_count, blob)
+
         if pages <= 0:
             raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
 
@@ -400,6 +411,7 @@ class TilerService:
             except BaseException:
                 for task in tasks:
                     task.cancel()
+
                 raise
 
             return
@@ -416,6 +428,7 @@ class TilerService:
         ]
 
         running = 0
+
         try:
             for task in tasks:
                 group = await task
@@ -460,7 +473,7 @@ class TilerService:
             if doc_type == DocType.URL:
                 if not url:
                     raise bad_request("url is required when doc_type=URL", "MISSING_URL")
-                
+
                 blob = await self._capture_url(url)
                 effective_type = DocType.MHTML
                 source_url = url
@@ -469,7 +482,7 @@ class TilerService:
             else:
                 if data is None:
                     raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
-                
+
                 blob = data
                 effective_type = doc_type
                 mime = media.check_and_mime(doc_type, blob)
@@ -477,6 +490,7 @@ class TilerService:
             doc_id = sha256_hex(blob)
 
             existing = None if force else await self.store.get_doc(doc_id)
+
             if existing is not None and existing.complete:
                 metrics.INGESTS.labels(
                     doc_type=effective_type, stored="true", result="idempotent"
@@ -648,6 +662,7 @@ class TilerService:
             metrics.DOCS.set(await self.store.count_docs())
 
         log.info("revision: revised=%d skipped=%d failed=%d", revised, skipped, len(failed))
+
         return {"revised": revised, "skipped": skipped, "failed": failed, "render_version": current}
 
 
@@ -693,10 +708,11 @@ class TilerService:
             target = await validate_url(
                 url, allow_private=s.url_allow_private, enabled=s.url_fetch_enabled
             )
+
         except BlockedTarget as exc:
             metrics.SSRF_BLOCKS.inc()
             raise forbidden(str(exc), "SSRF_BLOCKED", url=url) from exc
-        
+
         log.info("fetching %s (resolved to %s)", url, ",".join(target.ips))
         proxy = self.guard_proxy.url if self.guard_proxy is not None else None
         blob = await self._browser_call(web.capture_url_mhtml, self.browser, s, url, proxy)
@@ -713,6 +729,7 @@ class TilerService:
         """Validate metadata against the schema, raising 422 on any violation."""
         try:
             return validate_metadata(metadata, self.schema)
+
         except MetadataViolation as exc:
             raise unprocessable(str(exc), "METADATA_SCHEMA_VIOLATION", key=exc.key) from exc
 
@@ -727,6 +744,7 @@ class TilerService:
             "height": height,
             "image_hash": image_hash,
         }
+
         if jpeg is not None:
             meta["data"] = base64.b64encode(jpeg).decode("ascii")
 
@@ -767,10 +785,12 @@ class TilerService:
 
         if row is None:
             raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
+
         if not row.complete:
             raise not_found(
                 f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id
             )
+
         if tile_num < 0 or tile_num >= row.tile_count:
             raise bad_request(
                 f"tile_num {tile_num} out of range (tile_count={row.tile_count})",
@@ -778,7 +798,7 @@ class TilerService:
                 doc_id=doc_id,
                 tile_count=row.tile_count,
             )
-        
+
         tile_row = await self.store.get_tile(doc_id, tile_num)
 
         if tile_row is None:  # pragma: no cover - implies a partial write
@@ -805,7 +825,7 @@ class TilerService:
                 if self.settings.render_mismatch_policy == "strict":
                     log.warning("%s — refusing (strict policy)", message)
                     raise conflict(message, "RENDER_MISMATCH", doc_id=doc_id, tile_num=tile_num)
-                
+
                 log.warning("%s — serving anyway (lenient policy)", message)
 
         return jpeg, tile_row
@@ -832,7 +852,7 @@ class TilerService:
                 )
 
                 return cropped.jpeg
-            
+
             out = await self.run_render(
                 render.render_pdf_pages, blob, [tile_num], s.pdf_dpi, s.tile_width, s.jpeg_quality
             )
@@ -892,6 +912,7 @@ class TilerService:
         _, png = await self._browser_call(
             web.render_mhtml_full_png, self.browser, self.settings, blob
         )
+
         return png
 
 
@@ -899,6 +920,7 @@ class TilerService:
         """Read a document's original blob, mapping a missing file to 404."""
         try:
             return await self.blobs.read(row.doc_id)
+
         except FileNotFoundError as exc:
             raise not_found(
                 f"blob for {row.doc_id!r} is missing from storage", "MISSING_BLOB"
@@ -928,10 +950,11 @@ class TilerService:
         """Probe the DB, blob store and browser for the readiness endpoint."""
         checks: dict[str, Any] = {}
         ok = True
-        
+
         try:
             await self.store.db.execute("SELECT 1")
             checks["db"] = "ok"
+
         except Exception as exc:
             checks["db"] = f"error: {exc}"
             ok = False
@@ -939,6 +962,7 @@ class TilerService:
         try:
             await asyncio.to_thread(self.blobs.ensure_root)
             checks["blobs"] = "ok"
+
         except Exception as exc:
             checks["blobs"] = f"error: {exc}"
             ok = False
@@ -947,6 +971,7 @@ class TilerService:
             checks["browser"] = "ok" if self.browser.available else (
                 f"unavailable: {self.browser.start_error}"
             )
+
             if not self.browser.available:
                 ok = False
 
@@ -954,23 +979,6 @@ class TilerService:
             checks["browser"] = "disabled"
 
         return ok, checks
+    
 
-
-def summarize(rows: Sequence[DocRow]) -> list[dict[str, Any]]:
-    """Project doc rows into the compact summaries returned by search/listing."""
-    return [
-        {
-            "doc_id": r.doc_id,
-            "doc_type": r.doc_type,
-            "tile_count": r.tile_count,
-            "complete": r.complete,
-            "render_version": r.render_version,
-            "created_at": r.created_at,
-            "source_url": r.source_url,
-            "metadata": r.metadata,
-        }
-        for r in rows
-    ]
-
-
-__all__ = ["TilerService", "RenderedTile", "RenderedDoc", "summarize", "ApiError"]
+__all__ = ["TilerService", "RenderedTile", "RenderedDoc", "ApiError"]

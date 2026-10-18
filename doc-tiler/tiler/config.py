@@ -24,10 +24,13 @@ class ConfigError(RuntimeError):
 def _env_int(name: str, default: int) -> int:
     """Read an integer env var, falling back to `default` when unset/empty."""
     raw = os.environ.get(name)
+
     if raw is None or raw == "":
         return default
+
     try:
         return int(raw)
+
     except ValueError as exc:
         raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
 
@@ -35,19 +38,25 @@ def _env_int(name: str, default: int) -> int:
 def _env_bool(name: str, default: bool) -> bool:
     """Read a boolean env var, falling back to `default` when unset/empty."""
     raw = os.environ.get(name)
+
     if raw is None or raw == "":
         return default
+
     lowered = raw.strip().lower()
+
     if lowered in {"1", "true", "yes", "on"}:
         return True
+
     if lowered in {"0", "false", "no", "off"}:
         return False
+
     raise ConfigError(f"{name} must be a boolean, got {raw!r}")
 
 
 def _env_str(name: str, default: str) -> str:
     """Read a string env var, falling back to `default` when unset/empty."""
     raw = os.environ.get(name)
+
     return default if raw is None or raw == "" else raw
 
 
@@ -56,6 +65,7 @@ def _cpu_count() -> int:
     """Available CPU count, honouring cgroup/cpuset pinning where possible."""
     try:
         return len(os.sched_getaffinity(0))  # respects cgroup/cpuset pinning
+
     except AttributeError:  # pragma: no cover - non-Linux
         return multiprocessing.cpu_count()
 
@@ -67,23 +77,28 @@ def chromium_build_id() -> str:
     available even when the browser cannot be launched (tests, PDF-only deployments).
     """
     override = os.environ.get("TILER_CHROMIUM_REVISION")
+
     if override:
         return override
+
     try:
         import playwright  # noqa: PLC0415 - optional at import time
 
         root = Path(playwright.__file__).parent
+
         for candidate in (
             root / "driver" / "package" / "browsers.json",
             root / "driver" / "browsers.json",
         ):
             if candidate.exists():
                 data = json.loads(candidate.read_text())
+
                 for browser in data.get("browsers", []):
                     if browser.get("name") == "chromium":
                         return f"chromium-{browser.get('revision')}"
-                    
+
         return f"playwright-{version('playwright')}"
+
     except Exception:  # pragma: no cover - playwright missing entirely
         return "chromium-unknown"
 
@@ -92,6 +107,7 @@ def _lib_version(module: str, dist: str) -> str:
     """Installed version of a distribution, or 'unknown' if unavailable."""
     try:
         return version(dist)
+
     except Exception:  # pragma: no cover
         return "unknown"
 
@@ -148,31 +164,37 @@ class Settings:
     # --- binding secret (optional; empty = an explicit, unbindable slot) ---
     db_secret: str = field(default="", repr=False)
 
+
     # ------------------------------------------------------------------ #
     @property
     def step(self) -> int:
         """Vertical advance between strips (tile height minus overlap)."""
         return self.tile_height - self.tile_overlap
 
+
     @property
     def browsers(self) -> int:
         """Concurrent Chromium render limit; defaults to min(cpu, 4)."""
         return self.n_browsers or min(_cpu_count(), 4)
+
 
     @property
     def render_workers(self) -> int:
         """Process-pool size; defaults to the CPU count."""
         return self.n_render_workers or _cpu_count()
 
+
     @property
     def chromium_revision(self) -> str:
         """Resolved Chromium build id (env override or pinned bundle)."""
         return self._chromium_revision or chromium_build_id()
 
+
     @property
     def temp_dir(self) -> str:
         """Scratch directory for MHTML archive temp files during rendering."""
         return self.tmp_dir or str(Path(self.blob_dir).parent / "tmp")
+
 
     @property
     def geometry(self) -> dict[str, int]:
@@ -183,6 +205,7 @@ class Settings:
             "tile_overlap": self.tile_overlap,
             "min_tile_height": self.min_tile_height,
         }
+
 
     @property
     def pixel_tier(self) -> dict[str, object]:
@@ -198,6 +221,7 @@ class Settings:
             "pymupdf": _lib_version("fitz", "pymupdf"),
         }
 
+
     @property
     def pdf_tier(self) -> dict[str, object]:
         """PDF slicing params. Folded into render_version only when slicing is on, so
@@ -207,15 +231,20 @@ class Settings:
             "pdf_tile_overlap": self.pdf_tile_overlap,
         }
 
+
     @property
     def render_version(self) -> str:
         """Stable short hash over the geometry tier plus the pixel tier (and the PDF
         slicing tier only when PDF slicing is enabled)."""
         tiers: dict[str, object] = {"geometry": self.geometry, "pixel": self.pixel_tier}
+
         if self.pdf_slice:
             tiers["pdf"] = self.pdf_tier
+
         payload = json.dumps(tiers, sort_keys=True, separators=(",", ":"))
+
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
 
     @property
     def secret_hash(self) -> str:
@@ -224,41 +253,52 @@ class Settings:
         it to refuse an unrelated store; the tiler itself stays usable standalone."""
         return hashlib.sha256(self.db_secret.encode()).hexdigest() if self.db_secret else ""
 
+
     def validate(self) -> None:
         """Raise ConfigError if any setting is out of its valid range."""
         if self.tile_width <= 0 or self.tile_height <= 0:
             raise ConfigError("TILER_TILE_WIDTH and TILER_TILE_HEIGHT must be positive")
+
         if not 0 <= self.tile_overlap < self.tile_height:
             raise ConfigError(
                 "TILER_TILE_OVERLAP must satisfy 0 <= OVERLAP < TILER_TILE_HEIGHT"
             )
+
         if not 0 < self.min_tile_height <= self.tile_height:
             raise ConfigError(
                 "TILER_MIN_TILE_HEIGHT must satisfy 0 < MIN <= TILER_TILE_HEIGHT"
             )
+
         if self.pdf_slice:
             if self.pdf_tile_height <= 0:
                 raise ConfigError(
                     "TILER_PDF_TILE_HEIGHT must be positive when TILER_PDF_SLICE_ENABLE is set"
                 )
+
             if not 0 <= self.pdf_tile_overlap < self.pdf_tile_height:
                 raise ConfigError(
                     "TILER_PDF_TILE_OVERLAP must satisfy 0 <= OVERLAP < TILER_PDF_TILE_HEIGHT"
                 )
+
             if self.min_tile_height > self.pdf_tile_height:
                 raise ConfigError(
                     "TILER_MIN_TILE_HEIGHT must be <= TILER_PDF_TILE_HEIGHT when PDF slicing is on"
                 )
+
         if not 1 <= self.jpeg_quality <= 100:
             raise ConfigError("TILER_JPEG_QUALITY must be within 1..100")
+
         if self.pdf_dpi <= 0:
             raise ConfigError("TILER_PDF_DPI must be positive")
+
         if self.render_mismatch_policy not in {"strict", "lenient"}:
             raise ConfigError(
                 "TILER_RENDER_MISMATCH_POLICY must be 'strict' or 'lenient'"
             )
+
         if self.max_doc_bytes <= 0:
             raise ConfigError("TILER_MAX_DOC_BYTES must be positive")
+
         if self.safe_fullpage_px < self.tile_height:
             raise ConfigError("TILER_SAFE_FULLPAGE_PX must be >= TILER_TILE_HEIGHT")
 
@@ -300,4 +340,5 @@ def load_settings() -> Settings:
         db_secret=_env_str("TILER_DB_SECRET", ""),
     )
     settings.validate()
+
     return settings

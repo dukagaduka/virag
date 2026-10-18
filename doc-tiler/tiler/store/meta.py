@@ -78,6 +78,7 @@ NUMERIC_OPS = {"gt", "gte", "lt", "lte"}
 class SearchError(ValueError):
     """Bad search request (maps to 400)."""
 
+
     def __init__(self, message: str, key: str | None = None):
         super().__init__(message)
         self.key = key
@@ -113,6 +114,7 @@ class DocRow:
     updated_at: int
     complete: bool = True
     page_heights: list[int] | None = None
+
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> "DocRow":
@@ -167,8 +169,9 @@ def decode_cursor(cursor: str) -> tuple[int, str]:
     try:
         pad = "=" * (-len(cursor) % 4)
         created_at, _, doc_id = base64.urlsafe_b64decode(cursor + pad).decode().partition(":")
+
         return int(created_at), doc_id
-    
+
     except Exception as exc:
         raise SearchError(f"invalid cursor: {exc}") from exc
 
@@ -186,28 +189,32 @@ def build_search_query(
 
     for f in filters:
         field: Field | None = schema.get(f.key)
+
         if field is None:
             raise SearchError(
                 f"filter key {f.key!r} is not declared in the metadata schema; "
                 "only declared (indexed) keys are searchable",
                 f.key,
             )
-        
+
         op = (f.op or "eq").lower()
+
         if op not in OPS:
             raise SearchError(f"unsupported op {f.op!r}; expected one of {sorted(OPS)}", f.key)
+
         if op in NUMERIC_OPS and field.type != "number":
             raise SearchError(
                 f"op {op!r} requires a 'number' field, but {f.key!r} is declared "
                 f"{field.type!r}",
                 f.key,
             )
-        
+
         try:
             value = coerce_filter_value(f.value, field)
+
         except MetadataViolation as exc:
             raise SearchError(str(exc), f.key) from exc
-        
+
         where.append(f"{meta_expr(field.key)} {OPS[op]} ?")
         params.append(value)
 
@@ -220,17 +227,19 @@ def build_search_query(
         "SELECT doc_id, doc_type, blob_rel_path, source_url, page_height, page_heights, "
         "tile_count, mime_type, metadata, render_version, complete, created_at, updated_at FROM docs"
     )
+
     if where:
         sql += " WHERE " + " AND ".join(where)
 
     sql += " ORDER BY created_at DESC, doc_id DESC LIMIT ?"
     params.append(limit + 1)  # one extra row tells us whether a next page exists
-    
+
     return sql, params
 
 
 class MetaStore:
     """Async wrapper over the SQLite database backing docs, tiles, and search."""
+
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -243,8 +252,9 @@ class MetaStore:
         """The open connection; raises if the store is not connected."""
         if self._db is None:
             raise RuntimeError("MetaStore is not connected")
+
         return self._db
-    
+
 
     async def connect(self) -> None:
         """Open the connection and apply the startup pragmas."""
@@ -279,6 +289,7 @@ class MetaStore:
             # backfills to '' (an empty slot), matching a tiler run without a secret.
             cur = await self.db.execute("PRAGMA table_info(service_meta)")
             columns = {row["name"] for row in await cur.fetchall()}
+
             if "secret_hash" not in columns:
                 await self.db.execute(
                     "ALTER TABLE service_meta ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''"
@@ -288,6 +299,7 @@ class MetaStore:
             # written atomically, so they backfill to complete=1.
             cur = await self.db.execute("PRAGMA table_info(docs)")
             doc_columns = {row["name"] for row in await cur.fetchall()}
+
             if "complete" not in doc_columns:
                 await self.db.execute(
                     "ALTER TABLE docs ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
@@ -349,7 +361,7 @@ class MetaStore:
 
         if row is None:
             return None
-        
+
         return ServiceMeta(
             tile_width=row["tile_width"],
             tile_height=row["tile_height"],
@@ -418,6 +430,7 @@ class MetaStore:
             "ORDER BY tile_num",
             (doc_id,),
         )
+
         return [TileRow(**dict(r)) for r in await cur.fetchall()]
 
 
@@ -614,6 +627,7 @@ class MetaStore:
             "SELECT doc_id FROM docs WHERE complete = 0 AND updated_at < ?",
             (older_than,),
         )
+
         return [row["doc_id"] for row in await cur.fetchall()]
 
 
@@ -633,6 +647,7 @@ class MetaStore:
         async with self._lock:
             cur = await self.db.execute("DELETE FROM docs WHERE doc_id = ?", (doc_id,))
             await self.db.commit()
+
             return cur.rowcount > 0
 
 
@@ -647,6 +662,7 @@ class MetaStore:
         """Return the total number of stored documents."""
         cur = await self.db.execute("SELECT COUNT(*) AS n FROM docs")
         row = await cur.fetchone()
+
         return int(row["n"])
 
 
@@ -675,4 +691,5 @@ class MetaStore:
     async def explain(self, sql: str, params: Sequence[Any]) -> list[str]:
         """Return the query plan detail lines for a SQL statement."""
         cur = await self.db.execute(f"EXPLAIN QUERY PLAN {sql}", list(params))
+
         return [row["detail"] for row in await cur.fetchall()]

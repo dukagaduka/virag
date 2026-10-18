@@ -35,19 +35,24 @@ def _is_webp(head: bytes) -> bool:
 def sniff_image_mime(data: bytes) -> str | None:
     """Guess a raster image MIME type from magic bytes, else None."""
     head = data[:32]
+
     for magic, mime in _IMAGE_MAGIC:
         if head.startswith(magic):
             return mime
+
     if _is_webp(head):
         return "image/webp"
+
     if head.lstrip()[:5] == b"<?xml" or head.lstrip()[:4] == b"<svg":
         return None  # SVG needs a renderer we do not ship; treat as unsupported
+
     return None
 
 
 def looks_like_mhtml(data: bytes) -> bool:
     """True if the leading bytes carry MIME/MHTML headers."""
     head = data[:4096].lower()
+
     return (
         b"mime-version:" in head
         or b"content-type: multipart/related" in head
@@ -67,6 +72,7 @@ def check_and_mime(doc_type: DocType, data: bytes) -> str:
                 "declared doc_type=PDF but the payload does not start with %PDF-",
                 declared=DocType.PDF,
             )
+
         return "application/pdf"
 
     if doc_type == DocType.MHTML:
@@ -75,16 +81,19 @@ def check_and_mime(doc_type: DocType, data: bytes) -> str:
                 "declared doc_type=MHTML but the payload has no MIME/MHTML headers",
                 declared=DocType.MHTML,
             )
+
         return "multipart/related"
 
     if doc_type == DocType.IMG:
         mime = sniff_image_mime(data)
+
         if mime is None:
             raise unsupported_media(
                 "declared doc_type=IMG but the payload is not a supported raster image "
                 "(png/jpeg/gif/bmp/tiff/webp)",
                 declared=DocType.IMG,
             )
+
         return mime
 
     raise unsupported_media(f"unsupported doc_type {doc_type!r}")

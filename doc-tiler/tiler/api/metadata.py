@@ -17,8 +17,10 @@ async def _require_doc(request: Request, doc_id: str):
     svc = service(request)
     check_doc_id(doc_id)
     row = await svc.store.get_doc(doc_id)
+
     if row is None:
         raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
+
     return svc, row
 
 
@@ -31,6 +33,7 @@ async def _require_doc(request: Request, doc_id: str):
 async def get_metadata(request: Request, doc_id: str) -> dict[str, Any]:
     """Read the metadata object for a document."""
     _, row = await _require_doc(request, doc_id)
+
     return row.metadata
 
 
@@ -47,6 +50,7 @@ async def replace_metadata(
     svc, _ = await _require_doc(request, doc_id)
     validated = svc.validate_metadata_payload(body)
     await svc.store.set_metadata(doc_id, validated)
+
     return validated
 
 
@@ -61,14 +65,19 @@ async def merge_metadata(
 ) -> dict[str, Any]:
     """Shallow-merge the payload into existing metadata; a null value deletes a key."""
     svc, row = await _require_doc(request, doc_id)
+
     if not isinstance(body, dict):  # pragma: no cover - FastAPI enforces the type
         raise unprocessable("metadata must be a JSON object", "INVALID_METADATA_JSON")
+
     merged = dict(row.metadata)
+
     for key, value in body.items():
         if value is None:
             merged.pop(key, None)  # a null value deletes the key
         else:
             merged[key] = value
+
     validated = svc.validate_metadata_payload(merged)
     await svc.store.set_metadata(doc_id, validated)
+
     return validated

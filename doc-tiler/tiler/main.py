@@ -85,7 +85,7 @@ async def bootstrap(settings: Settings, schema: MetadataSchema) -> TilerService:
         settings.browsers,
         settings.render_workers,
     )
-    
+
     return svc
 
 
@@ -103,11 +103,11 @@ async def lifespan(app: FastAPI):
 
     try:
         svc = await bootstrap(settings, schema)
-        
+
     except guard.GeometryMismatch as exc:
         # Never serve a single request against a mismatched volume.
         raise SystemExit(1) from exc
-    
+
     app.state.service = svc
     app.state.settings = settings
 
@@ -118,9 +118,10 @@ async def lifespan(app: FastAPI):
 
     finally:
         sweeper.cancel()
-        
+
         try:
             await sweeper
+
         except asyncio.CancelledError:
             pass
 

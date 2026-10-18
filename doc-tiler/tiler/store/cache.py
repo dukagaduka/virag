@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Hashable
 class AsyncLRU:
     """Bounded async LRU that renders each missing key exactly once."""
 
+
     def __init__(self, capacity: int, name: str = "cache"):
         self.capacity = max(1, capacity)
         self.name = name
@@ -44,9 +45,11 @@ class AsyncLRU:
                 if key in self._data:
                     self._data.move_to_end(key)
                     self.hits += 1
+
                     return self._data[key]
-                
+
                 pending = self._inflight.get(key)
+
                 if pending is None:
                     self.misses += 1
                     fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -58,6 +61,7 @@ class AsyncLRU:
             # Someone else is already producing this key: wait for their result.
             try:
                 return await asyncio.shield(pending)
+
             except Exception:
                 # The producer failed; loop and try to become the producer ourselves.
                 continue
@@ -68,9 +72,10 @@ class AsyncLRU:
         except BaseException as exc:
             async with self._lock:
                 self._inflight.pop(key, None)
+
             if not fut.done():
                 fut.set_exception(exc)
-                
+
             # Nobody may be awaiting the future; swallow the "never retrieved" warning.
             fut.exception()
 

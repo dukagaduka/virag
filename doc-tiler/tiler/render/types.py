@@ -56,6 +56,7 @@ class RenderedTile:
     jpeg: bytes
     image_hash: str
 
+
     @classmethod
     def build(cls, tile_num: int, height: int, jpeg: bytes) -> RenderedTile:
         """Hash `jpeg` and wrap it as a tile."""

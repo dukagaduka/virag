@@ -37,6 +37,7 @@ async def healthz() -> dict[str, str]:
 async def readyz(request: Request) -> Response:
     """Readiness probe checking the DB, blob dir and Chromium pool."""
     ok, checks = await service(request).ready()
+
     return JSONResponse(
         status_code=200 if ok else 503,
         content={"status": "ready" if ok else "not ready", "checks": checks},
@@ -47,6 +48,7 @@ async def readyz(request: Request) -> Response:
 async def metrics_endpoint() -> Response:
     """Expose Prometheus metrics."""
     payload, content_type = m.render_latest()
+
     return Response(content=payload, media_type=content_type)
 
 
@@ -54,6 +56,7 @@ async def metrics_endpoint() -> Response:
 async def info(request: Request) -> dict[str, Any]:
     """Report effective geometry, render_version, policy, pools and cache stats."""
     svc = service(request)
+
     return {
         "version": __version__,
         "geometry": svc.settings.geometry,

@@ -32,7 +32,7 @@ def _validate_ingest_inputs(doc_type: str, document: UploadFile | None) -> DocTy
         raise bad_request(
             "doc_type=URL takes 'url' only; do not attach a document", "AMBIGUOUS_INPUT"
         )
-    
+
     return doc_type
 
 
@@ -60,6 +60,7 @@ async def ingest_document(
     check_declared_size(request, svc.settings.max_doc_bytes)
 
     data = None
+
     if document is not None and doc_type != DocType.URL:
         data = await read_capped(document, svc.settings.max_doc_bytes)
 
@@ -72,7 +73,7 @@ async def ingest_document(
         include_bytes=include_bytes,
         force=force,
     )
-    
+
     return IngestManifest(**manifest)
 
 
@@ -101,6 +102,7 @@ async def ingest_document_stream(
 
     check_declared_size(request, svc.settings.max_doc_bytes)
     data = None
+
     if document is not None and doc_type != DocType.URL:
         data = await read_capped(document, svc.settings.max_doc_bytes)
 
@@ -132,4 +134,5 @@ async def revise_documents(
     Qdrant is untouched — run virag's `/revision` afterwards to re-embed.
     """
     svc = service(request)
+
     return await svc.revise(force=force)

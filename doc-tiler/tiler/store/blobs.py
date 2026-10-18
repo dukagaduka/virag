@@ -18,6 +18,7 @@ from ..hashing import blob_rel_path
 class BlobStore:
     """Stores and retrieves blob bytes under a content-addressed directory tree."""
 
+
     def __init__(self, root: str | Path):
         self.root = Path(root)
 
@@ -48,9 +49,10 @@ class BlobStore:
     def _put_sync(self, doc_id: str, data: bytes) -> str:
         """Write the blob atomically, skipping if it already exists."""
         dest = self.path(doc_id)
+
         if dest.exists():  # dedup: identical content, identical path
             return blob_rel_path(doc_id)
-        
+
         dest.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
 
@@ -65,14 +67,16 @@ class BlobStore:
 
             try:
                 os.fsync(dir_fd)
+
             finally:
                 os.close(dir_fd)
 
         except BaseException:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+
             raise
-        
+
         return blob_rel_path(doc_id)
 
 
@@ -93,12 +97,15 @@ class BlobStore:
 
     async def delete(self, doc_id: str) -> bool:
         """Delete the blob; return whether it existed."""
+
         def _unlink() -> bool:
             """Unlink the file, returning whether it was present."""
             p = self.path(doc_id)
+
             try:
                 p.unlink()
                 return True
+
             except FileNotFoundError:
                 return False
 

@@ -81,6 +81,7 @@ class MhtmlRender:
 class BrowserPool:
     """One long-lived Chromium, `N_BROWSERS` concurrent contexts, periodic recycle."""
 
+
     def __init__(self, settings: Settings):
         self._s = settings
         self._pw: Any = None
@@ -92,6 +93,7 @@ class BrowserPool:
         self._recycling = False
         self._start_error: str | None = None
         self.per_context_proxy = False
+
 
     # ------------------------------------------------------------------ #
     @property
@@ -109,6 +111,7 @@ class BrowserPool:
     async def start(self, *, per_context_proxy: bool = False) -> None:
         """Start Playwright and launch Chromium; record any failure instead of raising."""
         self.per_context_proxy = per_context_proxy
+
         try:
             # imported lazily: playwright is optional (PDF/IMG-only deployments run without it)
             from playwright.async_api import async_playwright  # noqa: PLC0415
@@ -132,6 +135,7 @@ class BrowserPool:
     async def _launch(self) -> None:
         """Launch a fresh Chromium process and reset the render counter."""
         kwargs: dict[str, Any] = {"headless": True, "args": list(_LAUNCH_ARGS)}
+
         if self.per_context_proxy:
             # Chromium requires a browser-level proxy for per-context proxies to work.
             kwargs["proxy"] = {"server": "per-context"}
@@ -167,7 +171,7 @@ class BrowserPool:
         """Lease a fresh BrowserContext; handles recycling and crash recovery."""
         if self._pw is None:
             raise BrowserUnavailable(self._start_error or "Chromium is not enabled")
-        
+
         async with self._sem:
             async with self._cond:
                 while self._recycling:
@@ -184,6 +188,7 @@ class BrowserPool:
                     try:
                         while self._inflight > 0:
                             await self._cond.wait()
+
                         await self._recycle()
 
                     finally:
@@ -194,6 +199,7 @@ class BrowserPool:
                 self._inflight += 1
 
             ctx = None
+
             try:
                 opts: dict[str, Any] = {
                     "viewport": {"width": self._s.tile_width, "height": self._s.tile_height},
@@ -205,6 +211,7 @@ class BrowserPool:
                     "forced_colors": "none",
                     "java_script_enabled": True,
                 }
+
                 if proxy:
                     opts["proxy"] = {"server": proxy}
 
@@ -229,6 +236,7 @@ class BrowserPool:
         log.info("recycling Chromium after %d renders", self._renders)
 
         BROWSER_RECYCLES.inc()
+
         with contextlib.suppress(Exception):
             if self._browser is not None:
                 await self._browser.close()
@@ -244,8 +252,10 @@ async def _prepare(page: Any, settings: Settings) -> None:
     if settings.wait_network_idle:
         with contextlib.suppress(Exception):
             await page.wait_for_load_state("networkidle")
+
     with contextlib.suppress(Exception):
         await page.evaluate(_INJECT_CSS_JS, _DETERMINISM_CSS)
+
     with contextlib.suppress(Exception):
         await page.evaluate("() => document.fonts.ready.then(() => true)")
 
@@ -265,9 +275,10 @@ async def _page_height(page: Any) -> int:
 def _map_error(exc: Exception) -> Exception:
     """Translate a Playwright error into a RenderTimeout or RenderFailure."""
     name = type(exc).__name__
+
     if "Timeout" in name or "timeout" in str(exc).lower():
         return RenderTimeout(str(exc))
-    
+
     return RenderFailure(f"{name}: {exc}")
 
 
@@ -290,11 +301,12 @@ async def capture_url_mhtml(
 
         except Exception as exc:
             raise _map_error(exc) from exc
-        
+
         data = snapshot.get("data")
+
         if not data:
             raise RenderFailure("Page.captureSnapshot returned no data")
-        
+
         return data.encode("utf-8")
 
 
@@ -317,7 +329,7 @@ async def _mhtml_page(pool: BrowserPool, settings: Settings, blob: bytes):
 
             except Exception as exc:
                 raise _map_error(exc) from exc
-            
+
             yield page
 
     finally:
@@ -336,6 +348,7 @@ async def _clip(page: Any, settings: Settings, strip: Strip) -> bytes:
     # can fall short of the requested offset at the bottom of the page, so subtract
     # where the page actually landed, not where we asked it to go.
     scroll_y = await page.evaluate("() => window.scrollY")
+
     return await page.screenshot(
         type="png",
         animations="disabled",
@@ -371,14 +384,14 @@ async def render_mhtml_document(
                     full_page=True, type="png", animations="disabled", caret="hide", scale="css"
                 )
                 return MhtmlRender(css_height=height, full_png=png)
-            
+
             strips = make_strips(height)
 
             return MhtmlRender(
                 css_height=height,
                 strip_pngs=[await _clip(page, settings, s) for s in strips],
             )
-        
+
         except Exception as exc:
             raise _map_error(exc) from exc
 
@@ -390,7 +403,7 @@ async def render_mhtml_region(
     async with _mhtml_page(pool, settings, blob) as page:
         try:
             return await _clip(page, settings, strip)
-        
+
         except Exception as exc:
             raise _map_error(exc) from exc
 
@@ -405,8 +418,8 @@ async def render_mhtml_full_png(
             png = await page.screenshot(
                 full_page=True, type="png", animations="disabled", caret="hide", scale="css"
             )
-            
+
         except Exception as exc:
             raise _map_error(exc) from exc
-        
+
         return height, png
