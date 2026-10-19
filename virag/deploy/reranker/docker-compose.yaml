@@ -1,0 +1,31 @@
+services:
+  reranker-vllm-virag:
+    image: ${RERANKER_DEPLOY_IMAGE}
+    container_name: ${RERANKER_DEPLOY_CONTAINER_NAME}
+    entrypoint: ["/bin/bash", "-lc"]
+    command: ["bash /start.sh"]
+    shm_size: "16g"
+
+    ports:
+      - "${RERANKER_DEPLOY_HOST}:${RERANKER_DEPLOY_PORT}:8000"
+    volumes:
+      - ${RERANKER_DEPLOY_MODEL_PATH}:/model:ro
+      # Local screenshots, addressable as file:///media/... in rerank requests (saves
+      # base64 traffic). Point it at the tiler blob volume, or any dir if unused.
+      - ${RERANKER_DEPLOY_MEDIA_PATH}:/media:ro
+      - ./qwen3_vl_reranker.jinja:/chat_template.jinja:ro
+      - ./serve_reranker.sh:/start.sh:ro
+
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    runtime: nvidia
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s

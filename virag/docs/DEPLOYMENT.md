@@ -2,36 +2,60 @@
 
 virag is a small stateless gateway; the interesting part of deploying it is the
 **backends it needs**: doc-tiler, Qdrant, an embeddings server, and an upstream VLM.
-The Compose file in [`deploy/`](../deploy/) brings up the first three plus virag itself;
-the VLM is external (you point `VLM_BASE_URL` at it).
+Deployment is split into two independent Compose stacks under [`deploy/`](../deploy/):
+[`service/`](../deploy/service/) (virag, doc-tiler, Qdrant) and
+[`embeddings/`](../deploy/embeddings/) (the vLLM embeddings server). The VLM is external
+(you point `VLM_BASE_URL` at it).
 
 ---
 
 ## Quickstart (Compose)
 
 ```bash
-cd deploy
-cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE, paths
+# 1. embeddings server (GPU)
+cd deploy/embeddings
+cp .env.example .env                                   # image, port, model/adapter paths
+cp serve_embeddings.example.sh serve_embeddings.sh     # tune for your hardware
+docker compose up -d
+
+# 2. virag + tiler + Qdrant
+cd ../service
+cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE,
+                         # EMBEDDINGS_BASE_URL, paths
 docker compose up --build
 curl -s localhost:${VIRAG_DEPLOY_PORT:-48000}/ready | jq
 ```
 
-The stack (`deploy/docker-compose.yaml`) is four services on one bridge network:
+The `service/` stack (`deploy/service/docker-compose.yaml`) is three services on one bridge
+network. The embeddings server (`embeddings-vllm-virag`, GPU, runs `serve_embeddings.sh`) is a
+separate stack in `deploy/embeddings/` that virag reaches over `EMBEDDINGS_BASE_URL`:
 
 | Service | Role | Notes |
 |---|---|---|
 | `virag` | the gateway | built from this repo; waits for its backends to be healthy. |
 | `tiler-virag` | doc-tiler | built from `../../doc-tiler`; mounts `tiler_metadata_schema.yaml` (see below). |
 | `qdrant-virag` | Qdrant | vector store. |
-| `embeddings-vllm-virag` | vLLM embeddings | GPU (`runtime: nvidia`); runs `serve_vllm_embeddings.sh`. |
 
-`virag` `depends_on` the tiler and Qdrant being **healthy** and the embeddings server
-being **started**, and has `restart: unless-stopped` so it survives the long vLLM model
-load and retries until its dependency checks pass.
+### Connecting virag to the embeddings stack
+
+The two stacks do not share a Docker network. virag reaches the embeddings server through
+the host: set `EMBEDDINGS_BASE_URL=http://host.docker.internal:<VLLM_DEPLOY_PORT>/v1`
+(`48003` in the example). On Linux `host.docker.internal` is not defined by default, so the
+`virag` service declares `extra_hosts: ["host.docker.internal:host-gateway"]` in
+`deploy/service/docker-compose.yaml`. If the embeddings server runs on another machine, point
+`EMBEDDINGS_BASE_URL` at its address instead.
+
+In `deploy/service/.env` also set `VLLM_SERVED_MODEL_NAME` and `VLLM_API_KEY` to the values
+of `SERVED_MODEL_NAME` and `API_KEY` in `serve_embeddings.sh`; virag checks at startup that
+the server advertises that model and refuses to boot otherwise.
+
+`virag` `depends_on` the tiler and Qdrant only; the embeddings server is outside the stack,
+so virag has `restart: unless-stopped` and retries until its dependency checks (including
+the embeddings endpoint) pass — this also covers the long vLLM model load.
 
 ## Configuration
 
-Two layers of variables live in `.env` (from [`.env.example`](../deploy/.env.example)):
+Variables live in three places:
 
 - **Application settings** read by virag at startup — `VIRAG_*` (including the reconcile
   knobs `VIRAG_SELF_HEAL` / `VIRAG_RECONCILE_INTERVAL_SEC` / `VIRAG_PENDING_TTL_SEC`),
@@ -40,9 +64,17 @@ Two layers of variables live in `.env` (from [`.env.example`](../deploy/.env.exa
   [CONFIG.md](CONFIG.md). Required: `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`,
   `VLM_MODEL_NAME`.
 - **Compose/orchestration variables** — the `*_DEPLOY_*` image tags, host bind
-  addresses/ports, and volume paths, plus the `VLLM_*` serving knobs consumed by
-  `serve_vllm_embeddings.sh`. These are read by Compose and the launch script, not by
-  `Settings.from_env()`.
+  addresses/ports, and volume paths. Read by Compose, not by `Settings.from_env()`.
+  `deploy/service/.env` (from [`.env.example`](../deploy/service/.env.example)) holds the
+  application settings above together with the service-stack deploy variables;
+  `deploy/embeddings/.env` (from [`.env.example`](../deploy/embeddings/.env.example)) holds
+  only the embeddings deploy variables.
+- **vLLM serving parameters** — *not* in `.env`. They are written out, with a comment per
+  parameter, directly in `deploy/embeddings/serve_embeddings.sh`. The tracked
+  [`serve_embeddings.example.sh`](../deploy/embeddings/serve_embeddings.example.sh) holds
+  baseline values; copy it to `serve_embeddings.sh` (git-ignored) and tune it for your
+  GPU. Keep `SERVED_MODEL_NAME` and `API_KEY` there in sync with virag's
+  `VLLM_SERVED_MODEL_NAME` and `VLLM_API_KEY`.
 
 Set `TILER_DB_SECRET` to the **same** value it has on the tiler and (implicitly) the
 Qdrant collection — one secret, three consumers — *before* first boot. See
@@ -53,7 +85,7 @@ Qdrant collection — one secret, three consumers — *before* first boot. See
 virag stamps enroll-lifecycle markers on the tiler's indexed metadata and reconcile
 searches them, so the tiler must declare **three** indexed fields:
 `name` (text), `virag_started_at` (number), and `virag_enrolled_at` (number). The Compose
-file mounts `deploy/tiler_metadata_schema.yaml` into the tiler at
+file mounts `deploy/service/tiler_metadata_schema.yaml` into the tiler at
 `/config/metadata_schema.yaml` for exactly this. At startup virag reads the tiler's
 `GET /schema/metadata` and **refuses to boot** (fatal) if any of the three is missing or
 wrong-typed — so keep this schema in sync with the tiler.

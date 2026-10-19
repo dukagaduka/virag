@@ -18,8 +18,14 @@ request.
 ## Quickstart
 
 ```bash
-cd deploy
-cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE
+# embeddings server (see docs/DEPLOYMENT.md)
+cd deploy/embeddings
+cp .env.example .env && cp serve_embeddings.example.sh serve_embeddings.sh
+docker compose up -d
+
+# virag + tiler + Qdrant
+cd ../service
+cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE, EMBEDDINGS_BASE_URL
 docker compose up --build
 curl -s localhost:48000/ready | jq
 
@@ -76,7 +82,8 @@ virag/
   api/               chat_completions, enroll, revision, proxy, ops
   clients/           embeddings_client, qdrant_store, tiler_client, vlm_client
 docs/                documentation (see the table above)
-deploy/              docker-compose.yaml + .env.example + tiler metadata schema + vLLM serve script
+deploy/service/      virag + tiler + Qdrant: docker-compose.yaml, .env.example, tiler metadata schema
+deploy/embeddings/   vLLM embeddings stack: docker-compose.yaml, .env.example, serve_embeddings.example.sh
 ```
 
 ## Development

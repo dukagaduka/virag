@@ -4,7 +4,8 @@ All application configuration is read from environment variables at startup by
 `Settings.from_env()` (`virag/settings.py`). Two variables are **required** and abort
 startup if unset; everything else has a default. A ready-to-edit template — including
 the Compose/deployment variables — lives at
-[`deploy/.env.example`](../deploy/.env.example).
+[`deploy/service/.env.example`](../deploy/service/.env.example) and
+[`deploy/embeddings/.env.example`](../deploy/embeddings/.env.example).
 
 Invalid values fail fast with a `SettingsError` (wrong type, out of range, unknown
 enum) rather than surfacing later as a runtime error.
@@ -62,9 +63,9 @@ serves through it while the physical collection it points to is versioned (`__v1
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `EMBEDDINGS_BASE_URL` | no | `http://embeddings-vllm-virag:8000/v1` | Embeddings endpoint. The `/v1` suffix is required. |
-| `VLLM_SERVED_MODEL_NAME` | no | `embeddings-model` | Embeddings model name (matches what the vLLM server advertises). |
-| `VLLM_API_KEY` | no | `dummy` | Bearer key for the embeddings server (also injected on the `/embed` proxy). |
+| `EMBEDDINGS_BASE_URL` | no | `http://embeddings-vllm-virag:8000/v1` | Embeddings endpoint. The `/v1` suffix is required. The embeddings server runs in a separate stack, so the default container name only resolves if you attach both stacks to one Docker network; the shipped `deploy/service/.env.example` uses `http://host.docker.internal:48003/v1` instead. |
+| `VLLM_SERVED_MODEL_NAME` | no | `embeddings-model` | Embeddings model name (must match `SERVED_MODEL_NAME` in `serve_embeddings.sh`). |
+| `VLLM_API_KEY` | no | `dummy` | Bearer key for the embeddings server (must match `API_KEY` in `serve_embeddings.sh`; also injected on the `/embed` proxy). |
 | `EMBEDDINGS_CHUNK_SIZE` | no | `16` | Max items per embedding request (≥ 1). |
 | `EMBEDDINGS_TIMEOUT_SEC` | no | `60` | Per-request timeout (≥ 1). |
 
@@ -97,6 +98,8 @@ collection thereafter. See [SECURITY.md](SECURITY.md) for the binding contract a
 [DEPLOYMENT.md](DEPLOYMENT.md) for where it is wired in Compose.
 
 For the Compose-only orchestration variables (`*_DEPLOY_*` image tags, host ports,
-volume paths, the vLLM serving knobs), see [`deploy/.env.example`](../deploy/.env.example)
-and [DEPLOYMENT.md](DEPLOYMENT.md) — those are read by Compose and the vLLM launch
-script, not by `Settings.from_env()`.
+volume paths), see [`deploy/service/.env.example`](../deploy/service/.env.example) and
+[`deploy/embeddings/.env.example`](../deploy/embeddings/.env.example). The vLLM serving
+parameters are set in `deploy/embeddings/serve_embeddings.sh` (template:
+`serve_embeddings.example.sh`). See [DEPLOYMENT.md](DEPLOYMENT.md) — none of these are read
+by `Settings.from_env()`.

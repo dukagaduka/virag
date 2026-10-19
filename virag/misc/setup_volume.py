@@ -9,15 +9,15 @@ you, mode 0777 — sidesteps that: whatever uid a container drops to can write.
 It reads a deploy ``.env``, picks every ``*_VOLUME_PATH`` variable, and creates
 ``<path>/<basename-of-its-value>`` for each. For example:
 
-    TILER_DEPLOY_VOLUME_PATH=./.smoke-data/tiler   ->  <path>/tiler
-    QDRANT_DEPLOY_VOLUME_PATH=./.smoke-data/qdrant  ->  <path>/qdrant
+    TILER_DEPLOY_VOLUME_PATH=../.smoke-data/tiler   ->  <path>/tiler
+    QDRANT_DEPLOY_VOLUME_PATH=../.smoke-data/qdrant  ->  <path>/qdrant
 
 Only the basename is used, so ``--path`` is simply the root that holds all the
 volumes; where the .env happened to point them doesn't matter.
 
 Usage:
-    python misc/setup_volume.py --path ./.smoke-data --env deploy/.env
-    python misc/setup_volume.py --path /srv/virag/data --env deploy/.env --mode 770
+    python misc/setup_volume.py --path ./.smoke-data --env deploy/service/.env
+    python misc/setup_volume.py --path /srv/virag/data --env deploy/service/.env --mode 770
 
 No third-party dependencies; nothing is imported from the virag package.
 """
