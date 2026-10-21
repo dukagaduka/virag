@@ -36,18 +36,30 @@ class QdrantStoreSettings:
 
 
 @dataclass(slots=True, frozen=True)
+class HttpSettings:
+    backoff_base: float
+    backoff_cap: float
+
+
+@dataclass(slots=True, frozen=True)
 class EmbeddingsSettings:
     base_url: str
     model_name: str
     api_key: str
     chunk_size: int
     timeout: int
+    connect_timeout: int
+    max_connections: int
+    max_retries: int
 
 
 @dataclass(slots=True, frozen=True)
 class TilerSettings:
     base_url: str
     timeout: int
+    connect_timeout: int
+    max_connections: int
+    max_retries: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -56,6 +68,8 @@ class VLMSettings:
     model_name: str
     api_key: str
     timeout: int
+    connect_timeout: int
+    max_connections: int
     max_concurrency: int
     max_retries: int
 
@@ -74,6 +88,7 @@ class Settings:
     db_secret: str
 
     rag_settings: RagSettings
+    http_settings: HttpSettings
     qdrant_settings: QdrantStoreSettings
     embeddings_settings: EmbeddingsSettings
     tiler_settings: TilerSettings
@@ -111,6 +126,22 @@ class Settings:
                 raise SettingsError("`VIRAG_SCORE_THRESHOLD` must be a float.") from e
 
         rag_framing_text = os.environ.get("VIRAG_FRAMING_TEXT") or _DEFAULT_FRAMING_TEXT
+
+        # -----------------------------
+        # HTTP (shared upstream retry policy)
+        # -----------------------------
+
+        http_backoff_base = float_coercion(
+            os.environ.get("HTTP_RETRY_BACKOFF_BASE_SEC", "0.25"),
+            "HTTP_RETRY_BACKOFF_BASE_SEC",
+            low=0,
+        )
+
+        http_backoff_cap = float_coercion(
+            os.environ.get("HTTP_RETRY_BACKOFF_CAP_SEC", "8"),
+            "HTTP_RETRY_BACKOFF_CAP_SEC",
+            low=0,
+        )
 
         # -----------------------------
         # QDRANT
@@ -192,6 +223,24 @@ class Settings:
             low=1
         )
 
+        embeddings_connect_timeout = int_coercion(
+            os.environ.get("EMBEDDINGS_CONNECT_TIMEOUT_SEC", "10"),
+            "EMBEDDINGS_CONNECT_TIMEOUT_SEC",
+            low=1
+        )
+
+        embeddings_max_connections = int_coercion(
+            os.environ.get("EMBEDDINGS_MAX_CONNECTIONS", "100"),
+            "EMBEDDINGS_MAX_CONNECTIONS",
+            low=1
+        )
+
+        embeddings_max_retries = int_coercion(
+            os.environ.get("EMBEDDINGS_MAX_RETRIES", "3"),
+            "EMBEDDINGS_MAX_RETRIES",
+            low=0
+        )
+
         # -----------------------------
         # TILER
         # -----------------------------
@@ -205,6 +254,24 @@ class Settings:
             os.environ.get("TILER_TIMEOUT_SEC", "120"),
             "TILER_TIMEOUT_SEC",
             low=1
+        )
+
+        tiler_connect_timeout = int_coercion(
+            os.environ.get("TILER_CONNECT_TIMEOUT_SEC", "10"),
+            "TILER_CONNECT_TIMEOUT_SEC",
+            low=1
+        )
+
+        tiler_max_connections = int_coercion(
+            os.environ.get("TILER_MAX_CONNECTIONS", "100"),
+            "TILER_MAX_CONNECTIONS",
+            low=1
+        )
+
+        tiler_max_retries = int_coercion(
+            os.environ.get("TILER_MAX_RETRIES", "3"),
+            "TILER_MAX_RETRIES",
+            low=0
         )
 
         # -----------------------------
@@ -223,7 +290,19 @@ class Settings:
         vlm_timeout = int_coercion(
             os.environ.get("VLM_TIMEOUT_SEC", "480"),
             "VLM_TIMEOUT_SEC",
-            low=480
+            low=1
+        )
+
+        vlm_connect_timeout = int_coercion(
+            os.environ.get("VLM_CONNECT_TIMEOUT_SEC", "10"),
+            "VLM_CONNECT_TIMEOUT_SEC",
+            low=1
+        )
+
+        vlm_max_connections = int_coercion(
+            os.environ.get("VLM_MAX_CONNECTIONS", "100"),
+            "VLM_MAX_CONNECTIONS",
+            low=1
         )
 
         vlm_max_concurrency = int_coercion(
@@ -231,6 +310,13 @@ class Settings:
             "VLM_MAX_CONCURRENCY",
             low=0,
         )
+
+        # Above the pool size the semaphore never binds — the pool would queue instead.
+        if vlm_max_concurrency > vlm_max_connections:
+            raise SettingsError(
+                f"`VLM_MAX_CONCURRENCY` ({vlm_max_concurrency}) must not exceed "
+                f"`VLM_MAX_CONNECTIONS` ({vlm_max_connections})."
+            )
 
         vlm_max_retries = int_coercion(
             os.environ.get("VLM_MAX_RETRIES", "3"),
@@ -269,6 +355,10 @@ class Settings:
                 score_threshold=rag_score_threshold,
                 framing_text=rag_framing_text,
             ),
+            http_settings=HttpSettings(
+                backoff_base=http_backoff_base,
+                backoff_cap=http_backoff_cap,
+            ),
             qdrant_settings=QdrantStoreSettings(
                 base_url=qdrant_base_url,
                 collection_name=qdrant_collection_name,
@@ -282,17 +372,25 @@ class Settings:
                 model_name=embeddings_model_name,
                 api_key=embeddings_api_key,
                 chunk_size=embeddings_chunk_size,
-                timeout=embeddings_timeout
+                timeout=embeddings_timeout,
+                connect_timeout=embeddings_connect_timeout,
+                max_connections=embeddings_max_connections,
+                max_retries=embeddings_max_retries,
             ),
             tiler_settings=TilerSettings(
                 base_url=tiler_base_url,
                 timeout=tiler_timeout,
+                connect_timeout=tiler_connect_timeout,
+                max_connections=tiler_max_connections,
+                max_retries=tiler_max_retries,
             ),
             vlm_settings=VLMSettings(
                 base_url=vlm_base_url,
                 model_name=vlm_model_name,
                 api_key=vlm_api_key,
                 timeout=vlm_timeout,
+                connect_timeout=vlm_connect_timeout,
+                max_connections=vlm_max_connections,
                 max_concurrency=vlm_max_concurrency,
                 max_retries=vlm_max_retries,
             ),
@@ -325,6 +423,26 @@ def bool_coercion(value: str, name: str) -> bool:
         return False
 
     raise SettingsError(f"`{name}` must be a boolean (got {value!r}).")
+
+
+def float_coercion(
+    value: str,
+    name: str,
+    low: float | None = None,
+) -> float:
+    """Convert a string to a float and validate its lower bound."""
+    try:
+        coerced_value = float(value)
+    except ValueError as e:
+        raise SettingsError(f"`{name}` must be a float.") from e
+
+    if low is not None and coerced_value < low:
+        raise SettingsError(
+            f"`{name}` must be greater than or equal to {low}. "
+            f"Got {coerced_value}."
+        )
+
+    return coerced_value
 
 
 def int_coercion(

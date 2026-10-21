@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import types
 
-import httpx
+import httpx2
 from starlette.datastructures import Headers
 
 from virag.api.proxy import _forward_request_headers, _forward_response_headers
@@ -53,7 +53,7 @@ def test_request_injected_auth_overrides_client():
 
 
 def test_response_strips_hop_by_hop_and_length():
-    resp = httpx.Response(
+    resp = httpx2.Response(
         200,
         headers={
             "content-length": "5",

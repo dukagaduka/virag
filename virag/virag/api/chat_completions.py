@@ -7,7 +7,7 @@ import json
 import logging
 from contextlib import AsyncExitStack
 
-import httpx
+import httpx2
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -221,7 +221,7 @@ async def _stream_response(vlm, body: dict, sources: list[dict] | None) -> Respo
             async for chunk in _relay(response, sources):
                 yield chunk
 
-        except httpx.RequestError as e:
+        except httpx2.RequestError as e:
             # The upstream VLM stalled past its read deadline or dropped the stream
             # mid-response. Whatever streamed so far has already reached the client;
             # log and end the SSE cleanly rather than letting the error surface as an

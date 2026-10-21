@@ -89,7 +89,7 @@ deploy/embeddings/   vLLM embeddings stack: docker-compose.yaml, .env.example, s
 ## Development
 
 ```bash
-pip install -e '.[dev]'    # fastapi, httpx, qdrant-client, pytest
+pip install -e '.[dev]'    # fastapi, httpx2, qdrant-client, pytest
 pytest -q                  # tests live in tests/
 ```
 

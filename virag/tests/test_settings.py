@@ -23,6 +23,10 @@ _ALL_KEYS = {
     "QDRANT_DISTANCE_TYPE", "EMBEDDINGS_BASE_URL", "VLLM_SERVED_MODEL_NAME", "VLLM_API_KEY",
     "EMBEDDINGS_CHUNK_SIZE", "EMBEDDINGS_TIMEOUT_SEC", "TILER_BASE_URL", "TILER_TIMEOUT_SEC",
     "VLM_BASE_URL", "VLM_MODEL_NAME", "VLM_API_KEY", "VLM_TIMEOUT_SEC",
+    "VLM_CONNECT_TIMEOUT_SEC", "VLM_MAX_CONNECTIONS", "VLM_MAX_CONCURRENCY", "VLM_MAX_RETRIES",
+    "EMBEDDINGS_CONNECT_TIMEOUT_SEC", "EMBEDDINGS_MAX_CONNECTIONS", "EMBEDDINGS_MAX_RETRIES",
+    "TILER_CONNECT_TIMEOUT_SEC", "TILER_MAX_CONNECTIONS", "TILER_MAX_RETRIES",
+    "HTTP_RETRY_BACKOFF_BASE_SEC", "HTTP_RETRY_BACKOFF_CAP_SEC",
 }
 
 
@@ -111,3 +115,39 @@ def test_db_secret_from_tiler_env(monkeypatch):
     _base_env(monkeypatch)
     monkeypatch.setenv("TILER_DB_SECRET", "s3cret")
     assert Settings.from_env().db_secret == "s3cret"
+
+
+def test_http_transport_defaults(monkeypatch):
+    _base_env(monkeypatch)
+    s = Settings.from_env()
+
+    assert s.http_settings.backoff_base == 0.25
+    assert s.http_settings.backoff_cap == 8.0
+    for svc in (s.embeddings_settings, s.tiler_settings, s.vlm_settings):
+        assert svc.connect_timeout == 10
+        assert svc.max_connections == 100
+        assert svc.max_retries == 3
+
+
+def test_vlm_timeout_below_old_floor_allowed(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("VLM_TIMEOUT_SEC", "30")
+
+    assert Settings.from_env().vlm_settings.timeout == 30
+
+
+def test_vlm_concurrency_cannot_exceed_pool(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("VLM_MAX_CONNECTIONS", "4")
+    monkeypatch.setenv("VLM_MAX_CONCURRENCY", "8")
+
+    with pytest.raises(SettingsError, match="VLM_MAX_CONCURRENCY"):
+        Settings.from_env()
+
+
+def test_backoff_bad_float(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("HTTP_RETRY_BACKOFF_CAP_SEC", "soon")
+
+    with pytest.raises(SettingsError, match="HTTP_RETRY_BACKOFF_CAP_SEC"):
+        Settings.from_env()

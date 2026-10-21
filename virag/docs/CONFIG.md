@@ -59,6 +59,19 @@ The configured `QDRANT_COLLECTION_NAME` is the name of a stable serving **alias*
 serves through it while the physical collection it points to is versioned (`__v1`, `__v2`,
 …) so a `/revision` can blue-green swap it. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Upstream HTTP retries
+
+Every upstream client (embeddings, tiler, VLM) holds one long-lived pooled connection
+per upstream and replays transient failures — connection errors and `429`/`502`/`503`/`504`
+replies — with full-jitter exponential backoff. Read timeouts are never replayed (a slow
+upstream only gets slower under extra load), and neither are tiler ingests or the
+passthrough proxies.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `HTTP_RETRY_BACKOFF_BASE_SEC` | no | `0.25` | Backoff base (≥ 0). Each wait is uniform over `[0, min(CAP, BASE · 2^attempt)]`. |
+| `HTTP_RETRY_BACKOFF_CAP_SEC` | no | `8` | Backoff ceiling (≥ 0); also caps a numeric `Retry-After` from the upstream. |
+
 ## Embeddings (vLLM, OpenAI-compatible)
 
 | Variable | Required | Default | Meaning |
@@ -67,14 +80,20 @@ serves through it while the physical collection it points to is versioned (`__v1
 | `VLLM_SERVED_MODEL_NAME` | no | `embeddings-model` | Embeddings model name (must match `SERVED_MODEL_NAME` in `serve_embeddings.sh`). |
 | `VLLM_API_KEY` | no | `dummy` | Bearer key for the embeddings server (must match `API_KEY` in `serve_embeddings.sh`; also injected on the `/embed` proxy). |
 | `EMBEDDINGS_CHUNK_SIZE` | no | `16` | Max items per embedding request (≥ 1). |
-| `EMBEDDINGS_TIMEOUT_SEC` | no | `60` | Per-request timeout (≥ 1). |
+| `EMBEDDINGS_TIMEOUT_SEC` | no | `60` | Per-read deadline: max silence between bytes (≥ 1). |
+| `EMBEDDINGS_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
+| `EMBEDDINGS_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the embeddings server (≥ 1). |
+| `EMBEDDINGS_MAX_RETRIES` | no | `3` | Retries for a transient failure (≥ 0). |
 
 ## Tiler (doc-tiler)
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `TILER_BASE_URL` | no | `http://tiler-virag:8080` | doc-tiler endpoint. |
-| `TILER_TIMEOUT_SEC` | no | `120` | Per-request timeout (≥ 1); tiling and rendering can be slow. |
+| `TILER_TIMEOUT_SEC` | no | `120` | Per-read deadline (≥ 1): for the tile stream, the max gap between events, not the whole render. |
+| `TILER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
+| `TILER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the tiler (≥ 1). |
+| `TILER_MAX_RETRIES` | no | `3` | Retries for a transient failure on idempotent calls (≥ 0); an ingest is never replayed. |
 
 ## Upstream VLM (OpenAI-compatible; external)
 
@@ -83,9 +102,11 @@ serves through it while the physical collection it points to is versioned (`__v1
 | `VLM_BASE_URL` | **yes** | — | Vision model endpoint. The `/v1` suffix is required. |
 | `VLM_MODEL_NAME` | **yes** | — | Model name; used for the startup vision probe. Callers still pass their own `model` in the request body (passed through). |
 | `VLM_API_KEY` | no | `dummy` | Bearer key for the VLM (injected on chat completions and the `/v1` proxy). |
-| `VLM_TIMEOUT_SEC` | no | `480` | Per-read deadline on the VLM stream (max silence between chunks; covers a long prefill/TTFT on big pixel-RAG prompts), not total generation time (≥ 480). |
+| `VLM_TIMEOUT_SEC` | no | `480` | Per-read deadline on the VLM stream (max silence between chunks; covers a long prefill/TTFT on big pixel-RAG prompts), not total generation time (≥ 1). |
+| `VLM_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
+| `VLM_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the VLM (≥ 1); must be ≥ `VLM_MAX_CONCURRENCY`. |
 | `VLM_MAX_CONCURRENCY` | no | `0` | Max concurrent upstream chat-completion calls; `0` = unlimited (≥ 0). Cap it to shield a fragile/remote VLM from concurrent multimodal load; excess calls queue. Held for the whole stream. |
-| `VLM_MAX_RETRIES` | no | `3` | Retries for a transient connection error while *opening* an upstream call, before any bytes stream (≥ 0). Never replays a partially-streamed response. |
+| `VLM_MAX_RETRIES` | no | `3` | Retries for a transient failure (connection error or `429`/`502`/`503`/`504`) while *opening* an upstream call, before any bytes stream (≥ 0). Never replays a partially-streamed response; once retries run out the last upstream reply is passed through as-is. |
 
 ---
 

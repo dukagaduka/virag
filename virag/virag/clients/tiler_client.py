@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-import httpx
+import httpx2
 
+from virag.clients.http_service import HttpService
 from virag.errors import ApiError
-from virag.settings import TilerSettings
+from virag.settings import HttpSettings, TilerSettings
 from virag.utils import error_body
 
 
@@ -53,15 +54,14 @@ class TileResult:
         )
 
 
-class TilerService:
+class TilerService(HttpService):
     def __init__(
         self,
         base_url: str,
-        timeout: float | httpx.Timeout = 120,
+        **http_options,
     ):
 
-        self.base_url = base_url
-        self.timeout  = timeout
+        super().__init__(base_url, **http_options)
 
 
     @property
@@ -99,40 +99,29 @@ class TilerService:
         return f"{self.base_url}/docs/search"
 
 
+    def doc_route(self, doc_id: str) -> str:
+        return f"{self.base_url}/doc/{doc_id}"
+
+
     def metadata_route(self, doc_id: str) -> str:
         return f"{self.base_url}/doc/{doc_id}/metadata"
 
 
     @classmethod
-    def from_settings(cls, ts: TilerSettings) -> TilerService:
+    def from_settings(cls, ts: TilerSettings, hs: HttpSettings) -> TilerService:
         return cls(
             base_url=ts.base_url,
             timeout=ts.timeout,
+            connect_timeout=ts.connect_timeout,
+            max_connections=ts.max_connections,
+            max_retries=ts.max_retries,
+            backoff_base=hs.backoff_base,
+            backoff_cap=hs.backoff_cap,
         )
 
 
-    async def check_connection(self):
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(
-                    self.readyz_route
-                )
-
-                response.raise_for_status()
-
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot establish connection to the {self.base_url} during the check",
-                    details={"http_status_error": {"code": e.response.status_code}, "text": e.response.text},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.readyz_route} during the check",
-                    details={"error": repr(e)},
-                ) from e
+    async def check_connection(self) -> None:
+        await self._request("GET", self.readyz_route, action="the check")
 
 
     async def tile(
@@ -153,51 +142,18 @@ class TilerService:
             "force": force,
         }
 
-        data: dict = {"doc_type": doc_type}
-        if url is not None:
-            data["url"] = url
-        if metadata is not None:
-            data["metadata"] = json.dumps(metadata)
-
-        files = (
-            {"document": ("document", document, "application/octet-stream")}
-            if document is not None
-            else None
+        # An ingest is not replayed: a timed-out render may still be running upstream.
+        response = await self._request(
+            "POST",
+            self.tile_route,
+            action="the ingest",
+            retry=False,
+            params=params,
+            data=self._ingest_form(doc_type, url, metadata),
+            files=self._ingest_files(document),
         )
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.post(
-                    self.tile_route,
-                    params=params,
-                    data=data,
-                    files=files,
-                )
-                response.raise_for_status()
-
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Tiler rejected the ingest at {self.tile_route}",
-                    details={"tiler_status_code": e.response.status_code, "tiler_error": error_body(e.response)},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.tile_route} during the ingest",
-                    details={"error": repr(e)},
-                ) from e
-
-            try:
-                return TileResult.from_manifest(response.json())
-
-            except (KeyError, TypeError, ValueError) as e:
-                raise ApiError(
-                    status_code=422,
-                    message=f"Cannot decode {self.tile_route} manifest or unexpected response structure",
-                    details={"base_message": str(e)},
-                ) from e
+        return self._json(response, action="the ingest", parse=TileResult.from_manifest)
 
 
     async def tile_stream(
@@ -213,47 +169,26 @@ class TilerService:
 
         Because tiles arrive as they render, the per-read timeout — not a single
         whole-request deadline — bounds each hop, so an arbitrarily long render never
-        trips `TILER_TIMEOUT_SEC`.
+        trips `TILER_TIMEOUT_SEC`. Never replayed: events may already be consumed.
         """
-        params = {"force": force}
-
-        data: dict = {"doc_type": doc_type}
-        if url is not None:
-            data["url"] = url
-        if metadata is not None:
-            data["metadata"] = json.dumps(metadata)
-
-        files = (
-            {"document": ("document", document, "application/octet-stream")}
-            if document is not None
-            else None
-        )
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self._stream(
+            "POST",
+            self.tile_stream_route,
+            action="the ingest",
+            retry=False,
+            params={"force": force},
+            data=self._ingest_form(doc_type, url, metadata),
+            files=self._ingest_files(document),
+        ) as response:
             try:
-                async with client.stream(
-                    "POST",
-                    self.tile_stream_route,
-                    params=params,
-                    data=data,
-                    files=files,
-                ) as response:
-                    if response.status_code != 200:
-                        body = (await response.aread()).decode(errors="replace")
-                        raise ApiError(
-                            status_code=503,
-                            message=f"Tiler rejected the stream at {self.tile_stream_route}",
-                            details={"tiler_status_code": response.status_code, "tiler_error": body},
-                        )
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        yield json.loads(line)
 
-                    async for line in response.aiter_lines():
-                        if line.strip():
-                            yield json.loads(line)
-
-            except httpx.RequestError as e:
+            except httpx2.RequestError as e:
                 raise ApiError(
                     status_code=503,
-                    message=f"Cannot reach {self.tile_stream_route} during the ingest",
+                    message=f"Lost {self.tile_stream_route} mid-stream during the ingest",
                     details={"error": repr(e)},
                 ) from e
 
@@ -272,146 +207,68 @@ class TilerService:
             "verify": verify,
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(
-                    self.get_tile_route,
-                    params=params,
-                )
-                response.raise_for_status()
+        response = await self._request(
+            "GET",
+            self.get_tile_route,
+            action=f"tile regeneration ({doc_id}, {tile_num})",
+            params=params,
+        )
 
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Tiler could not regenerate tile ({doc_id}, {tile_num}) at {self.get_tile_route}",
-                    details={"tiler_status_code": e.response.status_code, "tiler_error": error_body(e.response)},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.get_tile_route} during tile regeneration",
-                    details={"error": repr(e)},
-                ) from e
-
-            return response.content
+        return response.content
 
 
     async def get_info(self) -> dict:
         """Fetch the tiler's runtime info (render_version, secret_hash, …) for binding."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(self.info_route)
-                response.raise_for_status()
+        response = await self._request("GET", self.info_route, action="the info fetch")
 
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Tiler /info at {self.info_route} failed",
-                    details={"tiler_status_code": e.response.status_code, "tiler_error": error_body(e.response)},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.info_route}",
-                    details={"error": repr(e)},
-                ) from e
-
-            try:
-                return response.json()
-
-            except ValueError as e:
-                raise ApiError(
-                    status_code=422,
-                    message=f"Cannot decode {self.info_route} response",
-                    details={"base_message": str(e)},
-                ) from e
+        return self._json(response, action="the info fetch")
 
 
     async def doc_exists(self, doc_id: str) -> bool:
         """Cheaply check a document exists in the tiler (Range 0-0, no blob transfer)."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(
-                    f"{self.base_url}/doc/{doc_id}",
-                    headers={"Range": "bytes=0-0"},
-                )
+        route = self.doc_route(doc_id)
 
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.base_url}/doc/{doc_id}",
-                    details={"error": repr(e)},
-                ) from e
+        try:
+            response = await self.send("GET", route, headers={"Range": "bytes=0-0"})
 
-            if response.status_code in (200, 206):
-                return True
-
-            if response.status_code == 404:
-                return False
-
+        except httpx2.RequestError as e:
             raise ApiError(
                 status_code=503,
-                message=f"Unexpected status {response.status_code} checking doc {doc_id}",
-                details={"tiler_error": error_body(response)},
-            )
+                message=f"Cannot reach {route}",
+                details={"error": repr(e)},
+            ) from e
+
+        if response.status_code in (200, 206):
+            return True
+
+        if response.status_code == 404:
+            return False
+
+        raise ApiError(
+            status_code=503,
+            message=f"Unexpected status {response.status_code} checking doc {doc_id}",
+            details={"upstream_status": response.status_code, "upstream_error": error_body(response)},
+        )
 
 
     async def get_schema(self) -> dict:
         """Fetch the tiler's declared metadata schema (which keys are indexed/searchable)."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(self.schema_route)
-                response.raise_for_status()
+        response = await self._request("GET", self.schema_route, action="the schema fetch")
 
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Tiler {self.schema_route} failed",
-                    details={"tiler_status_code": e.response.status_code, "tiler_error": error_body(e.response)},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.schema_route}",
-                    details={"error": repr(e)},
-                ) from e
-
-            try:
-                return response.json()
-
-            except ValueError as e:
-                raise ApiError(
-                    status_code=422,
-                    message=f"Cannot decode {self.schema_route} response",
-                    details={"base_message": str(e)},
-                ) from e
+        return self._json(response, action="the schema fetch")
 
 
     async def patch_metadata(self, doc_id: str, patch: dict) -> None:
-        """Shallow-merge a metadata patch onto a stored document (a null value deletes a key)."""
-        route = self.metadata_route(doc_id)
+        """Shallow-merge a metadata patch onto a stored document (a null value deletes a key).
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.patch(route, json=patch)
-                response.raise_for_status()
-
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Tiler rejected the metadata patch at {route}",
-                    details={"tiler_status_code": e.response.status_code, "tiler_error": error_body(e.response)},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {route} during the metadata patch",
-                    details={"error": repr(e)},
-                ) from e
+        Safe to replay: the patch sets absolute values, so applying it twice is a no-op.
+        """
+        await self._request(
+            "PATCH",
+            self.metadata_route(doc_id),
+            action="the metadata patch",
+            json=patch,
+        )
 
 
     async def search_docs(
@@ -428,34 +285,9 @@ class TilerService:
         if cursor is not None:
             body["cursor"] = cursor
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.post(self.docs_search_route, json=body)
-                response.raise_for_status()
+        response = await self._request("POST", self.docs_search_route, action="search", json=body)
 
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Tiler rejected the search at {self.docs_search_route}",
-                    details={"tiler_status_code": e.response.status_code, "tiler_error": error_body(e.response)},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.docs_search_route} during search",
-                    details={"error": repr(e)},
-                ) from e
-
-            try:
-                return response.json()
-
-            except ValueError as e:
-                raise ApiError(
-                    status_code=422,
-                    message=f"Cannot decode {self.docs_search_route} response",
-                    details={"base_message": str(e)},
-                ) from e
+        return self._json(response, action="search")
 
 
     async def iter_docs(self, *, filters: list[dict] | None = None) -> list[dict]:
@@ -472,3 +304,22 @@ class TilerService:
                 break
 
         return items
+
+
+    @staticmethod
+    def _ingest_form(doc_type: str, url: str | None, metadata: dict | None) -> dict:
+        data: dict = {"doc_type": doc_type}
+        if url is not None:
+            data["url"] = url
+        if metadata is not None:
+            data["metadata"] = json.dumps(metadata)
+
+        return data
+
+
+    @staticmethod
+    def _ingest_files(document: bytes | None) -> dict | None:
+        if document is None:
+            return None
+
+        return {"document": ("document", document, "application/octet-stream")}

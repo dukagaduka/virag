@@ -7,7 +7,7 @@ with document-image tiles retrieved from a Qdrant + [doc-tiler](../../doc-tiler)
 backend, then forwarded. The client keeps talking to one OpenAI-shaped endpoint and
 opts into retrieval per request.
 
-- **Stack:** Python 3.11+, FastAPI, async `httpx`, `qdrant-client` (async).
+- **Stack:** Python 3.11+, FastAPI, async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async).
 - **Backends (all external):** an embeddings server (vLLM, OpenAI-compatible), the
   doc-tiler service, a Qdrant instance, and the upstream VLM.
 - **Scope:** the gateway only. Tiling/rendering lives in doc-tiler; embedding lives in
@@ -88,7 +88,7 @@ per injected tile: `{name, doc_id, tile_num, score}` (`name` from the tile's
 ## 5. Passthrough proxy
 
 Everything that isn't RAG is a thin reverse proxy (`_reverse_proxy`, streaming via
-`httpx` `aiter_raw`):
+`httpx2` `aiter_raw` over each upstream's shared pooled client, never retried):
 
 | Prefix | Upstream | Auth injected |
 |---|---|---|

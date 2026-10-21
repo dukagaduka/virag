@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import sys
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 
@@ -17,6 +17,7 @@ from virag.reconcile import reconcile, run_periodic
 from virag.api import enroll as enroll_api
 from virag.api import chat_completions as chat_completions_api
 from virag.api import proxy as proxy_api
+from virag.api.proxy import QdrantProxyService
 from virag.api import ops as ops_api
 from virag.api import revision as revision_api
 
@@ -47,6 +48,17 @@ async def _require_dependency(name: str, coro) -> None:
         raise
 
 
+async def _cancel(task: asyncio.Task) -> None:
+    """Cancel a background task and wait for it to unwind."""
+    task.cancel()
+
+    try:
+        await task
+
+    except asyncio.CancelledError:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -54,59 +66,65 @@ async def lifespan(app: FastAPI):
 
     settings = Settings.from_env()
 
-    store = QdrantStore.from_settings(settings.qdrant_settings)
-    embeddings = EmbeddingsClient.from_settings(settings.embeddings_settings)
-    tiler = TilerService.from_settings(settings.tiler_settings)
-    vlm = VLMClient.from_settings(settings.vlm_settings)
+    # Every client registers its own shutdown as soon as it exists, so a failed
+    # dependency check below still closes whatever was already opened (LIFO).
+    async with AsyncExitStack() as stack:
+        store = QdrantStore.from_settings(settings.qdrant_settings)
+        stack.push_async_callback(store.close)
 
-    # Every dependency is essential; a failed check refuses startup.
-    await store.create_collection()
-    await _require_dependency("embeddings", embeddings.check_connection())
-    await _require_dependency("tiler", tiler.check_connection())
-    await _require_dependency("vlm", vlm.check_connection())
+        embeddings = EmbeddingsClient.from_settings(settings.embeddings_settings, settings.http_settings)
+        stack.push_async_callback(embeddings.close)
 
-    # Refuse to serve an unrelated Tiler/Qdrant pair; bind a fresh collection.
-    render_version = await enforce_binding(store, tiler, secret_hash(settings.db_secret))
-    # Reconcile depends on these indexed metadata fields being declared in the tiler.
-    await enforce_metadata_schema(tiler)
+        tiler = TilerService.from_settings(settings.tiler_settings, settings.http_settings)
+        stack.push_async_callback(tiler.close)
 
-    # Repair any partial/orphaned enrolls left by an earlier crash before serving.
-    await reconcile(store, tiler, embeddings, settings.reconcile_settings)
+        vlm = VLMClient.from_settings(settings.vlm_settings, settings.http_settings)
+        stack.push_async_callback(vlm.close)
 
-    reconcile_task = asyncio.create_task(
-        run_periodic(store, tiler, embeddings, settings.reconcile_settings)
-    )
+        qdrant_http = QdrantProxyService.from_settings(settings.qdrant_settings, settings.http_settings)
+        stack.push_async_callback(qdrant_http.close)
 
-    app.state.settings = settings
-    app.state.store = store
-    app.state.embeddings = embeddings
-    app.state.tiler = tiler
-    app.state.vlm = vlm
+        # Every dependency is essential; a failed check refuses startup.
+        await store.create_collection()
+        await _require_dependency("embeddings", embeddings.check_connection())
+        await _require_dependency("tiler", tiler.check_connection())
+        await _require_dependency("vlm", vlm.check_connection())
 
-    log.info(
-        "ready: qdrant=%s vector_size=%d collection=%s distance=%s embeddings=%s tiler=%s vlm=%s model=%s render_version=%s",
-        settings.qdrant_settings.base_url,
-        settings.qdrant_settings.vector_size,
-        settings.qdrant_settings.collection_name,
-        settings.qdrant_settings.distance_type.value,
-        settings.embeddings_settings.base_url,
-        settings.tiler_settings.base_url,
-        settings.vlm_settings.base_url,
-        settings.vlm_settings.model_name,
-        render_version,
-    )
+        # Refuse to serve an unrelated Tiler/Qdrant pair; bind a fresh collection.
+        render_version = await enforce_binding(store, tiler, secret_hash(settings.db_secret))
+        # Reconcile depends on these indexed metadata fields being declared in the tiler.
+        await enforce_metadata_schema(tiler)
 
-    try:
+        # Repair any partial/orphaned enrolls left by an earlier crash before serving.
+        await reconcile(store, tiler, embeddings, settings.reconcile_settings)
+
+        # Registered last, so it is cancelled first — before the clients it uses close.
+        reconcile_task = asyncio.create_task(
+            run_periodic(store, tiler, embeddings, settings.reconcile_settings)
+        )
+        stack.push_async_callback(_cancel, reconcile_task)
+
+        app.state.settings = settings
+        app.state.store = store
+        app.state.embeddings = embeddings
+        app.state.tiler = tiler
+        app.state.vlm = vlm
+        app.state.qdrant_http = qdrant_http
+
+        log.info(
+            "ready: qdrant=%s vector_size=%d collection=%s distance=%s embeddings=%s tiler=%s vlm=%s model=%s render_version=%s",
+            settings.qdrant_settings.base_url,
+            settings.qdrant_settings.vector_size,
+            settings.qdrant_settings.collection_name,
+            settings.qdrant_settings.distance_type.value,
+            settings.embeddings_settings.base_url,
+            settings.tiler_settings.base_url,
+            settings.vlm_settings.base_url,
+            settings.vlm_settings.model_name,
+            render_version,
+        )
+
         yield
-
-    finally:
-        reconcile_task.cancel()
-        try:
-            await reconcile_task
-        except asyncio.CancelledError:
-            pass
-
-        await store.close()
 
 
 def create_app() -> FastAPI:

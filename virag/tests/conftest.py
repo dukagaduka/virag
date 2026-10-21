@@ -12,7 +12,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -26,6 +25,7 @@ from virag.clients.tiler_client import Tile, TileResult
 from virag.errors import install_error_handlers
 from virag.settings import (
     EmbeddingsSettings,
+    HttpSettings,
     QdrantStoreSettings,
     RagSettings,
     ReconcileSettings,
@@ -232,17 +232,21 @@ def make_settings(**overrides) -> Settings:
         port=8080,
         db_secret=overrides.pop("db_secret", ""),
         rag_settings=rag,
+        http_settings=HttpSettings(backoff_base=0, backoff_cap=0),
         qdrant_settings=QdrantStoreSettings(
             base_url="http://qdrant", collection_name="c", vector_size=4, distance_type=Distance.COSINE,
             chunk_byte_budget=24 * 1024 * 1024, max_batch_chunks=1024,
         ),
         embeddings_settings=EmbeddingsSettings(
             base_url="http://emb/v1", model_name="emb", api_key="k-emb", chunk_size=16, timeout=60,
+            connect_timeout=10, max_connections=100, max_retries=0,
         ),
-        tiler_settings=TilerSettings(base_url="http://tiler", timeout=120),
+        tiler_settings=TilerSettings(
+            base_url="http://tiler", timeout=120, connect_timeout=10, max_connections=100, max_retries=0,
+        ),
         vlm_settings=VLMSettings(
             base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout=120,
-            max_concurrency=0, max_retries=0,
+            connect_timeout=10, max_connections=100, max_concurrency=0, max_retries=0,
         ),
         reconcile_settings=ReconcileSettings(self_heal=True, interval_sec=0, pending_ttl_sec=3600),
     )

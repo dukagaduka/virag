@@ -2,26 +2,23 @@ from __future__ import annotations
 
 import asyncio
 
-import httpx
-
-from virag.errors import ApiError
-from virag.settings import EmbeddingsSettings
+from virag.clients.http_service import OpenAIService
+from virag.settings import EmbeddingsSettings, HttpSettings
 
 
-class EmbeddingsClient:
+class EmbeddingsClient(OpenAIService):
     def __init__(
         self,
         base_url: str,
         model_name: str,
         api_key: str,
-        timeout: float | httpx.Timeout,
+        *,
         chunk_size: int = 16,
+        **http_options,
     ):
 
-        self.base_url   = base_url
-        self.model_name = model_name
-        self.api_key    = api_key
-        self.timeout    = timeout
+        super().__init__(base_url, model_name, api_key, **http_options)
+
         self.chunk_size = chunk_size
 
 
@@ -30,112 +27,36 @@ class EmbeddingsClient:
         return f"{self.base_url}/embeddings"
 
 
-    @property
-    def models_route(self) -> str:
-        return f"{self.base_url}/models"
-
-
-    @property
-    def auth_header(self) -> dict:
-        return {"Authorization": f"Bearer {self.api_key}"}
-
-
     @classmethod
-    def from_settings(cls, es: EmbeddingsSettings) -> EmbeddingsClient:
+    def from_settings(cls, es: EmbeddingsSettings, hs: HttpSettings) -> EmbeddingsClient:
         return cls(
             base_url=es.base_url,
             model_name=es.model_name,
             api_key=es.api_key,
+            chunk_size=es.chunk_size,
             timeout=es.timeout,
+            connect_timeout=es.connect_timeout,
+            max_connections=es.max_connections,
+            max_retries=es.max_retries,
+            backoff_base=hs.backoff_base,
+            backoff_cap=hs.backoff_cap,
         )
 
 
-    async def check_connection(self) -> None:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(
-                    self.models_route,
-                    headers=self.auth_header,
-                )
-                response.raise_for_status()
-
-            except httpx.HTTPStatusError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot establish connection to the {self.models_route} during the check",
-                    details={"http_status_error": {"code": e.response.status_code}, "text": e.response.text},
-                ) from e
-
-            except httpx.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Cannot reach {self.models_route} during the check",
-                    details={"error": repr(e)},
-                ) from e
-
-            try:
-                data = response.json()
-                models = [model["id"] for model in data["data"]]
-
-            except (KeyError, TypeError, ValueError) as e:
-                raise ApiError(
-                    status_code=422,
-                    message=f"Cannot decode {self.models_route} response or unexpected response structure during the check",
-                    details={"base_message": str(e)},
-                ) from e
-
-            if self.model_name not in models:
-                raise ApiError(
-                    status_code=404,
-                    message=f"Model {self.model_name} is not established at {self.base_url}",
-                    details={"models": models},
-                )
-
-
-    async def _post(
-        self,
-        client: httpx.AsyncClient,
-        body: dict,
-    ) -> list[list[float]]:
+    async def _post(self, body: dict) -> list[list[float]]:
         """POST one embeddings request and return its vectors ordered by `index`.
 
         Transport is shared by both flows; only the request body differs — text uses
         `input`, images use chat-style `messages` (see `embed_texts`/`embed_images`).
         """
-        try:
-            response = await client.post(
-                self.route,
-                json={"model": self.model_name, **body},
-                headers=self.auth_header,
-            )
-            response.raise_for_status()
+        response = await self._request(
+            "POST",
+            self.route,
+            action="embedding",
+            json={"model": self.model_name, **body},
+        )
 
-        except httpx.HTTPStatusError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Cannot establish connection to the {self.route} during embedding",
-                details={"httpx_status_error": {"code": e.response.status_code}, "text": e.response.text},
-            ) from e
-
-        except httpx.RequestError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Cannot reach {self.route} during embedding",
-                details={"error": repr(e)},
-            ) from e
-
-        try:
-            data = response.json()
-            embeddings = sorted(data["data"], key=lambda x: x["index"])
-
-            return [emb["embedding"] for emb in embeddings]
-
-        except (KeyError, TypeError, ValueError) as e:
-            raise ApiError(
-                status_code=422,
-                message=f"Cannot decode {self.route} response or unexpected response structure during embedding",
-                details={"base_message": str(e)},
-            ) from e
+        return self._json(response, action="embedding", parse=self._vectors)
 
 
     async def embed_texts(
@@ -145,10 +66,9 @@ class EmbeddingsClient:
         """Embed query/text inputs. Sent through the `input` field, batched by chunk_size."""
         all_embeddings: list[list[float]] = []
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for i in range(0, len(texts), self.chunk_size):
-                chunk = texts[i:i + self.chunk_size]
-                all_embeddings.extend(await self._post(client, {"input": chunk}))
+        for i in range(0, len(texts), self.chunk_size):
+            chunk = texts[i:i + self.chunk_size]
+            all_embeddings.extend(await self._post({"input": chunk}))
 
         return all_embeddings
 
@@ -182,14 +102,20 @@ class EmbeddingsClient:
 
         all_embeddings: list[list[float]] = []
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for i in range(0, len(base64_images), self.chunk_size):
-                group = base64_images[i:i + self.chunk_size]
-                results = await asyncio.gather(
-                    *(self._post(client, image_body(b64)) for b64 in group)
-                )
+        for i in range(0, len(base64_images), self.chunk_size):
+            group = base64_images[i:i + self.chunk_size]
+            results = await asyncio.gather(
+                *(self._post(image_body(b64)) for b64 in group)
+            )
 
-                for vectors in results:
-                    all_embeddings.extend(vectors)
+            for vectors in results:
+                all_embeddings.extend(vectors)
 
         return all_embeddings
+
+
+    @staticmethod
+    def _vectors(data: dict) -> list[list[float]]:
+        embeddings = sorted(data["data"], key=lambda x: x["index"])
+
+        return [emb["embedding"] for emb in embeddings]
