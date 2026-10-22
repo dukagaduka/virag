@@ -99,6 +99,15 @@ MAX_NUM_BATCHED_TOKENS="4096"
 # Меньше — стабильнее, но ниже throughput.
 # Для pooling-моделей без chunked prefill не должен быть меньше MAX_MODEL_LEN.
 
+SCHEDULING_POLICY="priority"
+# Порядок обслуживания запросов в очереди scheduler'а.
+# fcfs     — строго в порядке прихода.
+# priority — по полю `priority` запроса (меньше — раньше), при равенстве по времени.
+# virag шлёт priority только для фоновой загрузки (RETRIEVER_BULK_PRIORITY > 0),
+# чтобы запросы из чата обгоняли очередь тайлов enroll/revision. Запросы без поля
+# имеют priority 0, поэтому без настройки virag режим priority ведёт себя как fcfs.
+# Ненулевой priority на сервере в режиме fcfs — ошибка (virag проверяет при старте).
+
 ############################################
 # LORA
 ############################################
@@ -227,6 +236,7 @@ ARGS+=("--max-model-len" "$MAX_MODEL_LEN")
 ARGS+=("--gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION")
 ARGS+=("--max-num-seqs" "$MAX_NUM_SEQS")
 ARGS+=("--max-num-batched-tokens" "$MAX_NUM_BATCHED_TOKENS")
+ARGS+=("--scheduling-policy" "$SCHEDULING_POLICY")
 
 # LoRA
 if [[ "$LORA_ACTIVE" == "1" ]]; then
@@ -278,6 +288,7 @@ echo "max model len:           $MAX_MODEL_LEN"
 echo "gpu mem utilization:     $GPU_MEMORY_UTILIZATION"
 echo "max num seqs:            $MAX_NUM_SEQS"
 echo "max batched tokens:      $MAX_NUM_BATCHED_TOKENS"
+echo "scheduling policy:       $SCHEDULING_POLICY"
 echo
 echo "lora:                    $([[ "$LORA_ACTIVE" == "1" ]] && echo enabled || echo disabled)"
 if [[ "$LORA_ACTIVE" == "1" ]]; then

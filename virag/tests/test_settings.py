@@ -21,7 +21,8 @@ _ALL_KEYS = {
     "VIRAG_HOST", "VIRAG_PORT", "TILER_DB_SECRET", "VIRAG_TOP_N", "VIRAG_SCORE_THRESHOLD",
     "VIRAG_FRAMING_TEXT", "QDRANT_BASE_URL", "QDRANT_COLLECTION_NAME", "QDRANT_VECTOR_SIZE",
     "QDRANT_DISTANCE_TYPE", "RETRIEVER_BASE_URL", "RETRIEVER_MODEL_NAME", "RETRIEVER_API_KEY",
-    "RETRIEVER_CHUNK_SIZE", "RETRIEVER_TIMEOUT_SEC", "TILER_BASE_URL", "TILER_TIMEOUT_SEC",
+    "RETRIEVER_BATCH_SIZE", "RETRIEVER_MAX_CONCURRENCY", "RETRIEVER_BULK_PRIORITY",
+    "RETRIEVER_IMAGE_BATCHING", "VIRAG_ENROLL_BATCH_SIZE", "RETRIEVER_TIMEOUT_SEC", "TILER_BASE_URL", "TILER_TIMEOUT_SEC",
     "VLM_BASE_URL", "VLM_MODEL_NAME", "VLM_API_KEY", "VLM_TIMEOUT_SEC",
     "VLM_CONNECT_TIMEOUT_SEC", "VLM_MAX_CONNECTIONS", "VLM_MAX_CONCURRENCY", "VLM_MAX_RETRIES",
     "RETRIEVER_CONNECT_TIMEOUT_SEC", "RETRIEVER_MAX_CONNECTIONS", "RETRIEVER_MAX_RETRIES",
@@ -150,4 +151,32 @@ def test_backoff_bad_float(monkeypatch):
     monkeypatch.setenv("HTTP_RETRY_BACKOFF_CAP_SEC", "soon")
 
     with pytest.raises(SettingsError, match="HTTP_RETRY_BACKOFF_CAP_SEC"):
+        Settings.from_env()
+
+
+def test_retriever_and_enroll_defaults(monkeypatch):
+    _base_env(monkeypatch)
+    s = Settings.from_env()
+
+    assert s.retriever_settings.batch_size == 32
+    assert s.retriever_settings.max_concurrency == 32
+    assert s.retriever_settings.bulk_priority == 0
+    assert s.retriever_settings.image_batching == "auto"
+    assert s.enroll_settings.batch_size == 32
+
+
+def test_image_batching_mode_validated(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("RETRIEVER_IMAGE_BATCHING", "sometimes")
+
+    with pytest.raises(SettingsError, match="RETRIEVER_IMAGE_BATCHING"):
+        Settings.from_env()
+
+
+def test_retriever_concurrency_cannot_exceed_pool(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("RETRIEVER_MAX_CONNECTIONS", "8")
+    monkeypatch.setenv("RETRIEVER_MAX_CONCURRENCY", "16")
+
+    with pytest.raises(SettingsError, match="RETRIEVER_MAX_CONCURRENCY"):
         Settings.from_env()

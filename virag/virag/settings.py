@@ -12,6 +12,8 @@ class SettingsError(Exception):
     """Raised when service configuration is invalid."""
 
 
+_IMAGE_BATCHING_MODES = ("auto", "on", "off")
+
 _DEFAULT_FRAMING_TEXT = (
     "The following image tiles are retrieved document context. "
     "Use them to answer the question."
@@ -46,7 +48,10 @@ class RetrieverSettings:
     base_url: str
     model_name: str
     api_key: str
-    chunk_size: int
+    batch_size: int
+    max_concurrency: int
+    bulk_priority: int
+    image_batching: str
     timeout: int
     connect_timeout: int
     max_connections: int
@@ -75,6 +80,11 @@ class VLMSettings:
 
 
 @dataclass(slots=True, frozen=True)
+class EnrollSettings:
+    batch_size: int
+
+
+@dataclass(slots=True, frozen=True)
 class ReconcileSettings:
     self_heal: bool
     interval_sec: int
@@ -93,6 +103,7 @@ class Settings:
     retriever_settings: RetrieverSettings
     tiler_settings: TilerSettings
     vlm_settings: VLMSettings
+    enroll_settings: EnrollSettings
     reconcile_settings: ReconcileSettings
 
     @classmethod
@@ -211,11 +222,34 @@ class Settings:
             "dummy"
         )
 
-        retriever_chunk_size = int_coercion(
-            os.environ.get("RETRIEVER_CHUNK_SIZE", "16"),
-            "RETRIEVER_CHUNK_SIZE",
+        retriever_batch_size = int_coercion(
+            os.environ.get("RETRIEVER_BATCH_SIZE", "32"),
+            "RETRIEVER_BATCH_SIZE",
             low=1
         )
+
+        # Caps bulk (ingest) calls only; interactive queries bypass it.
+        retriever_max_concurrency = int_coercion(
+            os.environ.get("RETRIEVER_MAX_CONCURRENCY", "32"),
+            "RETRIEVER_MAX_CONCURRENCY",
+            low=0
+        )
+
+        # 0 = never send `priority` (portable); > 0 needs a vLLM retriever started
+        # with `--scheduling-policy priority` (lower value = served earlier).
+        retriever_bulk_priority = int_coercion(
+            os.environ.get("RETRIEVER_BULK_PRIORITY", "0"),
+            "RETRIEVER_BULK_PRIORITY",
+            low=0
+        )
+
+        retriever_image_batching = os.environ.get("RETRIEVER_IMAGE_BATCHING", "auto").strip().lower()
+
+        if retriever_image_batching not in _IMAGE_BATCHING_MODES:
+            raise SettingsError(
+                f"Incorrect `RETRIEVER_IMAGE_BATCHING`: {retriever_image_batching!r}. "
+                f"Must be one of {list(_IMAGE_BATCHING_MODES)}."
+            )
 
         retriever_timeout = int_coercion(
             os.environ.get("RETRIEVER_TIMEOUT_SEC", "60"),
@@ -239,6 +273,12 @@ class Settings:
             os.environ.get("RETRIEVER_MAX_RETRIES", "3"),
             "RETRIEVER_MAX_RETRIES",
             low=0
+        )
+
+        concurrency_within_pool(
+            retriever_max_concurrency,
+            retriever_max_connections,
+            "RETRIEVER",
         )
 
         # -----------------------------
@@ -311,17 +351,27 @@ class Settings:
             low=0,
         )
 
-        # Above the pool size the semaphore never binds — the pool would queue instead.
-        if vlm_max_concurrency > vlm_max_connections:
-            raise SettingsError(
-                f"`VLM_MAX_CONCURRENCY` ({vlm_max_concurrency}) must not exceed "
-                f"`VLM_MAX_CONNECTIONS` ({vlm_max_connections})."
-            )
+        concurrency_within_pool(
+            vlm_max_concurrency,
+            vlm_max_connections,
+            "VLM",
+        )
 
         vlm_max_retries = int_coercion(
             os.environ.get("VLM_MAX_RETRIES", "3"),
             "VLM_MAX_RETRIES",
             low=0,
+        )
+
+        # -----------------------------
+        # ENROLL
+        # -----------------------------
+
+        # Tiles gathered per embed+upsert step (enroll, self-heal, revision).
+        enroll_batch_size = int_coercion(
+            os.environ.get("VIRAG_ENROLL_BATCH_SIZE", "32"),
+            "VIRAG_ENROLL_BATCH_SIZE",
+            low=1,
         )
 
         # -----------------------------
@@ -371,7 +421,10 @@ class Settings:
                 base_url=retriever_base_url,
                 model_name=retriever_model_name,
                 api_key=retriever_api_key,
-                chunk_size=retriever_chunk_size,
+                batch_size=retriever_batch_size,
+                max_concurrency=retriever_max_concurrency,
+                bulk_priority=retriever_bulk_priority,
+                image_batching=retriever_image_batching,
                 timeout=retriever_timeout,
                 connect_timeout=retriever_connect_timeout,
                 max_connections=retriever_max_connections,
@@ -394,6 +447,9 @@ class Settings:
                 max_concurrency=vlm_max_concurrency,
                 max_retries=vlm_max_retries,
             ),
+            enroll_settings=EnrollSettings(
+                batch_size=enroll_batch_size,
+            ),
             reconcile_settings=ReconcileSettings(
                 self_heal=reconcile_self_heal,
                 interval_sec=reconcile_interval_sec,
@@ -410,6 +466,15 @@ def require_env(name: str) -> str:
         raise SettingsError(f"`{name}` environment variable is required.")
 
     return value
+
+
+def concurrency_within_pool(max_concurrency: int, max_connections: int, prefix: str) -> None:
+    """Above the pool size a concurrency cap never binds — the pool would queue instead."""
+    if max_concurrency > max_connections:
+        raise SettingsError(
+            f"`{prefix}_MAX_CONCURRENCY` ({max_concurrency}) must not exceed "
+            f"`{prefix}_MAX_CONNECTIONS` ({max_connections})."
+        )
 
 
 def bool_coercion(value: str, name: str) -> bool:

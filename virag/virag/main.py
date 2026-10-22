@@ -6,7 +6,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 
-from virag.settings import Settings
+from virag.settings import Settings, SettingsError
 from virag.errors import ApiError, install_error_handlers
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.retriever_client import RetrieverClient
@@ -48,6 +48,17 @@ async def _require_dependency(name: str, coro) -> None:
         raise
 
 
+def _require_vector_size(dimension: int | None, vector_size: int) -> None:
+    """The retriever's vectors must fit the collection, or the first upsert fails."""
+    if dimension != vector_size:
+        message = (
+            f"retriever returns {dimension}-d vectors but QDRANT_VECTOR_SIZE is {vector_size}"
+        )
+        log.critical("FATAL: %s", message)
+
+        raise SettingsError(message)
+
+
 async def _cancel(task: asyncio.Task) -> None:
     """Cancel a background task and wait for it to unwind."""
     task.cancel()
@@ -87,6 +98,7 @@ async def lifespan(app: FastAPI):
         # Every dependency is essential; a failed check refuses startup.
         await store.create_collection()
         await _require_dependency("retriever", retriever.check_connection())
+        _require_vector_size(retriever.dimension, settings.qdrant_settings.vector_size)
         await _require_dependency("tiler", tiler.check_connection())
         await _require_dependency("vlm", vlm.check_connection())
 
@@ -96,11 +108,11 @@ async def lifespan(app: FastAPI):
         await enforce_metadata_schema(tiler)
 
         # Repair any partial/orphaned enrolls left by an earlier crash before serving.
-        await reconcile(store, tiler, retriever, settings.reconcile_settings)
+        await reconcile(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
 
         # Registered last, so it is cancelled first — before the clients it uses close.
         reconcile_task = asyncio.create_task(
-            run_periodic(store, tiler, retriever, settings.reconcile_settings)
+            run_periodic(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
         )
         stack.push_async_callback(_cancel, reconcile_task)
 

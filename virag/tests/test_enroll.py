@@ -6,13 +6,16 @@ import json
 
 from virag.api.enroll import point_id
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, sample_tile_result
+from virag.settings import EnrollSettings
+
+from conftest import FakeRetriever, FakeStore, FakeTiler, make_settings, sample_tile_result
 
 
-def _client(make_client, *, n_tiles=2):
+def _client(make_client, *, n_tiles=2, batch_size=16):
     store, retriever = FakeStore(), FakeRetriever()
     tiler = FakeTiler(result=sample_tile_result("doc-a", n_tiles=n_tiles))
-    client = make_client(store=store, retriever=retriever, tiler=tiler)
+    settings = make_settings(enroll_settings=EnrollSettings(batch_size=batch_size))
+    client = make_client(settings=settings, store=store, retriever=retriever, tiler=tiler)
     return client, store, retriever, tiler
 
 
@@ -121,8 +124,7 @@ def test_enroll_marks_pending_then_promotes(make_client):
 
 
 def test_enroll_streams_in_batches(make_client):
-    client, store, retriever, _ = _client(make_client, n_tiles=3)
-    retriever.chunk_size = 1                                               # force one tile per batch
+    client, store, retriever, _ = _client(make_client, n_tiles=3, batch_size=1)   # one tile per batch
 
     r = client.post(
         "/enroll",

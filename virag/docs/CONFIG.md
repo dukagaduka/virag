@@ -32,6 +32,12 @@ them per request (see [API.md](API.md)).
 | `VIRAG_SCORE_THRESHOLD` | no | *(none)* | Minimum Qdrant score; empty/unset = no threshold. Must parse as a float. |
 | `VIRAG_FRAMING_TEXT` | no | built-in prompt | Text prepended to retrieved tiles. Empty falls back to the built-in default ("The following image tiles are retrieved document context. Use them to answer the question."). |
 
+## Enroll
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `VIRAG_ENROLL_BATCH_SIZE` | no | `32` | Tiles gathered per embed+upsert step in `/enroll`, self-heal and `/revision` (≥ 1). Independent of how the retriever batches its requests. |
+
 ## Reconcile (enroll self-repair)
 
 virag keeps Qdrant a consistent subset of the tiler by reconciling at startup and on an
@@ -79,7 +85,10 @@ passthrough proxies.
 | `RETRIEVER_BASE_URL` | no | `http://retriever-vllm-virag:8000/v1` | Retriever endpoint. The `/v1` suffix is required. The retriever server runs in a separate stack, so the default container name only resolves if you attach both stacks to one Docker network; the shipped `deploy/service/.env.example` uses `http://host.docker.internal:48003/v1` instead. |
 | `RETRIEVER_MODEL_NAME` | no | `retriever-model` | Retriever model name (must match `SERVED_MODEL_NAME` in `serve_retriever.sh`). |
 | `RETRIEVER_API_KEY` | no | `dummy` | Bearer key for the retriever server (must match `API_KEY` in `serve_retriever.sh`; also injected on the `/retriever` proxy). |
-| `RETRIEVER_CHUNK_SIZE` | no | `16` | Max items per embedding request (≥ 1). |
+| `RETRIEVER_BATCH_SIZE` | no | `32` | Items per embedding request (≥ 1): always for texts, for images only when image batching is on. |
+| `RETRIEVER_MAX_CONCURRENCY` | no | `32` | Max concurrent **bulk** requests — enroll, self-heal, revision (≥ 0; `0` = unlimited; must be ≤ `RETRIEVER_MAX_CONNECTIONS`). Chat queries bypass it, so keep it below the pool size to leave them headroom. |
+| `RETRIEVER_BULK_PRIORITY` | no | `0` | `0` = never send `priority` (portable to any OpenAI-compatible API). `> 0` tags bulk requests with this vLLM priority (lower = served earlier; queries stay at the default `0`), so the server schedules chat queries ahead of queued bulk work. Requires the retriever to run with `--scheduling-policy priority`; verified at startup. |
+| `RETRIEVER_IMAGE_BATCHING` | no | `auto` | `auto` — probe at startup whether the upstream accepts several images per request (a vLLM batch of chat conversations) and fall back to one per request if not; `on` — require it (startup fails otherwise); `off` — always one image per request. |
 | `RETRIEVER_TIMEOUT_SEC` | no | `60` | Per-read deadline: max silence between bytes (≥ 1). |
 | `RETRIEVER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `RETRIEVER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the retriever server (≥ 1). |

@@ -24,7 +24,7 @@ from virag.api.enroll import point_id
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.tiler_client import TilerService
-from virag.settings import ReconcileSettings
+from virag.settings import EnrollSettings, ReconcileSettings
 
 
 log = logging.getLogger("virag.reconcile")
@@ -35,10 +35,11 @@ async def reconcile(
     tiler: TilerService,
     retriever: RetrieverClient,
     settings: ReconcileSettings,
+    enroll_settings: EnrollSettings,
 ) -> None:
     """Run one reconcile pass: enforce the invariant, then clear stale pending enrolls."""
     await _enforce_subset(store, tiler)
-    await _clear_stale_pending(store, tiler, retriever, settings)
+    await _clear_stale_pending(store, tiler, retriever, settings, enroll_settings)
 
 
 async def _enforce_subset(store: QdrantStore, tiler: TilerService) -> None:
@@ -61,6 +62,7 @@ async def _clear_stale_pending(
     tiler: TilerService,
     retriever: RetrieverClient,
     settings: ReconcileSettings,
+    enroll_settings: EnrollSettings,
 ) -> None:
     """Drop partial points for enrolls left pending past the TTL, then self-heal."""
     cutoff = int(time.time()) - settings.pending_ttl_sec
@@ -87,7 +89,7 @@ async def _clear_stale_pending(
             continue
 
         try:
-            await _reembed_doc(store, tiler, retriever, doc)
+            await _reembed_doc(store, tiler, retriever, doc, batch_size=enroll_settings.batch_size)
             log.info("reconcile: self-healed doc_id=%s", doc_id)
 
         except Exception as e:  # noqa: BLE001 - one bad doc must not stop the sweep
@@ -100,6 +102,7 @@ async def _reembed_doc(
     retriever: RetrieverClient,
     summary: dict,
     *,
+    batch_size: int,
     collection: str | None = None,
     mark_enrolled: bool = True,
 ) -> None:
@@ -124,7 +127,7 @@ async def _reembed_doc(
 
         jpegs = [await tiler.get_tile(doc_id, n) for n in batch]
         b64s = [base64.b64encode(j).decode("ascii") for j in jpegs]
-        vectors = await retriever.embed_images(b64s)
+        vectors = await retriever.embed_images(b64s, bulk=True)
         payloads = [
             {
                 "doc_id": doc_id,
@@ -144,7 +147,7 @@ async def _reembed_doc(
 
     for tile_num in range(tile_count):
         batch.append(tile_num)
-        if len(batch) >= retriever.chunk_size:
+        if len(batch) >= batch_size:
             await flush()
 
     await flush()
@@ -153,7 +156,12 @@ async def _reembed_doc(
         await tiler.patch_metadata(doc_id, {"virag_enrolled_at": int(time.time())})
 
 
-async def revise(store: QdrantStore, tiler: TilerService, retriever: RetrieverClient) -> dict:
+async def revise(
+    store: QdrantStore,
+    tiler: TilerService,
+    retriever: RetrieverClient,
+    enroll_settings: EnrollSettings,
+) -> dict:
     """Re-embed the whole corpus into a fresh collection, then blue-green swap the alias.
 
     The live collection keeps serving until the new one is fully built and the alias flips
@@ -170,7 +178,15 @@ async def revise(store: QdrantStore, tiler: TilerService, retriever: RetrieverCl
             skipped += 1  # incomplete docs aren't servable; leave them for tiler /revision
             continue
 
-        await _reembed_doc(store, tiler, retriever, doc, collection=new_collection, mark_enrolled=False)
+        await _reembed_doc(
+            store,
+            tiler,
+            retriever,
+            doc,
+            batch_size=enroll_settings.batch_size,
+            collection=new_collection,
+            mark_enrolled=False,
+        )
         reembedded += 1
 
     await store.swap_alias(new_collection)
@@ -184,6 +200,7 @@ async def run_periodic(
     tiler: TilerService,
     retriever: RetrieverClient,
     settings: ReconcileSettings,
+    enroll_settings: EnrollSettings,
 ) -> None:
     """Loop reconcile on the configured interval until cancelled (interval 0 = disabled)."""
     if settings.interval_sec <= 0:
@@ -193,7 +210,7 @@ async def run_periodic(
         await asyncio.sleep(settings.interval_sec)
 
         try:
-            await reconcile(store, tiler, retriever, settings)
+            await reconcile(store, tiler, retriever, settings, enroll_settings)
 
         except asyncio.CancelledError:
             raise

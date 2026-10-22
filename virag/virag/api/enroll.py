@@ -40,6 +40,7 @@ async def enroll(
     store = request.app.state.store
     retriever = request.app.state.retriever
     tiler = request.app.state.tiler
+    batch_size = request.app.state.settings.enroll_settings.batch_size
 
     meta_obj = _parse_metadata(metadata)
     has_name = _has_name(meta_obj)
@@ -71,7 +72,7 @@ async def enroll(
         if not batch:
             return
 
-        vectors = await retriever.embed_images([t["data"] for t in batch])
+        vectors = await retriever.embed_images([t["data"] for t in batch], bulk=True)
         payloads = [
             {
                 "doc_id": doc_id,
@@ -113,7 +114,7 @@ async def enroll(
 
             elif kind == "tile":
                 batch.append(event)
-                if len(batch) >= retriever.chunk_size:
+                if len(batch) >= batch_size:
                     await flush()
 
             elif kind == "committed":

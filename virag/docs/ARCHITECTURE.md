@@ -107,10 +107,17 @@ tiler, inspect the Qdrant collection) without exposing each service separately.
 Four typed async clients, each built from its settings block and given a
 `check_connection()` used at startup:
 
-- **`RetrieverClient`** — vLLM OpenAI-compatible embeddings. Text goes through the
-  `input` field (batchable); images go through chat-style `messages`/`image_url` with
-  a `data:` URI, one request per image. (These are two different vLLM request shapes;
-  conflating them is a common bug.)
+- **`RetrieverClient`** — the retrieval embedding model behind any OpenAI-compatible
+  `/embeddings` API. Text goes through the standard `input` field, `RETRIEVER_BATCH_SIZE`
+  per request; images go through chat-style `messages`/`image_url` with a `data:` URI (a
+  vLLM extension) — several per request as a batch of conversations when the upstream
+  supports it, otherwise one per request (`RETRIEVER_IMAGE_BATCHING`). All batches of a
+  call fire concurrently; a batch the upstream rejects on content (`400`/`413`/`422`) is
+  retried once as single-item requests, while transient failures retry the batch as-is.
+  *Bulk* calls (enroll, self-heal, revision) are capped by `RETRIEVER_MAX_CONCURRENCY`
+  and may carry a vLLM `priority`; chat queries bypass both, so an ingest never queues a
+  user's query. `check_connection()` also learns the vector size (checked against
+  `QDRANT_VECTOR_SIZE`), resolves image batching and verifies the bulk priority.
 - **`TilerService`** — doc-tiler client: `tile()`, `tile_stream()` (the NDJSON stream
   `/enroll` consumes), `get_tile()`, `get_info()` (for binding), `get_schema()` (metadata
   schema guard), `patch_metadata()` (the enroll pending markers), `search_docs()` /
@@ -131,7 +138,8 @@ Four typed async clients, each built from its settings block and given a
 - Build all four clients from `Settings.from_env()`.
 - `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler and
   VLM. **Every dependency is fatal** — the service is useless without any one of them,
-  so a failed check aborts startup.
+  so a failed check aborts startup. The retriever's vector size must also equal
+  `QDRANT_VECTOR_SIZE`.
 - **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): virag, the tiler,
   and the Qdrant collection must share one secret hash, or startup fails. A fresh
   collection is bound on first run; tiler `render_version` drift is a warning.
@@ -152,7 +160,7 @@ is a bare liveness probe.
 
 `/enroll` (`api/enroll.py`) is internally **streaming**. It calls the tiler's
 `POST /tile/stream` and consumes the NDJSON event stream, accumulating tiles into
-embedding batches of `RETRIEVER_CHUNK_SIZE`, embedding each batch, and upserting its
+batches of `VIRAG_ENROLL_BATCH_SIZE`, embedding each batch, and upserting its
 vectors to Qdrant as it goes — bounded memory, never the whole document at once. The HTTP
 contract is unchanged (see [API.md](API.md)); what changed is that it no longer buffers a
 whole multi-MB manifest and no longer hits a render timeout, so arbitrarily large

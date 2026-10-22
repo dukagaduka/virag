@@ -6,9 +6,12 @@ import asyncio
 
 from virag.api.enroll import point_id
 from virag.reconcile import reconcile, revise
-from virag.settings import ReconcileSettings
+from virag.settings import EnrollSettings, ReconcileSettings
 
 from conftest import FakeRetriever, FakeStore, FakeTiler
+
+
+_ENROLL = EnrollSettings(batch_size=16)
 
 
 def _settings(self_heal=True):
@@ -20,7 +23,7 @@ def test_reconcile_deletes_dangling_points():
     store._doc_ids = {"kept", "dangling"}                       # dangling has no tiler doc
     tiler.docs = [{"doc_id": "kept"}]
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings()))
+    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
 
     assert "dangling" in store.deletes
     assert "kept" not in store.deletes
@@ -34,7 +37,7 @@ def test_reconcile_self_heals_complete_pending():
         "metadata": {"name": "A", "virag_started_at": 1, "virag_enrolled_at": 0},
     }]
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings()))
+    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
 
     assert len(store.upserts) == 1
     up = store.upserts[0]
@@ -55,7 +58,7 @@ def test_revise_reembeds_into_new_collection_then_swaps():
          "render_version": "rv", "source_url": None, "metadata": {"name": "B"}},
     ]
 
-    out = asyncio.run(revise(store, tiler, retriever))
+    out = asyncio.run(revise(store, tiler, retriever, _ENROLL))
 
     assert out["reembedded"] == 1 and out["skipped"] == 1
     assert store.swapped_to == "c__v2"                          # alias flipped to the built collection
@@ -70,7 +73,7 @@ def test_reconcile_leaves_incomplete_for_reenroll():
         "render_version": "rv-test", "source_url": None, "metadata": {"name": "B"},
     }]
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings()))
+    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
 
     assert store.deletes == ["doc-b"]      # partial cleared
     assert store.upserts == []             # not re-embedded (tiler incomplete)

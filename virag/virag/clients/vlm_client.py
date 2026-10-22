@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 
 import httpx2
 
@@ -19,32 +18,13 @@ _PROBE_IMAGE = (
 
 
 class VLMClient(OpenAIService):
-    def __init__(
-        self,
-        base_url: str,
-        model_name: str,
-        api_key: str,
-        *,
-        max_concurrency: int = 0,
-        **http_options,
-    ):
-
-        super().__init__(base_url, model_name, api_key, **http_options)
-
-        # 0 (or less) = unlimited; otherwise cap concurrent upstream calls so a fragile
-        # or remote VLM isn't buried under simultaneous multimodal requests.
-        self._semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency > 0 else None
-
+    """Upstream vision chat model. `max_concurrency` (via `_guard`) shields a fragile
+    or remote VLM from simultaneous multimodal requests; a slot is held for the whole
+    call, including the entire streaming lifetime."""
 
     @property
     def route(self) -> str:
         return f"{self.base_url}/chat/completions"
-
-
-    def _guard(self):
-        """Limit concurrent upstream calls when a ceiling is configured; a no-op
-        otherwise. Held for the whole call, including the entire streaming lifetime."""
-        return self._semaphore if self._semaphore is not None else nullcontext()
 
 
     @classmethod

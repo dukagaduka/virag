@@ -25,6 +25,7 @@ from virag.clients.tiler_client import Tile, TileResult
 from virag.errors import install_error_handlers
 from virag.settings import (
     RetrieverSettings,
+    EnrollSettings,
     HttpSettings,
     QdrantStoreSettings,
     RagSettings,
@@ -58,15 +59,14 @@ class FakeRetriever:
 
     def __init__(self, dim: int = 4):
         self.dim = dim
-        self.chunk_size = 16
         self.text_calls: list[list[str]] = []
         self.image_calls: list[list[str]] = []
 
-    async def embed_texts(self, texts):
+    async def embed_texts(self, texts, *, bulk=False):
         self.text_calls.append(list(texts))
         return [[float(i)] * self.dim for i, _ in enumerate(texts)]
 
-    async def embed_images(self, images):
+    async def embed_images(self, images, *, bulk=False):
         self.image_calls.append(list(images))
         return [[0.5] * self.dim for _ in images]
 
@@ -238,7 +238,8 @@ def make_settings(**overrides) -> Settings:
             chunk_byte_budget=24 * 1024 * 1024, max_batch_chunks=1024,
         ),
         retriever_settings=RetrieverSettings(
-            base_url="http://retriever/v1", model_name="retriever", api_key="k-retriever", chunk_size=16, timeout=60,
+            base_url="http://retriever/v1", model_name="retriever", api_key="k-retriever", batch_size=16,
+            max_concurrency=0, bulk_priority=0, image_batching="auto", timeout=60,
             connect_timeout=10, max_connections=100, max_retries=0,
         ),
         tiler_settings=TilerSettings(
@@ -248,6 +249,7 @@ def make_settings(**overrides) -> Settings:
             base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout=120,
             connect_timeout=10, max_connections=100, max_concurrency=0, max_retries=0,
         ),
+        enroll_settings=overrides.pop("enroll_settings", EnrollSettings(batch_size=16)),
         reconcile_settings=ReconcileSettings(self_heal=True, interval_sec=0, pending_ttl_sec=3600),
     )
 

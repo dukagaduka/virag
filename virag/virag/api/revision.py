@@ -21,6 +21,7 @@ async def revision(request: Request):
     store = request.app.state.store
     retriever = request.app.state.retriever
     tiler = request.app.state.tiler
+    enroll_settings = request.app.state.settings.enroll_settings
 
     log.info("revision requested")
-    return await revise(store, tiler, retriever)
+    return await revise(store, tiler, retriever, enroll_settings)

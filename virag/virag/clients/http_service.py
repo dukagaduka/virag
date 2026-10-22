@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import random
 from abc import ABC, abstractmethod
-from contextlib import asynccontextmanager
-from typing import Any, Callable
+from collections.abc import Collection, Coroutine, Iterable
+from contextlib import asynccontextmanager, nullcontext
+from typing import Any, Callable, TypeVar
 
 import httpx2
 
@@ -33,6 +34,8 @@ RETRY_ERRORS = (
     httpx2.WriteError,
 )
 
+T = TypeVar("T")
+
 
 class HttpService(ABC):
     """An upstream reached over one pooled, keep-alive HTTP client."""
@@ -47,6 +50,7 @@ class HttpService(ABC):
         max_retries: int,
         backoff_base: float,
         backoff_cap: float,
+        max_concurrency: int = 0,
         headers: dict | None = None,
     ):
 
@@ -54,6 +58,10 @@ class HttpService(ABC):
         self.max_retries  = max_retries
         self.backoff_base = backoff_base
         self.backoff_cap  = backoff_cap
+
+        # 0 = unlimited; otherwise cap concurrent upstream calls made under `_guard`
+        # so this process cannot bury the upstream under its own load.
+        self._semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency > 0 else None
 
         # `timeout` bounds read/write/pool waits (a read deadline is the max silence
         # between bytes, not the whole request); connecting is held to its own,
@@ -75,6 +83,12 @@ class HttpService(ABC):
 
     async def close(self) -> None:
         await self.http.aclose()
+
+
+    def _guard(self):
+        """Hold one concurrency slot when a ceiling is configured; a no-op otherwise.
+        The slot is shared by every caller of this client, retries included."""
+        return self._semaphore if self._semaphore is not None else nullcontext()
 
 
     async def send(
@@ -130,10 +144,12 @@ class HttpService(ABC):
         *,
         action: str,
         retry: bool = True,
+        passthrough_statuses: Collection[int] = (),
         **kwargs,
     ) -> httpx2.Response:
         """`send` that requires a 2xx: an unreachable upstream or an error status
-        becomes an ApiError(503) naming the `action`."""
+        becomes an ApiError(503) naming the `action`. Statuses listed in
+        `passthrough_statuses` are returned instead, for the caller to handle."""
         try:
             response = await self.send(method, url, retry=retry, **kwargs)
 
@@ -144,7 +160,7 @@ class HttpService(ABC):
                 details={"error": repr(e)},
             ) from e
 
-        if not response.is_success:
+        if not response.is_success and response.status_code not in passthrough_statuses:
             raise ApiError(
                 status_code=503,
                 message=f"Upstream {url} failed during {action}",
@@ -213,6 +229,24 @@ class HttpService(ABC):
                 message=f"Cannot decode {response.url} response or unexpected response structure during {action}",
                 details={"base_message": str(e)},
             ) from e
+
+
+    @staticmethod
+    async def _gather(coros: Iterable[Coroutine[Any, Any, T]]) -> list[T]:
+        """Run coroutines concurrently and return their results in input order.
+
+        Unlike asyncio.gather, the first failure cancels the rest — no orphaned
+        requests keep loading the upstream — and is re-raised as-is rather than
+        wrapped in an ExceptionGroup, so callers still see a plain ApiError.
+        """
+        try:
+            async with asyncio.TaskGroup() as group:
+                tasks = [group.create_task(coro) for coro in coros]
+
+        except BaseExceptionGroup as eg:
+            raise eg.exceptions[0]
+
+        return [task.result() for task in tasks]
 
 
     def _backoff(self, attempt: int) -> float:

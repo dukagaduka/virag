@@ -170,6 +170,30 @@ def test_json_maps_bad_structure_to_422():
     assert exc.value.status_code == 422
 
 
+def test_gather_keeps_order():
+    async def value(v, delay):
+        await asyncio.sleep(delay)
+        return v
+
+    assert _run(HttpService._gather([value(1, 0.02), value(2, 0), value(3, 0.01)])) == [1, 2, 3]
+
+
+def test_gather_cancels_siblings_and_raises_plain_error():
+    finished = []
+
+    async def slow():
+        await asyncio.sleep(1)
+        finished.append("slow")
+
+    async def boom():
+        raise ApiError(status_code=503, message="boom")
+
+    with pytest.raises(ApiError, match="boom"):
+        _run(HttpService._gather([slow(), boom()]))
+
+    assert finished == []
+
+
 # ---------------------------------------------------------------------------
 # concrete clients
 # ---------------------------------------------------------------------------
