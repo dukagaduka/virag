@@ -12,6 +12,7 @@ from virag.clients.http_service import HttpService
 from virag.clients.tiler_client import TilerService
 from virag.clients.vlm_client import VLMClient
 from virag.errors import ApiError
+from virag.utils import gather
 
 
 _HTTP = dict(timeout=5, connect_timeout=5, max_connections=4, backoff_base=0, backoff_cap=0)
@@ -175,7 +176,7 @@ def test_gather_keeps_order():
         await asyncio.sleep(delay)
         return v
 
-    assert _run(HttpService._gather([value(1, 0.02), value(2, 0), value(3, 0.01)])) == [1, 2, 3]
+    assert _run(gather([value(1, 0.02), value(2, 0), value(3, 0.01)])) == [1, 2, 3]
 
 
 def test_gather_cancels_siblings_and_raises_plain_error():
@@ -189,7 +190,7 @@ def test_gather_cancels_siblings_and_raises_plain_error():
         raise ApiError(status_code=503, message="boom")
 
     with pytest.raises(ApiError, match="boom"):
-        _run(HttpService._gather([slow(), boom()]))
+        _run(gather([slow(), boom()]))
 
     assert finished == []
 
@@ -263,3 +264,25 @@ def test_tiler_stream_yields_events():
         return [event async for event in tiler.tile_stream("PDF", document=b"x")]
 
     assert _run(consume()) == [{"event": "begin"}, {"event": "committed"}]
+
+
+def test_tiler_bulk_get_tile_is_capped_interactive_is_not():
+    tiler = TilerService("http://tiler", max_retries=0, max_concurrency=2, **_HTTP)
+    in_flight = {"now": 0, "peak": 0}
+
+    async def handler(req, n):
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        await asyncio.sleep(0.01)
+        in_flight["now"] -= 1
+
+        return httpx2.Response(200, content=b"jpeg")
+
+    _mock(tiler, handler)
+
+    _run(gather(tiler.get_tile("d", n, bulk=True) for n in range(6)))
+    assert in_flight["peak"] == 2
+
+    in_flight["peak"] = 0
+    _run(gather(tiler.get_tile("d", n) for n in range(6)))
+    assert in_flight["peak"] > 2

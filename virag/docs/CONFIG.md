@@ -48,7 +48,7 @@ interval — repairing partial/orphaned enrolls and propagating tiler deletes. S
 |---|---|---|---|
 | `VIRAG_SELF_HEAL` | no | `true` | On reconcile, re-embed a stale-pending doc from the tiler when the tiler doc is complete (else just drop its partial points and leave it for re-enroll). |
 | `VIRAG_RECONCILE_INTERVAL_SEC` | no | `300` | Seconds between periodic reconcile passes (≥ 0). `0` disables the loop — the one-shot startup pass still runs. |
-| `VIRAG_PENDING_TTL_SEC` | no | `3600` | A pending enroll older than this is treated as crashed/partial (≥ 1). Must exceed the longest enroll, or an in-flight enroll could be swept. |
+| `VIRAG_PENDING_TTL_SEC` | no | `3600` | A pending enroll older than this is treated as crashed/partial (≥ 1). Must exceed the longest enroll, or an in-flight enroll could be swept. Also the longest a revision/rollback waits after its swap for enrolls still writing into the old collection. |
 
 ## Qdrant
 
@@ -103,6 +103,7 @@ passthrough proxies.
 | `TILER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `TILER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the tiler (≥ 1). |
 | `TILER_MAX_RETRIES` | no | `3` | Retries for a transient failure on idempotent calls (≥ 0); an ingest is never replayed. |
+| `TILER_MAX_CONCURRENCY` | no | `32` | Max concurrent **bulk** tile regenerations — self-heal, revision, rollback sync (≥ 0; `0` = unlimited; must be ≤ `TILER_MAX_CONNECTIONS`). Chat RAG tile fetches bypass it. Size it to the tiler's parallel render capacity; it also sizes how many re-embed batches are kept in flight. |
 
 ## Upstream VLM (OpenAI-compatible; external)
 

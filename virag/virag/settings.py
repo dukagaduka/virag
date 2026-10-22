@@ -61,6 +61,7 @@ class RetrieverSettings:
 @dataclass(slots=True, frozen=True)
 class TilerSettings:
     base_url: str
+    max_concurrency: int
     timeout: int
     connect_timeout: int
     max_connections: int
@@ -314,6 +315,19 @@ class Settings:
             low=0
         )
 
+        # Caps bulk tile regeneration (self-heal, revision) only; chat RAG bypasses it.
+        tiler_max_concurrency = int_coercion(
+            os.environ.get("TILER_MAX_CONCURRENCY", "32"),
+            "TILER_MAX_CONCURRENCY",
+            low=0
+        )
+
+        concurrency_within_pool(
+            tiler_max_concurrency,
+            tiler_max_connections,
+            "TILER",
+        )
+
         # -----------------------------
         # VLM (upstream, OpenAI-compatible)
         # -----------------------------
@@ -432,6 +446,7 @@ class Settings:
             ),
             tiler_settings=TilerSettings(
                 base_url=tiler_base_url,
+                max_concurrency=tiler_max_concurrency,
                 timeout=tiler_timeout,
                 connect_timeout=tiler_connect_timeout,
                 max_connections=tiler_max_connections,

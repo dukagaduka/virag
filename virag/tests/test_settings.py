@@ -26,7 +26,7 @@ _ALL_KEYS = {
     "VLM_BASE_URL", "VLM_MODEL_NAME", "VLM_API_KEY", "VLM_TIMEOUT_SEC",
     "VLM_CONNECT_TIMEOUT_SEC", "VLM_MAX_CONNECTIONS", "VLM_MAX_CONCURRENCY", "VLM_MAX_RETRIES",
     "RETRIEVER_CONNECT_TIMEOUT_SEC", "RETRIEVER_MAX_CONNECTIONS", "RETRIEVER_MAX_RETRIES",
-    "TILER_CONNECT_TIMEOUT_SEC", "TILER_MAX_CONNECTIONS", "TILER_MAX_RETRIES",
+    "TILER_CONNECT_TIMEOUT_SEC", "TILER_MAX_CONNECTIONS", "TILER_MAX_RETRIES", "TILER_MAX_CONCURRENCY",
     "HTTP_RETRY_BACKOFF_BASE_SEC", "HTTP_RETRY_BACKOFF_CAP_SEC",
 }
 
@@ -179,4 +179,13 @@ def test_retriever_concurrency_cannot_exceed_pool(monkeypatch):
     monkeypatch.setenv("RETRIEVER_MAX_CONCURRENCY", "16")
 
     with pytest.raises(SettingsError, match="RETRIEVER_MAX_CONCURRENCY"):
+        Settings.from_env()
+
+
+def test_tiler_concurrency_default_and_pool_bound(monkeypatch):
+    _base_env(monkeypatch)
+    assert Settings.from_env().tiler_settings.max_concurrency == 32
+
+    monkeypatch.setenv("TILER_MAX_CONNECTIONS", "8")
+    with pytest.raises(SettingsError, match="TILER_MAX_CONCURRENCY"):
         Settings.from_env()

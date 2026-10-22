@@ -204,11 +204,29 @@ passes:
    doc is complete — re-embed the doc from the tiler to restore it. An incomplete tiler
    doc is left for a tiler `/revision`.
 
-**Revision** (`POST /revision` → `revise()`) is a full re-embed with a blue-green swap.
-It builds a new physical collection `__vN+1`, re-embeds every complete tiler doc into it,
-then atomically repoints the serving alias to the new collection and drops the old one.
-The live collection serves throughout — no downtime, no empty window. Use it after an
-embedding-model change (or the tiler's `/revision` re-render).
+**Re-embed stream.** Self-heal, revision and rollback sync share one re-embed
+(`reembed_docs`): every `(doc_id, tile_num)` of the docs is cut into batches of
+`VIRAG_ENROLL_BATCH_SIZE` *across document boundaries*, each batch fetches its tiles
+concurrently (bulk, capped by `TILER_MAX_CONCURRENCY`), embeds them in one bulk retriever
+call and upserts once; a window of batches derived from the tiler cap stays in flight. A
+failed batch fails the docs it touched; they are retried once in per-document batches.
+
+**Revision** (`virag/revision.py`, `POST /revision`) is a background full re-embed with a
+blue-green swap: drop any leftover `__vN+1` and create it; start the store's writer
+journal; re-embed every complete tiler doc into it; abort without a swap (dropping the
+build) if docs still fail; enforce `Qdrant ⊆ Tiler` on it; swap the alias, keeping the
+replaced collection (stamped `retired_at`) as the rollback target; stop the journal; wait
+up to `VIRAG_PENDING_TTL_SEC` for writers of the old collection to finish; sync the
+journaled docs into the new collection (drop, then re-embed if the tiler holds them
+complete and enrolled); enforce the invariant again. New writes are never mirrored into
+the build — the journal of writers (enroll, self-heal; including those already in flight
+at the start) plus the post-swap sync closes the gap. Use it after a retriever-model
+change (or the tiler's `/revision` re-render). The lock, journal and status are
+in-process: correct for a single virag replica.
+
+**Rollback** (`POST /revision/rollback`) repoints the alias to the retained collection,
+drops the abandoned one and syncs the docs enrolled since `retired_at`, under the same
+journal + drain.
 
 ## 10. Module layout
 
@@ -217,13 +235,14 @@ virag/
   main.py            # app, lifespan (clients, dependency checks, binding, reconcile), router order
   settings.py        # Settings.from_env() — every env var and its validation
   binding.py         # the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
-  reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and /revision re-embed
+  reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and the shared re-embed stream
+  revision.py        # RevisionManager: background revision / rollback job, journal sync
   errors.py          # ApiError + the uniform {"error": {...}} envelope
-  utils.py           # non-domain helpers (error_body)
+  utils.py           # non-domain helpers (error_body, gather)
   api/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
     enroll.py            # /enroll: streaming tile → embed → upsert
-    revision.py          # /revision: full re-embed + blue-green alias swap
+    revision.py          # /revision (start, status) and /revision/rollback
     proxy.py             # reverse proxy for /tiler, /retriever, /qdrant, /v1/*
     ops.py               # /health, /ready
   clients/

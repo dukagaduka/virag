@@ -8,7 +8,7 @@ import httpx2
 from virag.clients.http_service import OpenAIService
 from virag.errors import ApiError
 from virag.settings import HttpSettings, RetrieverSettings
-from virag.utils import error_body
+from virag.utils import error_body, gather
 
 
 log = logging.getLogger(__name__)
@@ -218,7 +218,7 @@ class RetrieverClient(OpenAIService):
         """Fire every batch concurrently (bulk ones gated by `_guard`); output order
         matches input order."""
         batches = [units[i:i + batch_size] for i in range(0, len(units), batch_size)]
-        results = await self._gather(self._embed_batch(batch, bulk=bulk) for batch in batches)
+        results = await gather(self._embed_batch(batch, bulk=bulk) for batch in batches)
 
         return [vector for vectors in results for vector in vectors]
 

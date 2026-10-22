@@ -14,6 +14,7 @@ from virag.clients.tiler_client import TilerService
 from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding, enforce_metadata_schema, secret_hash
 from virag.reconcile import reconcile, run_periodic
+from virag.revision import RevisionManager
 from virag.api import enroll as enroll_api
 from virag.api import chat_completions as chat_completions_api
 from virag.api import proxy as proxy_api
@@ -122,6 +123,16 @@ async def lifespan(app: FastAPI):
         app.state.tiler = tiler
         app.state.vlm = vlm
         app.state.qdrant_http = qdrant_http
+
+        revision = RevisionManager(
+            store,
+            tiler,
+            retriever,
+            settings.enroll_settings,
+            settings.reconcile_settings,
+        )
+        stack.push_async_callback(revision.close)
+        app.state.revision = revision
 
         log.info(
             "ready: qdrant=%s vector_size=%d collection=%s distance=%s retriever=%s tiler=%s vlm=%s model=%s render_version=%s",

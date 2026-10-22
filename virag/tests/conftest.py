@@ -79,6 +79,14 @@ class FakeStore:
         self.metadata: dict | None = None
         self._doc_ids: set[str] = set()
         self.deletes: list[str] = []
+        self.delete_collections: list[str | None] = []
+        self.physical_name = "c__v1"
+        self.previous_name: str | None = None
+        self.dropped: list[str] = []
+        self.writers: list[str] = []
+        self._journal: set[str] | None = None
+        self.journal_seen: set[str] | None = None
+        self.rollback_retired_at = 0
 
     async def query(self, vector, top_n):
         return self._hits[:top_n]
@@ -93,8 +101,34 @@ class FakeStore:
         self.revision_collection = "c__v2"
         return self.revision_collection
 
+    async def drop_collection(self, name: str) -> None:
+        self.dropped.append(name)
+
     async def swap_alias(self, new_physical: str) -> None:
         self.swapped_to = new_physical
+        self.previous_name, self.physical_name = self.physical_name, new_physical
+
+    async def rollback(self):
+        restored, abandoned = self.previous_name, self.physical_name
+        self.physical_name, self.previous_name = restored, None
+        return restored, abandoned, self.rollback_retired_at
+
+    @asynccontextmanager
+    async def writer(self, doc_id: str):
+        self.writers.append(doc_id)
+        if self._journal is not None:
+            self._journal.add(doc_id)
+        yield
+
+    def start_journal(self) -> None:
+        self._journal = set(self.journal_seen or ())
+
+    def stop_journal(self) -> set[str]:
+        journal, self._journal = self._journal or set(), None
+        return journal
+
+    async def drain(self, physical: str, timeout: float) -> bool:
+        return True
 
     async def get_collection_metadata(self) -> dict:
         return self.metadata or {}
@@ -102,11 +136,16 @@ class FakeStore:
     async def set_collection_metadata(self, metadata: dict) -> None:
         self.metadata = dict(metadata)
 
-    async def delete_by_doc(self, doc_id: str, *, wait: bool = True) -> None:
+    async def delete_by_doc(self, doc_id: str, *, wait: bool = True, collection=None) -> None:
         self.deletes.append(doc_id)
+        self.delete_collections.append(collection)
         self._doc_ids.discard(doc_id)
 
-    async def iter_doc_ids(self) -> set[str]:
+    async def delete_by_docs(self, doc_ids, *, collection=None) -> None:
+        for doc_id in doc_ids:
+            await self.delete_by_doc(doc_id, collection=collection)
+
+    async def iter_doc_ids(self, *, collection=None) -> set[str]:
         return set(self._doc_ids)
 
     async def close(self):
@@ -131,6 +170,8 @@ class FakeTiler:
         }
         self.docs: list[dict] = []
         self.pending_docs: list[dict] = []
+        self.max_concurrency = 0
+        self.fail_tiles: set[tuple] = set()
 
     async def tile(self, doc_type, *, document=None, url=None, metadata=None,
                    store=True, include_bytes=True, force=False):
@@ -147,8 +188,10 @@ class FakeTiler:
                "source_url": res.source_url, "render_version": res.render_version,
                "page_height": 0, "tile_count": res.tile_count}
 
-    async def get_tile(self, doc_id, tile_num) -> bytes:
+    async def get_tile(self, doc_id, tile_num, *, bulk=False) -> bytes:
         self.get_tile_calls.append((doc_id, tile_num))
+        if (doc_id, tile_num) in self.fail_tiles:
+            raise RuntimeError(f"tile {doc_id}:{tile_num} unavailable")
         return tile_bytes(doc_id, tile_num)
 
     async def get_info(self) -> dict:
@@ -243,7 +286,7 @@ def make_settings(**overrides) -> Settings:
             connect_timeout=10, max_connections=100, max_retries=0,
         ),
         tiler_settings=TilerSettings(
-            base_url="http://tiler", timeout=120, connect_timeout=10, max_connections=100, max_retries=0,
+            base_url="http://tiler", max_concurrency=0, timeout=120, connect_timeout=10, max_connections=100, max_retries=0,
         ),
         vlm_settings=VLMSettings(
             base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout=120,

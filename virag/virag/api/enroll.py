@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import AsyncExitStack
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 
@@ -91,60 +92,65 @@ async def enroll(
         enrolled += len(batch)
         batch.clear()
 
-    try:
-        async for event in tiler.tile_stream(
-            doc_type, document=doc_bytes, url=url, metadata=meta_obj, force=force
-        ):
-            kind = event.get("event")
+    async with AsyncExitStack() as writing:
+        try:
+            async for event in tiler.tile_stream(
+                doc_type, document=doc_bytes, url=url, metadata=meta_obj, force=force
+            ):
+                kind = event.get("event")
 
-            if kind == "begin":
-                doc_id = event["doc_id"]
-                doc_type_out = event["doc_type"]
-                source_url = event.get("source_url")
-                render_version = event["render_version"]
-                payload_meta = meta_obj if has_name else {**(meta_obj or {}), "name": doc_id}
-                if not has_name:
-                    log.warning("no metadata.name; naming doc_id=%s by its content hash", doc_id)
+                if kind == "begin":
+                    doc_id = event["doc_id"]
+                    doc_type_out = event["doc_type"]
+                    source_url = event.get("source_url")
+                    render_version = event["render_version"]
+                    payload_meta = meta_obj if has_name else {**(meta_obj or {}), "name": doc_id}
+                    if not has_name:
+                        log.warning("no metadata.name; naming doc_id=%s by its content hash", doc_id)
 
-                # Mark pending (virag semantics on the tiler's indexed metadata) and clear
-                # any prior partial/stale points. A crash from here leaves a clean, detectable
-                # state that reconcile finishes or rolls back.
-                await tiler.patch_metadata(doc_id, {"virag_started_at": int(time.time()), "virag_enrolled_at": 0})
-                await store.delete_by_doc(doc_id)
+                    # Registered as a writer until commit/rollback, so a concurrent revision
+                    # journals this doc and syncs it into the collection it builds.
+                    await writing.enter_async_context(store.writer(doc_id))
 
-            elif kind == "tile":
-                batch.append(event)
-                if len(batch) >= batch_size:
+                    # Mark pending (virag semantics on the tiler's indexed metadata) and clear
+                    # any prior partial/stale points. A crash from here leaves a clean, detectable
+                    # state that reconcile finishes or rolls back.
+                    await tiler.patch_metadata(doc_id, {"virag_started_at": int(time.time()), "virag_enrolled_at": 0})
+                    await store.delete_by_doc(doc_id)
+
+                elif kind == "tile":
+                    batch.append(event)
+                    if len(batch) >= batch_size:
+                        await flush()
+
+                elif kind == "committed":
                     await flush()
+                    # Promote: the enroll is durable end-to-end — clear pending.
+                    await tiler.patch_metadata(doc_id, {"virag_enrolled_at": int(time.time())})
+                    log.info("enrolled: doc_id=%s points=%d", doc_id, enrolled)
 
-            elif kind == "committed":
-                await flush()
-                # Promote: the enroll is durable end-to-end — clear pending.
-                await tiler.patch_metadata(doc_id, {"virag_enrolled_at": int(time.time())})
-                log.info("enrolled: doc_id=%s points=%d", doc_id, enrolled)
+                    return _summary(
+                        doc_id, doc_type_out, render_version, event.get("tile_count", enrolled), enrolled
+                    )
 
-                return _summary(
-                    doc_id, doc_type_out, render_version, event.get("tile_count", enrolled), enrolled
-                )
+                elif kind == "error":
+                    raise ApiError(
+                        status_code=502,
+                        message=f"tiler stream error: {event.get('message')}",
+                        details={"tiler_code": event.get("code")},
+                    )
 
-            elif kind == "error":
-                raise ApiError(
-                    status_code=502,
-                    message=f"tiler stream error: {event.get('message')}",
-                    details={"tiler_code": event.get("code")},
-                )
+            raise ApiError(status_code=502, message="tiler stream ended without a committed event")
 
-        raise ApiError(status_code=502, message="tiler stream ended without a committed event")
-
-    except Exception:
-        # Roll the doc back out of Qdrant. It stays in the tiler (Tiler ⊇ Qdrant) and
-        # pending, so reconcile heals or sweeps it later.
-        if doc_id is not None:
-            try:
-                await store.delete_by_doc(doc_id)
-            except Exception as cleanup_err:  # noqa: BLE001 - never mask the original failure
-                log.error("rollback delete_by_doc failed for doc_id=%s: %r", doc_id, cleanup_err)
-        raise
+        except Exception:
+            # Roll the doc back out of Qdrant. It stays in the tiler (Tiler ⊇ Qdrant) and
+            # pending, so reconcile heals or sweeps it later.
+            if doc_id is not None:
+                try:
+                    await store.delete_by_doc(doc_id)
+                except Exception as cleanup_err:  # noqa: BLE001 - never mask the original failure
+                    log.error("rollback delete_by_doc failed for doc_id=%s: %r", doc_id, cleanup_err)
+            raise
 
 
 def _has_name(meta_obj: dict | None) -> bool:

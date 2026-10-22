@@ -135,24 +135,52 @@ curl -s -X POST localhost:8080/enroll \
 ## `POST /revision`
 
 Re-embed the **whole corpus** into a fresh vector collection and swap it in with no
-downtime. Use it after an embedding-model change (or after the tiler's own `/revision`
-re-render) so the vectors are rebuilt against the new model.
+downtime. Use it after a retriever-model change (or after the tiler's own `/revision`
+re-render) so the vectors are rebuilt against the new model. It is not periodic
+maintenance — with nothing changed it would recompute the same vectors.
 
 virag serves through a stable Qdrant **alias**; `/revision` builds a new physical
-collection alongside the live one, re-embeds every *complete* tiler doc into it (fetching
-tiles from the tiler), then **atomically** repoints the alias to the new collection and
-drops the old one. The live collection keeps serving the entire time — no empty window.
+collection alongside the live one, re-embeds every *complete* tiler doc into it, then
+**atomically** repoints the alias. The live collection keeps serving the entire time.
+Enrolls that happen meanwhile are journaled and synced into the new collection right
+after the swap. If any document still fails after a retry, the alias is **not** swapped
+and the old collection keeps serving. The replaced collection is kept for
+[`/revision/rollback`](#post-revisionrollback) until the next revision.
 
-This is long-running (it re-embeds the entire corpus). Incomplete tiler docs are skipped
-(they aren't servable; leave them for a tiler `/revision`). Response:
-
-```json
-{"reembedded": 128, "skipped": 2, "collection": "store-collection__v2"}
-```
+It runs in the **background**: the call returns `202` with the job status at once; a
+second call while a job runs is `409 CONFLICT`. Incomplete tiler docs are skipped (they
+aren't servable; leave them for a tiler `/revision`).
 
 ```bash
 curl -s -X POST localhost:8080/revision | jq
 ```
+
+## `GET /revision`
+
+Status of the current or last revision / rollback job (in-process; reset on restart):
+
+```json
+{
+  "kind": "revision",
+  "state": "succeeded",
+  "started_at": 1761130000,
+  "finished_at": 1761130950,
+  "collection": "store-collection__v2",
+  "total": 130, "skipped": 2, "reembedded": 128, "synced": 3
+}
+```
+
+`state` is `running`, `succeeded`, `degraded` (swapped, but some journaled docs failed to
+sync — listed in `sync_failed_doc_ids`; re-enroll them), or `failed` (`error`, and
+`failed_doc_ids` when the alias was not swapped).
+
+## `POST /revision/rollback`
+
+Repoint the alias back to the collection the last revision replaced, drop the abandoned
+one, and re-sync the documents enrolled since the swap. Background, like `/revision`
+(`202`; `409` while a job runs or when there is no previous collection). Revert the
+retriever configuration first — the old collection holds the old model's vectors (a
+vector-size mismatch is refused).
 
 ---
 

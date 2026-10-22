@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
 import json
+import logging
 import re
+import time
 import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
@@ -18,18 +22,25 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    MatchAny,
     MatchValue,
     PayloadSchemaType,
     PointStruct,
     VectorParams
 )
 
+from virag.errors import ApiError
 from virag.settings import QdrantStoreSettings
 
+
+log = logging.getLogger(__name__)
 
 # Empirical cost of one JSON-serialized float (repr + separator); see enroll
 # 400s where 920x2048 vectors produced a ~40 MB body (~21.5 B/float measured).
 BYTES_PER_FLOAT_JSON = 24
+
+# doc_ids per filtered delete request — one MatchAny filter instead of N requests.
+DELETE_DOCS_CHUNK = 256
 
 
 @dataclass(slots=True)
@@ -41,7 +52,13 @@ class QueryResult:
 
 class QdrantStore:
     """Points are addressed through a stable serving alias; the physical collection it
-    points to is versioned so a /revision can blue-green swap it atomically.
+    points to is versioned so a /revision can blue-green swap it atomically. The
+    collection it replaced is retained as `previous_name` for a rollback until the
+    next revision.
+
+    Writers of document points (enroll, self-heal) register through `writer()`, so a
+    revision can journal which documents changed while it was building and wait for
+    writers of the old collection to finish before syncing them into the new one.
     """
 
     def __init__(
@@ -62,6 +79,7 @@ class QdrantStore:
         # ops (create/index/metadata) use the physical name.
         self.serving_name = collection_name
         self.physical_name = collection_name
+        self.previous_name: str | None = None
 
         # Internal collection params
         self.vector_size = vector_size
@@ -74,6 +92,12 @@ class QdrantStore:
         self.qdrant = AsyncQdrantClient(
             url=self.base_url
         )
+
+        # In-flight document writers: token -> (doc_id, physical collection at start).
+        self._writers: dict[object, tuple[str, str]] = {}
+        self._writers_changed = asyncio.Condition()
+        # doc_ids written while a revision builds; None when no revision is journaling.
+        self._journal: set[str] | None = None
 
 
     @classmethod
@@ -191,6 +215,8 @@ class QdrantStore:
         self.physical_name = await self._resolve_or_create()
         await self._validate(self.physical_name)
         await self._ensure_indexes(self.physical_name)
+
+        self.previous_name = await self._find_previous()
 
 
     async def _resolve_or_create(self) -> str:
@@ -313,17 +339,45 @@ class QdrantStore:
     # ------------------------------------------------------------------ #
     # revision (blue-green re-embed target)
     # ------------------------------------------------------------------ #
+    def _version(self, name: str | None) -> int | None:
+        """The `N` of a `<serving>__vN` physical name, or None for any other name."""
+        match = re.match(rf"^{re.escape(self.serving_name)}__v(\d+)$", name or "")
+
+        return int(match.group(1)) if match else None
+
+
     def _next_physical(self) -> str:
         """The next versioned physical name, e.g. `<serving>__v2` after `__v1`."""
-        match = re.match(rf"^{re.escape(self.serving_name)}__v(\d+)$", self.physical_name or "")
-        version = int(match.group(1)) if match else 1
+        version = self._version(self.physical_name) or 1
 
         return f"{self.serving_name}__v{version + 1}"
 
 
+    async def _find_previous(self) -> str | None:
+        """The newest retained version older than the serving one — the rollback target."""
+        current = self._version(self.physical_name)
+        if current is None:
+            return None
+
+        collections = (await self.qdrant.get_collections()).collections
+        older = [
+            (version, c.name)
+            for c in collections
+            if (version := self._version(c.name)) is not None and version < current
+        ]
+
+        return max(older)[1] if older else None
+
+
     async def create_revision_collection(self) -> str:
-        """Create the next physical collection (indexed, binding metadata carried) to re-embed into."""
+        """Create the next physical collection (indexed, binding metadata carried) to
+        re-embed into. A leftover of an aborted or crashed revision is dropped first, so
+        a build never resumes on top of stale points."""
         new_name = self._next_physical()
+
+        if await self.qdrant.collection_exists(new_name):
+            log.warning("revision: dropping leftover collection %s from an earlier attempt", new_name)
+            await self.qdrant.delete_collection(collection_name=new_name)
 
         await self._create_physical(new_name)
         await self._ensure_indexes(new_name)
@@ -335,23 +389,129 @@ class QdrantStore:
         return new_name
 
 
-    async def swap_alias(self, new_physical: str) -> None:
-        """Atomically repoint the serving alias to `new_physical` and drop the old collection."""
-        old_physical = self.physical_name
+    async def drop_collection(self, name: str) -> None:
+        """Drop a non-serving physical collection (an aborted revision build)."""
+        if name in (self.physical_name, self.previous_name):
+            raise ValueError(f"refusing to drop live collection {name}")
 
+        await self.qdrant.delete_collection(collection_name=name)
+
+
+    async def swap_alias(self, new_physical: str) -> None:
+        """Atomically repoint the serving alias to `new_physical`. The replaced collection
+        becomes `previous_name` (the rollback target), stamped with `retired_at` so a
+        rollback knows which enrolls it missed; the one it supersedes is dropped."""
+        old_physical = self.physical_name
+        stale_previous = self.previous_name
+
+        meta = await self._collection_metadata(old_physical)
+        await self.qdrant.update_collection(
+            collection_name=old_physical,
+            metadata={**meta, "retired_at": int(time.time())},
+        )
+
+        await self._repoint_alias(new_physical)
+
+        self.physical_name = new_physical
+        self.previous_name = old_physical if old_physical != new_physical else None
+
+        if stale_previous and stale_previous not in (new_physical, old_physical):
+            await self.qdrant.delete_collection(collection_name=stale_previous)
+
+
+    async def rollback(self) -> tuple[str, str, int]:
+        """Point the serving alias back at `previous_name` and drop the abandoned
+        collection. Returns (restored, abandoned, retired_at): documents enrolled since
+        `retired_at` live only in the abandoned one and must be re-synced."""
+        if self.previous_name is None:
+            raise ApiError(status_code=409, message="No previous collection to roll back to")
+
+        info = (await self.qdrant.get_collection(self.previous_name)).config.params.vectors
+        if info.size != self.vector_size:  # type: ignore
+            raise ApiError(
+                status_code=409,
+                message=f"Previous collection {self.previous_name} holds {info.size}-d vectors "  # type: ignore
+                        f"but QDRANT_VECTOR_SIZE is {self.vector_size}; revert the retriever config first",
+            )
+
+        restored, abandoned = self.previous_name, self.physical_name
+
+        meta = await self._collection_metadata(restored)
+        retired_at = int(meta.get("retired_at") or 0)
+
+        # Explicit null: Qdrant merges metadata updates, so an omitted key would survive.
+        await self.qdrant.update_collection(collection_name=restored, metadata={**meta, "retired_at": None})
+        await self._repoint_alias(restored)
+
+        self.physical_name = restored
+        self.previous_name = None
+
+        await self.qdrant.delete_collection(collection_name=abandoned)
+
+        return restored, abandoned, retired_at
+
+
+    async def _repoint_alias(self, physical: str) -> None:
         await self.qdrant.update_collection_aliases(
             change_aliases_operations=[
                 DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=self.serving_name)),
                 CreateAliasOperation(
-                    create_alias=CreateAlias(collection_name=new_physical, alias_name=self.serving_name)
+                    create_alias=CreateAlias(collection_name=physical, alias_name=self.serving_name)
                 ),
             ]
         )
 
-        self.physical_name = new_physical
 
-        if old_physical and old_physical != new_physical:
-            await self.qdrant.delete_collection(collection_name=old_physical)
+    # ------------------------------------------------------------------ #
+    # writers journal (revision consistency)
+    # ------------------------------------------------------------------ #
+    @asynccontextmanager
+    async def writer(self, doc_id: str):
+        """Register an in-flight write of one document's points for its whole duration
+        (enroll from `begin` to commit/rollback, a self-heal re-embed)."""
+        token = object()
+        self._writers[token] = (doc_id, self.physical_name)
+
+        if self._journal is not None:
+            self._journal.add(doc_id)
+
+        try:
+            yield
+
+        finally:
+            del self._writers[token]
+
+            async with self._writers_changed:
+                self._writers_changed.notify_all()
+
+
+    def start_journal(self) -> None:
+        """Begin recording written doc_ids — including writers already in flight."""
+        self._journal = {doc_id for doc_id, _ in self._writers.values()}
+
+
+    def stop_journal(self) -> set[str]:
+        """Stop recording and return every doc_id written since `start_journal`."""
+        journal, self._journal = self._journal or set(), None
+
+        return journal
+
+
+    async def drain(self, physical: str, timeout: float) -> bool:
+        """Wait until no writer that started against `physical` is still running.
+        False if the timeout ran out first."""
+        def drained() -> bool:
+            return all(collection != physical for _, collection in self._writers.values())
+
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._writers_changed:
+                    await self._writers_changed.wait_for(drained)
+
+        except TimeoutError:
+            return False
+
+        return True
 
 
     # ------------------------------------------------------------------ #
@@ -373,10 +533,16 @@ class QdrantStore:
         )
 
 
-    async def delete_by_doc(self, doc_id: str, *, wait: bool = True) -> None:
+    async def delete_by_doc(
+        self,
+        doc_id: str,
+        *,
+        wait: bool = True,
+        collection: str | None = None,
+    ) -> None:
         """Delete every point belonging to one document — the enroll rollback + reconcile primitive."""
         await self.qdrant.delete(
-            collection_name=self.serving_name,
+            collection_name=collection or self.serving_name,
             wait=wait,
             points_selector=Filter(
                 must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
@@ -384,14 +550,33 @@ class QdrantStore:
         )
 
 
-    async def iter_doc_ids(self) -> set[str]:
+    async def delete_by_docs(
+        self,
+        doc_ids: Sequence[str],
+        *,
+        collection: str | None = None,
+    ) -> None:
+        """Delete every point of many documents, `DELETE_DOCS_CHUNK` doc_ids per request."""
+        doc_ids = list(doc_ids)
+
+        for i in range(0, len(doc_ids), DELETE_DOCS_CHUNK):
+            await self.qdrant.delete(
+                collection_name=collection or self.serving_name,
+                wait=True,
+                points_selector=Filter(
+                    must=[FieldCondition(key="doc_id", match=MatchAny(any=doc_ids[i:i + DELETE_DOCS_CHUNK]))]
+                ),
+            )
+
+
+    async def iter_doc_ids(self, *, collection: str | None = None) -> set[str]:
         """Scroll the whole collection and return the distinct doc_ids it holds."""
         doc_ids: set[str] = set()
         offset = None
 
         while True:
             points, offset = await self.qdrant.scroll(
-                collection_name=self.serving_name,
+                collection_name=collection or self.serving_name,
                 limit=1024,
                 offset=offset,
                 with_payload=["doc_id"],

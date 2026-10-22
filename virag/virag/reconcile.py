@@ -10,6 +10,9 @@ Runs at startup and (optionally) on an interval. Two passes:
 The TTL gate (`virag_started_at < now - pending_ttl_sec`) skips in-flight enrolls,
 whose `virag_started_at` is ~now. Because the tiler is bound to this virag by secret,
 every tiler doc carries virag metadata, so there are no foreign docs to misjudge.
+
+Also home of the flat tile-stream re-embed (`reembed_docs`, `sync_docs`) shared by
+self-heal, revision and rollback.
 """
 
 from __future__ import annotations
@@ -19,15 +22,22 @@ import base64
 import hashlib
 import logging
 import time
+from collections.abc import Iterable, Iterator
+from contextlib import AsyncExitStack
+from itertools import islice
 
 from virag.api.enroll import point_id
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.tiler_client import TilerService
 from virag.settings import EnrollSettings, ReconcileSettings
+from virag.utils import gather
 
 
 log = logging.getLogger("virag.reconcile")
+
+# Tiles assumed in flight when the tiler has no bulk concurrency cap; sizes the window.
+_UNCAPPED_TILES = 128
 
 
 async def reconcile(
@@ -38,23 +48,30 @@ async def reconcile(
     enroll_settings: EnrollSettings,
 ) -> None:
     """Run one reconcile pass: enforce the invariant, then clear stale pending enrolls."""
-    await _enforce_subset(store, tiler)
+    await enforce_subset(store, tiler)
     await _clear_stale_pending(store, tiler, retriever, settings, enroll_settings)
 
 
-async def _enforce_subset(store: QdrantStore, tiler: TilerService) -> None:
-    """Delete Qdrant points whose doc_id is absent from the tiler (invariant repair)."""
-    qdrant_ids = await store.iter_doc_ids()
+async def enforce_subset(
+    store: QdrantStore,
+    tiler: TilerService,
+    *,
+    collection: str | None = None,
+) -> int:
+    """Delete points whose doc_id is absent from the tiler (invariant repair) in the
+    serving collection, or in `collection` (a revision build). Returns how many docs."""
+    qdrant_ids = await store.iter_doc_ids(collection=collection)
     tiler_ids = {doc["doc_id"] for doc in await tiler.iter_docs()}
 
     dangling = qdrant_ids - tiler_ids
     if not dangling:
-        return
+        return 0
 
     log.warning("reconcile: %d dangling doc_id(s) in qdrant not in tiler; deleting", len(dangling))
 
-    for doc_id in dangling:
-        await store.delete_by_doc(doc_id)
+    await store.delete_by_docs(sorted(dangling), collection=collection)
+
+    return len(dangling)
 
 
 async def _clear_stale_pending(
@@ -78,121 +95,232 @@ async def _clear_stale_pending(
 
     log.warning("reconcile: %d stale pending enroll(s); clearing partial points", len(stale))
 
-    for doc in stale:
-        doc_id = doc["doc_id"]
-        await store.delete_by_doc(doc_id)                       # always clear the partial first
+    # Registered as writers so a concurrent revision journals and later syncs these docs.
+    async with AsyncExitStack() as writing:
+        for doc in stale:
+            await writing.enter_async_context(store.writer(doc["doc_id"]))
 
-        if not (settings.self_heal and doc.get("complete")):
-            # An incomplete tiler doc can't be re-embedded (no tiles yet); leave it for
-            # tiler_revision / re-enroll to restore.
-            log.info("reconcile: doc_id=%s left for re-enroll (self-heal off or tiler incomplete)", doc_id)
-            continue
+        await store.delete_by_docs([doc["doc_id"] for doc in stale])      # always clear the partial first
 
-        try:
-            await _reembed_doc(store, tiler, retriever, doc, batch_size=enroll_settings.batch_size)
-            log.info("reconcile: self-healed doc_id=%s", doc_id)
+        # An incomplete tiler doc can't be re-embedded (no tiles yet); leave it for a
+        # tiler revision / re-enroll to restore.
+        healable = [doc for doc in stale if settings.self_heal and doc.get("complete")]
 
-        except Exception as e:  # noqa: BLE001 - one bad doc must not stop the sweep
-            log.error("reconcile: self-heal failed for doc_id=%s: %r", doc_id, e)
+        for doc in stale:
+            if doc not in healable:
+                log.info("reconcile: doc_id=%s left for re-enroll (self-heal off or tiler incomplete)", doc["doc_id"])
 
-
-async def _reembed_doc(
-    store: QdrantStore,
-    tiler: TilerService,
-    retriever: RetrieverClient,
-    summary: dict,
-    *,
-    batch_size: int,
-    collection: str | None = None,
-    mark_enrolled: bool = True,
-) -> None:
-    """Re-embed a complete tiler doc into Qdrant (self-heal, or a revision target).
-
-    Tiles are pulled via get_tile and embedded in batches; the point ids match enroll's
-    (`point_id(doc_id, tile_num)`), so this restores exactly what a fresh enroll would.
-    `collection` targets a specific physical collection (a revision build); `mark_enrolled`
-    clears the pending marker (self-heal) — a revision leaves it untouched.
-    """
-    doc_id = summary["doc_id"]
-    tile_count = summary["tile_count"]
-    render_version = summary.get("render_version") or ""
-    # Strip virag's own lifecycle markers — the payload carries user metadata only.
-    payload_meta = {k: v for k, v in (summary.get("metadata") or {}).items() if not k.startswith("virag_")}
-
-    batch: list[int] = []
-
-    async def flush() -> None:
-        if not batch:
+        if not healable:
             return
 
-        jpegs = [await tiler.get_tile(doc_id, n) for n in batch]
-        b64s = [base64.b64encode(j).decode("ascii") for j in jpegs]
-        vectors = await retriever.embed_images(b64s, bulk=True)
-        payloads = [
-            {
-                "doc_id": doc_id,
-                "tile_num": n,
-                "image_hash": hashlib.sha256(j).hexdigest(),
-                "doc_type": summary.get("doc_type"),
-                "source_url": summary.get("source_url"),
-                "render_version": render_version,
-                "metadata": payload_meta,
-            }
-            for n, j in zip(batch, jpegs)
-        ]
-        ids = [point_id(doc_id, n) for n in batch]
-
-        await store.upsert(vectors, payloads, ids=ids, collection=collection)
-        batch.clear()
-
-    for tile_num in range(tile_count):
-        batch.append(tile_num)
-        if len(batch) >= batch_size:
-            await flush()
-
-    await flush()
-
-    if mark_enrolled:
-        await tiler.patch_metadata(doc_id, {"virag_enrolled_at": int(time.time())})
-
-
-async def revise(
-    store: QdrantStore,
-    tiler: TilerService,
-    retriever: RetrieverClient,
-    enroll_settings: EnrollSettings,
-) -> dict:
-    """Re-embed the whole corpus into a fresh collection, then blue-green swap the alias.
-
-    The live collection keeps serving until the new one is fully built and the alias flips
-    atomically — no empty window. Use after an embedding-model change (or a tiler /revision).
-    """
-    new_collection = await store.create_revision_collection()
-    log.info("revision: building %s", new_collection)
-
-    reembedded = 0
-    skipped = 0
-
-    for doc in await tiler.iter_docs():
-        if not doc.get("complete"):
-            skipped += 1  # incomplete docs aren't servable; leave them for tiler /revision
-            continue
-
-        await _reembed_doc(
+        failed = await reembed_docs(
             store,
             tiler,
             retriever,
-            doc,
+            healable,
             batch_size=enroll_settings.batch_size,
-            collection=new_collection,
-            mark_enrolled=False,
+            mark_enrolled=True,
         )
-        reembedded += 1
 
-    await store.swap_alias(new_collection)
+        if failed:
+            # Leave no partial points behind; the docs stay pending for the next sweep.
+            await store.delete_by_docs(sorted(failed))
+            log.error("reconcile: self-heal failed for %d doc(s): %s", len(failed), sorted(failed))
 
-    log.info("revision: re-embedded=%d skipped=%d, alias now → %s", reembedded, skipped, new_collection)
-    return {"reembedded": reembedded, "skipped": skipped, "collection": new_collection}
+        log.info("reconcile: self-healed %d doc(s)", len(healable) - len(failed))
+
+
+async def sync_docs(
+    store: QdrantStore,
+    tiler: TilerService,
+    retriever: RetrieverClient,
+    doc_ids: Iterable[str],
+    *,
+    batch_size: int,
+    collection: str | None = None,
+) -> set[str]:
+    """Make `collection` mirror the tiler for these docs: drop their points, then
+    re-embed the ones the tiler holds complete and enrolled. Docs gone, incomplete or
+    still pending stay dropped — exactly as the serving collection treats them.
+    Returns the doc_ids that failed to re-embed."""
+    wanted = set(doc_ids)
+    if not wanted:
+        return set()
+
+    await store.delete_by_docs(sorted(wanted), collection=collection)
+
+    current = [
+        doc
+        for doc in await tiler.iter_docs()
+        if doc["doc_id"] in wanted
+        and doc.get("complete")
+        and (doc.get("metadata") or {}).get("virag_enrolled_at", 0) > 0
+    ]
+
+    return await reembed_docs(
+        store,
+        tiler,
+        retriever,
+        current,
+        batch_size=batch_size,
+        collection=collection,
+    )
+
+
+async def reembed_docs(
+    store: QdrantStore,
+    tiler: TilerService,
+    retriever: RetrieverClient,
+    docs: list[dict],
+    *,
+    batch_size: int,
+    collection: str | None = None,
+    mark_enrolled: bool = False,
+) -> set[str]:
+    """Re-embed complete tiler docs into Qdrant (self-heal, revision, sync); docs that
+    fail are retried once in per-document batches, so a doc that merely shared a batch
+    with a broken one recovers. Returns the doc_ids that still failed."""
+    failed = await _reembed_pass(
+        store, tiler, retriever, docs,
+        batch_size=batch_size, collection=collection, mark_enrolled=mark_enrolled,
+    )
+
+    if not failed:
+        return failed
+
+    log.warning("reembed: retrying %d failed doc(s)", len(failed))
+
+    return await _reembed_pass(
+        store, tiler, retriever, [doc for doc in docs if doc["doc_id"] in failed],
+        batch_size=batch_size, collection=collection, mark_enrolled=mark_enrolled,
+        per_doc=True,
+    )
+
+
+async def _reembed_pass(
+    store: QdrantStore,
+    tiler: TilerService,
+    retriever: RetrieverClient,
+    docs: list[dict],
+    *,
+    batch_size: int,
+    collection: str | None,
+    mark_enrolled: bool,
+    per_doc: bool = False,
+) -> set[str]:
+    """One pass of the flat tile stream.
+
+    Every (doc_id, tile_num) of every doc is cut into batches of `batch_size` across
+    document boundaries, so small docs share full batches. Each batch fetches its
+    tiles concurrently (bulk, capped by the tiler's `max_concurrency`), embeds them in
+    one bulk retriever call and upserts once. A window of batches stays in flight, so
+    one batch fetches while another embeds; it is derived from the tiler cap — more
+    would only queue at the guard. Point ids match enroll's (`point_id`), so this
+    restores exactly what a fresh enroll would.
+
+    A doc is done when its last tile lands; a failed batch fails every doc it touched
+    (their later tiles are skipped). `per_doc` keeps batches within one document (the
+    retry pass). `collection` targets a revision build; `mark_enrolled` promotes
+    self-healed docs out of pending.
+    """
+    by_id = {doc["doc_id"]: doc for doc in docs}
+    remaining = {doc_id: doc["tile_count"] for doc_id, doc in by_id.items()}
+    failed: set[str] = set()
+
+    # Strip virag's own lifecycle markers — the payload carries user metadata only.
+    payload_meta = {
+        doc_id: {k: v for k, v in (doc.get("metadata") or {}).items() if not k.startswith("virag_")}
+        for doc_id, doc in by_id.items()
+    }
+
+    async def finish(doc_ids: list[str]) -> None:
+        if not mark_enrolled:
+            return
+
+        for doc_id in doc_ids:
+            try:
+                await tiler.patch_metadata(doc_id, {"virag_enrolled_at": int(time.time())})
+
+            except Exception as e:  # noqa: BLE001 - one doc must not stop the stream
+                log.error("reembed: cannot promote doc_id=%s: %r", doc_id, e)
+                failed.add(doc_id)
+
+    async def process(batch: list[tuple[str, int]]) -> None:
+        batch = [(doc_id, n) for doc_id, n in batch if doc_id not in failed]
+        if not batch:
+            return
+
+        try:
+            jpegs = await gather(tiler.get_tile(doc_id, n, bulk=True) for doc_id, n in batch)
+            b64s = [base64.b64encode(j).decode("ascii") for j in jpegs]
+            vectors = await retriever.embed_images(b64s, bulk=True)
+
+            payloads = [
+                {
+                    "doc_id": doc_id,
+                    "tile_num": n,
+                    "image_hash": hashlib.sha256(j).hexdigest(),
+                    "doc_type": by_id[doc_id].get("doc_type"),
+                    "source_url": by_id[doc_id].get("source_url"),
+                    "render_version": by_id[doc_id].get("render_version") or "",
+                    "metadata": payload_meta[doc_id],
+                }
+                for (doc_id, n), j in zip(batch, jpegs)
+            ]
+            ids = [point_id(doc_id, n) for doc_id, n in batch]
+
+            await store.upsert(vectors, payloads, ids=ids, collection=collection)
+
+        except Exception as e:  # noqa: BLE001 - a failed batch fails its docs, not the stream
+            touched = {doc_id for doc_id, _ in batch}
+            failed.update(touched)
+            log.error("reembed: batch failed for doc(s) %s: %r", sorted(touched), e)
+
+            return
+
+        finished = []
+        for doc_id, _ in batch:
+            remaining[doc_id] -= 1
+            if remaining[doc_id] == 0:
+                finished.append(doc_id)
+
+        await finish([doc_id for doc_id in finished if doc_id not in failed])
+
+    # A doc without tiles has nothing to stream — it is done as it stands.
+    await finish([doc_id for doc_id, count in remaining.items() if count == 0])
+
+    if per_doc:
+        batches = (
+            batch
+            for doc_id, doc in by_id.items()
+            for batch in _batches(((doc_id, n) for n in range(doc["tile_count"])), batch_size)
+        )
+    else:
+        tiles = ((doc_id, n) for doc_id, doc in by_id.items() for n in range(doc["tile_count"]))
+        batches = _batches(tiles, batch_size)
+
+    window = max(1, (tiler.max_concurrency or _UNCAPPED_TILES) // batch_size) + 1
+    slots = asyncio.Semaphore(window)
+
+    async def run(batch: list[tuple[str, int]]) -> None:
+        try:
+            await process(batch)
+
+        finally:
+            slots.release()
+
+    async with asyncio.TaskGroup() as group:
+        for batch in batches:
+            await slots.acquire()
+            group.create_task(run(batch))
+
+    return failed
+
+
+def _batches(items: Iterator, size: int) -> Iterator[list]:
+    """Lazily cut an iterator into lists of `size` (the last may be shorter)."""
+    while batch := list(islice(items, size)):
+        yield batch
 
 
 async def run_periodic(

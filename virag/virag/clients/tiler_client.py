@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import httpx2
@@ -112,6 +113,7 @@ class TilerService(HttpService):
         return cls(
             base_url=ts.base_url,
             timeout=ts.timeout,
+            max_concurrency=ts.max_concurrency,
             connect_timeout=ts.connect_timeout,
             max_connections=ts.max_connections,
             max_retries=ts.max_retries,
@@ -199,20 +201,24 @@ class TilerService(HttpService):
         tile_num: int,
         *,
         verify: bool = True,
+        bulk: bool = False,
     ) -> bytes:
-
+        """Regenerate one tile. `bulk` calls (self-heal, revision) are capped by
+        `max_concurrency`; interactive ones (chat RAG) bypass it, so a corpus rebuild
+        never starves a user's query of tiles."""
         params = {
             "doc_id": doc_id,
             "tile_num": tile_num,
             "verify": verify,
         }
 
-        response = await self._request(
-            "GET",
-            self.get_tile_route,
-            action=f"tile regeneration ({doc_id}, {tile_num})",
-            params=params,
-        )
+        async with (self._guard() if bulk else nullcontext()):
+            response = await self._request(
+                "GET",
+                self.get_tile_route,
+                action=f"tile regeneration ({doc_id}, {tile_num})",
+                params=params,
+            )
 
         return response.content
 

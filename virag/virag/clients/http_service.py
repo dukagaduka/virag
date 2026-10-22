@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 import random
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Coroutine, Iterable
+from collections.abc import Collection
 from contextlib import asynccontextmanager, nullcontext
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable
 
 import httpx2
 
@@ -34,8 +34,6 @@ RETRY_ERRORS = (
     httpx2.WriteError,
 )
 
-T = TypeVar("T")
-
 
 class HttpService(ABC):
     """An upstream reached over one pooled, keep-alive HTTP client."""
@@ -54,10 +52,11 @@ class HttpService(ABC):
         headers: dict | None = None,
     ):
 
-        self.base_url     = base_url
-        self.max_retries  = max_retries
-        self.backoff_base = backoff_base
-        self.backoff_cap  = backoff_cap
+        self.base_url        = base_url
+        self.max_retries     = max_retries
+        self.max_concurrency = max_concurrency
+        self.backoff_base    = backoff_base
+        self.backoff_cap     = backoff_cap
 
         # 0 = unlimited; otherwise cap concurrent upstream calls made under `_guard`
         # so this process cannot bury the upstream under its own load.
@@ -229,24 +228,6 @@ class HttpService(ABC):
                 message=f"Cannot decode {response.url} response or unexpected response structure during {action}",
                 details={"base_message": str(e)},
             ) from e
-
-
-    @staticmethod
-    async def _gather(coros: Iterable[Coroutine[Any, Any, T]]) -> list[T]:
-        """Run coroutines concurrently and return their results in input order.
-
-        Unlike asyncio.gather, the first failure cancels the rest — no orphaned
-        requests keep loading the upstream — and is re-raised as-is rather than
-        wrapped in an ExceptionGroup, so callers still see a plain ApiError.
-        """
-        try:
-            async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(coro) for coro in coros]
-
-        except BaseExceptionGroup as eg:
-            raise eg.exceptions[0]
-
-        return [task.result() for task in tasks]
 
 
     def _backoff(self, attempt: int) -> float:
