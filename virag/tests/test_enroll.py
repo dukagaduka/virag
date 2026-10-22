@@ -6,14 +6,14 @@ import json
 
 from virag.api.enroll import point_id
 
-from conftest import FakeEmbeddings, FakeStore, FakeTiler, sample_tile_result
+from conftest import FakeRetriever, FakeStore, FakeTiler, sample_tile_result
 
 
 def _client(make_client, *, n_tiles=2):
-    store, emb = FakeStore(), FakeEmbeddings()
+    store, retriever = FakeStore(), FakeRetriever()
     tiler = FakeTiler(result=sample_tile_result("doc-a", n_tiles=n_tiles))
-    client = make_client(store=store, embeddings=emb, tiler=tiler)
-    return client, store, emb, tiler
+    client = make_client(store=store, retriever=retriever, tiler=tiler)
+    return client, store, retriever, tiler
 
 
 def _pdf_files():
@@ -27,7 +27,7 @@ def test_point_id_is_deterministic_and_unique():
 
 
 def test_enroll_success(make_client):
-    client, store, emb, _ = _client(make_client)
+    client, store, retriever, _ = _client(make_client)
 
     r = client.post(
         "/enroll",
@@ -45,7 +45,7 @@ def test_enroll_success(make_client):
     assert len(store.upserts) == 1
     up = store.upserts[0]
     assert up["ids"] == [point_id("doc-a", 0), point_id("doc-a", 1)]     # deterministic ids
-    assert len(emb.image_calls[0]) == 2                                  # both tiles embedded
+    assert len(retriever.image_calls[0]) == 2                                  # both tiles embedded
     assert up["payloads"][0]["metadata"]["name"] == "Report A"
     assert up["payloads"][0]["image_hash"]                              # carried for integrity
 
@@ -77,7 +77,7 @@ def test_enroll_allow_missing_name_uses_doc_id(make_client):
 
 
 def test_enroll_zero_tiles_enrolls_nothing(make_client):
-    client, store, emb, _ = _client(make_client, n_tiles=0)
+    client, store, retriever, _ = _client(make_client, n_tiles=0)
 
     r = client.post(
         "/enroll",
@@ -88,7 +88,7 @@ def test_enroll_zero_tiles_enrolls_nothing(make_client):
     assert r.status_code == 200
     assert r.json()["enrolled"] == 0
     assert store.upserts == []
-    assert emb.image_calls == []
+    assert retriever.image_calls == []
 
 
 def test_enroll_bad_metadata_json_is_422(make_client):
@@ -121,8 +121,8 @@ def test_enroll_marks_pending_then_promotes(make_client):
 
 
 def test_enroll_streams_in_batches(make_client):
-    client, store, emb, _ = _client(make_client, n_tiles=3)
-    emb.chunk_size = 1                                               # force one tile per batch
+    client, store, retriever, _ = _client(make_client, n_tiles=3)
+    retriever.chunk_size = 1                                               # force one tile per batch
 
     r = client.post(
         "/enroll",

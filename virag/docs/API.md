@@ -164,7 +164,7 @@ the path (plus query string) is forwarded upstream, streaming the response.
 | Route | Upstream | Notes |
 |---|---|---|
 | `ANY /tiler/{path}` | doc-tiler | e.g. `GET /tiler/get_tile?doc_id=…&tile_num=0`. |
-| `ANY /embed/{path}` | embeddings server | `Authorization` injected from `VLLM_API_KEY`. |
+| `ANY /retriever/{path}` | retriever server | `Authorization` injected from `RETRIEVER_API_KEY`. |
 | `ANY /qdrant/{path}` | Qdrant | e.g. `GET /qdrant/collections`. |
 | `ANY /v1/{path}` | VLM | Every `/v1/*` **except** `/v1/chat/completions`; `Authorization` injected from `VLM_API_KEY`. |
 
@@ -192,7 +192,7 @@ Every error uses one shape:
 | Status | `code` | Typical cause |
 |---|---|---|
 | `422` | `UNPROCESSABLE` | Bad request body/JSON, invalid `rag` field, RAG on with no query text, bad `metadata`. |
-| `502` | `UPSTREAM_FAILURE` | A backend (VLM, tiler, embeddings, Qdrant) could not be reached. |
+| `502` | `UPSTREAM_FAILURE` | A backend (VLM, tiler, retriever, Qdrant) could not be reached. |
 | `503` | `NOT_READY` | Queried before startup finished wiring backends. |
 | `500` | `INTERNAL_ERROR` | Unexpected server error. |
 

@@ -13,7 +13,7 @@ This repository holds two independently deployable services:
 | [**doc-tiler/**](doc-tiler/) | Turns PDF/URL/MHTML/IMG documents into fixed-geometry image tiles and regenerates any tile on demand from the stored original. | [doc-tiler/README.md](doc-tiler/README.md) · [doc-tiler/docs/](doc-tiler/docs/) |
 
 Two more components are external dependencies the stack talks to: a **Qdrant** vector
-store and a **vLLM** embeddings server (both wired up by virag's Compose file), plus the
+store and a **vLLM** retriever server (both wired up by virag's Compose file), plus the
 upstream **VLM** that generates the answers.
 
 ## How it fits together
@@ -24,14 +24,14 @@ flowchart LR
         direction LR
         D[document] --> VE["virag<br/>POST /enroll"]
         VE -->|"① tile"| TE[doc-tiler]
-        VE -->|"② embed tiles"| EE[embeddings]
+        VE -->|"② embed tiles"| EE[retriever]
         VE -->|"③ upsert vectors"| QE[(Qdrant)]
     end
 
     subgraph query["Query · online"]
         direction LR
         C[client] --> VQ["virag<br/>POST /v1/chat/completions<br/>rag: true"]
-        VQ -->|"① embed query"| EQ[embeddings]
+        VQ -->|"① embed query"| EQ[retriever]
         VQ -->|"② top-N tiles"| QQ[(Qdrant)]
         VQ -->|"③ regen + verify"| TQ[doc-tiler]
         VQ -->|"④ answer + sources"| MQ[VLM]

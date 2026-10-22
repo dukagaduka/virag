@@ -5,7 +5,7 @@ All application configuration is read from environment variables at startup by
 startup if unset; everything else has a default. A ready-to-edit template — including
 the Compose/deployment variables — lives at
 [`deploy/service/.env.example`](../deploy/service/.env.example) and
-[`deploy/embeddings/.env.example`](../deploy/embeddings/.env.example).
+[`deploy/retriever/.env.example`](../deploy/retriever/.env.example).
 
 Invalid values fail fast with a `SettingsError` (wrong type, out of range, unknown
 enum) rather than surfacing later as a runtime error.
@@ -61,7 +61,7 @@ serves through it while the physical collection it points to is versioned (`__v1
 
 ## Upstream HTTP retries
 
-Every upstream client (embeddings, tiler, VLM) holds one long-lived pooled connection
+Every upstream client (retriever, tiler, VLM) holds one long-lived pooled connection
 per upstream and replays transient failures — connection errors and `429`/`502`/`503`/`504`
 replies — with full-jitter exponential backoff. Read timeouts are never replayed (a slow
 upstream only gets slower under extra load), and neither are tiler ingests or the
@@ -72,18 +72,18 @@ passthrough proxies.
 | `HTTP_RETRY_BACKOFF_BASE_SEC` | no | `0.25` | Backoff base (≥ 0). Each wait is uniform over `[0, min(CAP, BASE · 2^attempt)]`. |
 | `HTTP_RETRY_BACKOFF_CAP_SEC` | no | `8` | Backoff ceiling (≥ 0); also caps a numeric `Retry-After` from the upstream. |
 
-## Embeddings (vLLM, OpenAI-compatible)
+## Retriever (OpenAI-compatible embeddings, e.g. vLLM)
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `EMBEDDINGS_BASE_URL` | no | `http://embeddings-vllm-virag:8000/v1` | Embeddings endpoint. The `/v1` suffix is required. The embeddings server runs in a separate stack, so the default container name only resolves if you attach both stacks to one Docker network; the shipped `deploy/service/.env.example` uses `http://host.docker.internal:48003/v1` instead. |
-| `VLLM_SERVED_MODEL_NAME` | no | `embeddings-model` | Embeddings model name (must match `SERVED_MODEL_NAME` in `serve_embeddings.sh`). |
-| `VLLM_API_KEY` | no | `dummy` | Bearer key for the embeddings server (must match `API_KEY` in `serve_embeddings.sh`; also injected on the `/embed` proxy). |
-| `EMBEDDINGS_CHUNK_SIZE` | no | `16` | Max items per embedding request (≥ 1). |
-| `EMBEDDINGS_TIMEOUT_SEC` | no | `60` | Per-read deadline: max silence between bytes (≥ 1). |
-| `EMBEDDINGS_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
-| `EMBEDDINGS_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the embeddings server (≥ 1). |
-| `EMBEDDINGS_MAX_RETRIES` | no | `3` | Retries for a transient failure (≥ 0). |
+| `RETRIEVER_BASE_URL` | no | `http://retriever-vllm-virag:8000/v1` | Retriever endpoint. The `/v1` suffix is required. The retriever server runs in a separate stack, so the default container name only resolves if you attach both stacks to one Docker network; the shipped `deploy/service/.env.example` uses `http://host.docker.internal:48003/v1` instead. |
+| `RETRIEVER_MODEL_NAME` | no | `retriever-model` | Retriever model name (must match `SERVED_MODEL_NAME` in `serve_retriever.sh`). |
+| `RETRIEVER_API_KEY` | no | `dummy` | Bearer key for the retriever server (must match `API_KEY` in `serve_retriever.sh`; also injected on the `/retriever` proxy). |
+| `RETRIEVER_CHUNK_SIZE` | no | `16` | Max items per embedding request (≥ 1). |
+| `RETRIEVER_TIMEOUT_SEC` | no | `60` | Per-read deadline: max silence between bytes (≥ 1). |
+| `RETRIEVER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
+| `RETRIEVER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the retriever server (≥ 1). |
+| `RETRIEVER_MAX_RETRIES` | no | `3` | Retries for a transient failure (≥ 0). |
 
 ## Tiler (doc-tiler)
 
@@ -120,7 +120,7 @@ collection thereafter. See [SECURITY.md](SECURITY.md) for the binding contract a
 
 For the Compose-only orchestration variables (`*_DEPLOY_*` image tags, host ports,
 volume paths), see [`deploy/service/.env.example`](../deploy/service/.env.example) and
-[`deploy/embeddings/.env.example`](../deploy/embeddings/.env.example). The vLLM serving
-parameters are set in `deploy/embeddings/serve_embeddings.sh` (template:
-`serve_embeddings.example.sh`). See [DEPLOYMENT.md](DEPLOYMENT.md) — none of these are read
+[`deploy/retriever/.env.example`](../deploy/retriever/.env.example). The vLLM serving
+parameters are set in `deploy/retriever/serve_retriever.sh` (template:
+`serve_retriever.example.sh`). See [DEPLOYMENT.md](DEPLOYMENT.md) — none of these are read
 by `Settings.from_env()`.

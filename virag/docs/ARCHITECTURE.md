@@ -8,7 +8,7 @@ backend, then forwarded. The client keeps talking to one OpenAI-shaped endpoint 
 opts into retrieval per request.
 
 - **Stack:** Python 3.11+, FastAPI, async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async).
-- **Backends (all external):** an embeddings server (vLLM, OpenAI-compatible), the
+- **Backends (all external):** a retriever server (vLLM, OpenAI-compatible), the
   doc-tiler service, a Qdrant instance, and the upstream VLM.
 - **Scope:** the gateway only. Tiling/rendering lives in doc-tiler; embedding lives in
   the vLLM server; vector storage lives in Qdrant; generation lives in the VLM.
@@ -23,7 +23,7 @@ match `/v1/*`:
 1. `ops` — `/health`, `/ready`.
 2. `enroll` — `POST /enroll`.
 3. `chat_completions` — `POST /v1/chat/completions` (the RAG entry point).
-4. `proxy` — catch-all reverse proxy: `/tiler/*`, `/embed/*`, `/qdrant/*`, and
+4. `proxy` — catch-all reverse proxy: `/tiler/*`, `/retriever/*`, `/qdrant/*`, and
    `/v1/*`.
 
 Because `chat_completions` is registered **before** the `/v1/{path:path}` wildcard,
@@ -53,7 +53,7 @@ When RAG is on, `_run_rag` runs before the upstream call:
 1. **Build the query.** Take the text of the *last user message* — concatenating the
    text parts of multimodal content. No user text → `422` (RAG was asked for but there
    is nothing to retrieve on).
-2. **Embed.** One text embedding via the embeddings client (`embed_texts`).
+2. **Embed.** One text embedding via the retriever client (`embed_texts`).
 3. **Search.** Qdrant top-`N`; if `score_threshold` is set, drop hits below it.
 4. **Fetch tiles.** For each hit, call doc-tiler `GET /get_tile?doc_id&tile_num`
    (concurrently) and base64-encode the JPEG. A tile that fails to render is logged
@@ -93,7 +93,7 @@ Everything that isn't RAG is a thin reverse proxy (`_reverse_proxy`, streaming v
 | Prefix | Upstream | Auth injected |
 |---|---|---|
 | `/tiler/*` | doc-tiler | — |
-| `/embed/*` | embeddings server | `Authorization: Bearer <VLLM_API_KEY>` |
+| `/retriever/*` | retriever server | `Authorization: Bearer <RETRIEVER_API_KEY>` |
 | `/qdrant/*` | Qdrant | — |
 | `/v1/*` (except chat/completions) | VLM | `Authorization: Bearer <VLM_API_KEY>` |
 
@@ -107,7 +107,7 @@ tiler, inspect the Qdrant collection) without exposing each service separately.
 Four typed async clients, each built from its settings block and given a
 `check_connection()` used at startup:
 
-- **`EmbeddingsClient`** — vLLM OpenAI-compatible embeddings. Text goes through the
+- **`RetrieverClient`** — vLLM OpenAI-compatible embeddings. Text goes through the
   `input` field (batchable); images go through chat-style `messages`/`image_url` with
   a `data:` URI, one request per image. (These are two different vLLM request shapes;
   conflating them is a common bug.)
@@ -129,7 +129,7 @@ Four typed async clients, each built from its settings block and given a
 `lifespan` wires everything and refuses to serve a half-working system:
 
 - Build all four clients from `Settings.from_env()`.
-- `create_collection()` on Qdrant; then `check_connection()` on embeddings, tiler and
+- `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler and
   VLM. **Every dependency is fatal** — the service is useless without any one of them,
   so a failed check aborts startup.
 - **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): virag, the tiler,
@@ -152,7 +152,7 @@ is a bare liveness probe.
 
 `/enroll` (`api/enroll.py`) is internally **streaming**. It calls the tiler's
 `POST /tile/stream` and consumes the NDJSON event stream, accumulating tiles into
-embedding batches of `EMBEDDINGS_CHUNK_SIZE`, embedding each batch, and upserting its
+embedding batches of `RETRIEVER_CHUNK_SIZE`, embedding each batch, and upserting its
 vectors to Qdrant as it goes — bounded memory, never the whole document at once. The HTTP
 contract is unchanged (see [API.md](API.md)); what changed is that it no longer buffers a
 whole multi-MB manifest and no longer hits a render timeout, so arbitrarily large
@@ -216,8 +216,8 @@ virag/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
     enroll.py            # /enroll: streaming tile → embed → upsert
     revision.py          # /revision: full re-embed + blue-green alias swap
-    proxy.py             # reverse proxy for /tiler, /embed, /qdrant, /v1/*
+    proxy.py             # reverse proxy for /tiler, /retriever, /qdrant, /v1/*
     ops.py               # /health, /ready
   clients/
-    embeddings_client.py  qdrant_store.py  tiler_client.py  vlm_client.py
+    retriever_client.py  qdrant_store.py  tiler_client.py  vlm_client.py
 ```

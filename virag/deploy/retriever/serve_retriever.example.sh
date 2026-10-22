@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ###############################################################################
-# serve_embeddings.sh
+# serve_retriever.sh
 #
 # Назначение:
 #   Запуск одного OpenAI-compatible vLLM endpoint для эмбеддингов (/v1/embeddings) с:
@@ -20,7 +20,7 @@ set -euo pipefail
 ############################################
 MODEL_NAME="/model"
 # Путь к директории базовой модели внутри контейнера.
-# Compose монтирует туда VLLM_DEPLOY_MODEL_PATH, обычно менять не нужно.
+# Compose монтирует туда RETRIEVER_DEPLOY_MODEL_PATH, обычно менять не нужно.
 
 ############################################
 # LISTEN / AUTH
@@ -32,16 +32,16 @@ HOST="0.0.0.0"
 
 PORT="8000"
 # Порт OpenAI-compatible API внутри контейнера.
-# Наружу он пробрасывается через VLLM_DEPLOY_PORT в .env, здесь менять не нужно.
+# Наружу он пробрасывается через RETRIEVER_DEPLOY_PORT в .env, здесь менять не нужно.
 
 API_KEY="dummy"
 # Если строка непустая, сервер будет требовать Bearer token на /v1/*.
 # Оставь пустым для отключения авторизации.
 # Должен совпадать с ключом, с которым virag ходит в этот endpoint.
 
-SERVED_MODEL_NAME="embeddings-model"
+SERVED_MODEL_NAME="retriever-model"
 # Имя модели, которое клиент (virag) указывает в поле "model".
-# Должно совпадать с VLLM_SERVED_MODEL_NAME в настройках virag.
+# Должно совпадать с RETRIEVER_MODEL_NAME в настройках virag.
 # Если смонтирован LoRA adapter, под этим именем отдаётся base+adapter,
 # а сама база регистрируется под BASE_MODEL_NAME (см. LORA).
 
@@ -110,7 +110,7 @@ ENABLE_LORA="auto"
 
 ADAPTER_DIR="/adapter"
 # Путь к LoRA adapter внутри контейнера.
-# Compose монтирует туда VLLM_DEPLOY_ADAPTER_PATH. Если адаптер не нужен,
+# Compose монтирует туда RETRIEVER_DEPLOY_ADAPTER_PATH. Если адаптер не нужен,
 # укажи в .env путь к любой папке без adapter_config.json.
 
 BASE_MODEL_NAME="base-model"

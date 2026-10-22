@@ -60,13 +60,13 @@ model. So a pixel-tier drift on the tiler (a Chromium/JPEG/DPI change) degrades 
 The reverse proxy injects bearer credentials so backends can stay locked down behind the
 gateway:
 
-- `/embed/*` and calls to the embeddings server → `Authorization: Bearer <VLLM_API_KEY>`.
+- `/retriever/*` and calls to the retriever server → `Authorization: Bearer <RETRIEVER_API_KEY>`.
 - `/v1/*` (passthrough) and chat-completions → `Authorization: Bearer <VLM_API_KEY>`.
 - `/tiler/*` and `/qdrant/*` → no auth injected.
 
 Notes:
 
-- These keys live in the environment (`VLLM_API_KEY`, `VLM_API_KEY`) and default to
+- These keys live in the environment (`RETRIEVER_API_KEY`, `VLM_API_KEY`) and default to
   `dummy`; set real values in any deployment where the backends enforce auth.
 - virag itself does **not** authenticate its own callers — it is designed to sit behind
   your own gateway/network policy. Don't expose it directly to untrusted clients.
@@ -88,8 +88,8 @@ Notes:
 
 - [ ] `TILER_DB_SECRET` set to a strong value, identical on virag and the tiler, before
       the stack's first boot.
-- [ ] Real `VLM_API_KEY` / `VLLM_API_KEY` if the upstreams enforce auth.
+- [ ] Real `VLM_API_KEY` / `RETRIEVER_API_KEY` if the upstreams enforce auth.
 - [ ] virag reachable only from a trusted gateway/network — it has no built-in
       client authentication.
-- [ ] Backends (tiler, Qdrant, embeddings) not separately exposed if the proxy routes
+- [ ] Backends (tiler, Qdrant, retriever) not separately exposed if the proxy routes
       are meant to be the only path to them.

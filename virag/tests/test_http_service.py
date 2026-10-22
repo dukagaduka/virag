@@ -7,7 +7,7 @@ import asyncio
 import httpx2
 import pytest
 
-from virag.clients.embeddings_client import EmbeddingsClient
+from virag.clients.retriever_client import RetrieverClient
 from virag.clients.http_service import HttpService
 from virag.clients.tiler_client import TilerService
 from virag.clients.vlm_client import VLMClient
@@ -174,27 +174,27 @@ def test_json_maps_bad_structure_to_422():
 # concrete clients
 # ---------------------------------------------------------------------------
 
-def test_embeddings_sends_bearer_and_orders_vectors():
-    emb = EmbeddingsClient("http://emb/v1", "emb", "k-emb", max_retries=0, **_HTTP)
+def test_retriever_sends_bearer_and_orders_vectors():
+    retriever = RetrieverClient("http://retriever/v1", "retriever", "k-retriever", max_retries=0, **_HTTP)
 
     def handler(req, n):
-        assert req.headers["authorization"] == "Bearer k-emb"
+        assert req.headers["authorization"] == "Bearer k-retriever"
         return httpx2.Response(200, json={"data": [
             {"index": 1, "embedding": [1.0]},
             {"index": 0, "embedding": [0.0]},
         ]})
 
-    _mock(emb, handler)
+    _mock(retriever, handler)
 
-    assert _run(emb.embed_texts(["a", "b"])) == [[0.0], [1.0]]
+    assert _run(retriever.embed_texts(["a", "b"])) == [[0.0], [1.0]]
 
 
 def test_openai_check_rejects_missing_model():
-    emb = EmbeddingsClient("http://emb/v1", "emb", "k", max_retries=0, **_HTTP)
-    _mock(emb, lambda req, n: httpx2.Response(200, json={"data": [{"id": "other"}]}))
+    retriever = RetrieverClient("http://retriever/v1", "retriever", "k", max_retries=0, **_HTTP)
+    _mock(retriever, lambda req, n: httpx2.Response(200, json={"data": [{"id": "other"}]}))
 
     with pytest.raises(ApiError) as exc:
-        _run(emb.check_connection())
+        _run(retriever.check_connection())
 
     assert exc.value.status_code == 404
 

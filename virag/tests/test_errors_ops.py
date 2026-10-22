@@ -56,13 +56,13 @@ def test_ready_503_when_backends_missing(make_client):
     assert r.status_code == 503
     body = r.json()
     assert body["status"] == "not ready"
-    assert set(body["missing"]) == {"store", "embeddings", "tiler", "vlm"}
+    assert set(body["missing"]) == {"store", "retriever", "tiler", "vlm"}
 
 
 def test_ready_200_when_all_present(make_client):
-    from conftest import FakeEmbeddings, FakeStore, FakeTiler, FakeVLM
+    from conftest import FakeRetriever, FakeStore, FakeTiler, FakeVLM
 
-    client = make_client(store=FakeStore(), embeddings=FakeEmbeddings(),
+    client = make_client(store=FakeStore(), retriever=FakeRetriever(),
                          tiler=FakeTiler(), vlm=FakeVLM())
     r = client.get("/ready")
     assert r.status_code == 200

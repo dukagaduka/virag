@@ -8,7 +8,7 @@ from virag.api.enroll import point_id
 from virag.reconcile import reconcile, revise
 from virag.settings import ReconcileSettings
 
-from conftest import FakeEmbeddings, FakeStore, FakeTiler
+from conftest import FakeRetriever, FakeStore, FakeTiler
 
 
 def _settings(self_heal=True):
@@ -16,25 +16,25 @@ def _settings(self_heal=True):
 
 
 def test_reconcile_deletes_dangling_points():
-    store, tiler, emb = FakeStore(), FakeTiler(), FakeEmbeddings()
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
     store._doc_ids = {"kept", "dangling"}                       # dangling has no tiler doc
     tiler.docs = [{"doc_id": "kept"}]
 
-    asyncio.run(reconcile(store, tiler, emb, _settings()))
+    asyncio.run(reconcile(store, tiler, retriever, _settings()))
 
     assert "dangling" in store.deletes
     assert "kept" not in store.deletes
 
 
 def test_reconcile_self_heals_complete_pending():
-    store, tiler, emb = FakeStore(), FakeTiler(), FakeEmbeddings()
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
     tiler.pending_docs = [{
         "doc_id": "doc-a", "doc_type": "PDF", "tile_count": 2, "complete": True,
         "render_version": "rv-test", "source_url": None,
         "metadata": {"name": "A", "virag_started_at": 1, "virag_enrolled_at": 0},
     }]
 
-    asyncio.run(reconcile(store, tiler, emb, _settings()))
+    asyncio.run(reconcile(store, tiler, retriever, _settings()))
 
     assert len(store.upserts) == 1
     up = store.upserts[0]
@@ -47,7 +47,7 @@ def test_reconcile_self_heals_complete_pending():
 
 
 def test_revise_reembeds_into_new_collection_then_swaps():
-    store, tiler, emb = FakeStore(), FakeTiler(), FakeEmbeddings()
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
     tiler.docs = [
         {"doc_id": "doc-a", "doc_type": "PDF", "tile_count": 2, "complete": True,
          "render_version": "rv", "source_url": None, "metadata": {"name": "A"}},
@@ -55,7 +55,7 @@ def test_revise_reembeds_into_new_collection_then_swaps():
          "render_version": "rv", "source_url": None, "metadata": {"name": "B"}},
     ]
 
-    out = asyncio.run(revise(store, tiler, emb))
+    out = asyncio.run(revise(store, tiler, retriever))
 
     assert out["reembedded"] == 1 and out["skipped"] == 1
     assert store.swapped_to == "c__v2"                          # alias flipped to the built collection
@@ -64,13 +64,13 @@ def test_revise_reembeds_into_new_collection_then_swaps():
 
 
 def test_reconcile_leaves_incomplete_for_reenroll():
-    store, tiler, emb = FakeStore(), FakeTiler(), FakeEmbeddings()
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
     tiler.pending_docs = [{
         "doc_id": "doc-b", "doc_type": "PDF", "tile_count": 0, "complete": False,
         "render_version": "rv-test", "source_url": None, "metadata": {"name": "B"},
     }]
 
-    asyncio.run(reconcile(store, tiler, emb, _settings()))
+    asyncio.run(reconcile(store, tiler, retriever, _settings()))
 
     assert store.deletes == ["doc-b"]      # partial cleared
     assert store.upserts == []             # not re-embedded (tiler incomplete)

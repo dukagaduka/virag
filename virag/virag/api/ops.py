@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
-_DEPENDENCIES = ("store", "embeddings", "tiler", "vlm")
+_DEPENDENCIES = ("store", "retriever", "tiler", "vlm")
 
 
 @router.get("/health", summary="Liveness")

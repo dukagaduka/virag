@@ -59,11 +59,11 @@ async def tiler_proxy(path: str, request: Request):
     return await _reverse_proxy(request, tiler, f"{tiler.base_url}/{path}")
 
 
-@router.api_route("/embed/{path:path}", methods=_METHODS)
-async def embed_proxy(path: str, request: Request):
-    embeddings = request.app.state.embeddings
+@router.api_route("/retriever/{path:path}", methods=_METHODS)
+async def retriever_proxy(path: str, request: Request):
+    retriever = request.app.state.retriever
 
-    return await _reverse_proxy(request, embeddings, f"{embeddings.base_url}/{path}", auth_key=embeddings.api_key)
+    return await _reverse_proxy(request, retriever, f"{retriever.base_url}/{path}", auth_key=retriever.api_key)
 
 
 @router.api_route("/qdrant/{path:path}", methods=_METHODS)

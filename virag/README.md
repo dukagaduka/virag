@@ -18,14 +18,14 @@ request.
 ## Quickstart
 
 ```bash
-# embeddings server (see docs/DEPLOYMENT.md)
-cd deploy/embeddings
-cp .env.example .env && cp serve_embeddings.example.sh serve_embeddings.sh
+# retriever server (see docs/DEPLOYMENT.md)
+cd deploy/retriever
+cp .env.example .env && cp serve_retriever.example.sh serve_retriever.sh
 docker compose up -d
 
 # virag + tiler + Qdrant
 cd ../service
-cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE, EMBEDDINGS_BASE_URL
+cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE, RETRIEVER_BASE_URL
 docker compose up --build
 curl -s localhost:48000/ready | jq
 
@@ -80,10 +80,10 @@ virag/
   reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic) and /revision re-embed
   errors.py          ApiError + the uniform {"error": {...}} envelope
   api/               chat_completions, enroll, revision, proxy, ops
-  clients/           embeddings_client, qdrant_store, tiler_client, vlm_client
+  clients/           retriever_client, qdrant_store, tiler_client, vlm_client
 docs/                documentation (see the table above)
 deploy/service/      virag + tiler + Qdrant: docker-compose.yaml, .env.example, tiler metadata schema
-deploy/embeddings/   vLLM embeddings stack: docker-compose.yaml, .env.example, serve_embeddings.example.sh
+deploy/retriever/   vLLM retriever stack: docker-compose.yaml, .env.example, serve_retriever.example.sh
 ```
 
 ## Development

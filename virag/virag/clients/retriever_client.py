@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 
 from virag.clients.http_service import OpenAIService
-from virag.settings import EmbeddingsSettings, HttpSettings
+from virag.settings import HttpSettings, RetrieverSettings
 
 
-class EmbeddingsClient(OpenAIService):
+class RetrieverClient(OpenAIService):
     def __init__(
         self,
         base_url: str,
@@ -28,16 +28,16 @@ class EmbeddingsClient(OpenAIService):
 
 
     @classmethod
-    def from_settings(cls, es: EmbeddingsSettings, hs: HttpSettings) -> EmbeddingsClient:
+    def from_settings(cls, rs: RetrieverSettings, hs: HttpSettings) -> RetrieverClient:
         return cls(
-            base_url=es.base_url,
-            model_name=es.model_name,
-            api_key=es.api_key,
-            chunk_size=es.chunk_size,
-            timeout=es.timeout,
-            connect_timeout=es.connect_timeout,
-            max_connections=es.max_connections,
-            max_retries=es.max_retries,
+            base_url=rs.base_url,
+            model_name=rs.model_name,
+            api_key=rs.api_key,
+            chunk_size=rs.chunk_size,
+            timeout=rs.timeout,
+            connect_timeout=rs.connect_timeout,
+            max_connections=rs.max_connections,
+            max_retries=rs.max_retries,
             backoff_base=hs.backoff_base,
             backoff_cap=hs.backoff_cap,
         )

@@ -16,8 +16,8 @@ services:
       - path: .env
         required: true
 
-    # Embeddings run in a separate stack; virag reaches them via the host
-    # (EMBEDDINGS_BASE_URL=http://host.docker.internal:<port>/v1).
+    # The retriever runs in a separate stack; virag reaches it via the host
+    # (RETRIEVER_BASE_URL=http://host.docker.internal:<port>/v1).
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

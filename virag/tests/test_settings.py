@@ -20,11 +20,11 @@ def _base_env(monkeypatch):
 _ALL_KEYS = {
     "VIRAG_HOST", "VIRAG_PORT", "TILER_DB_SECRET", "VIRAG_TOP_N", "VIRAG_SCORE_THRESHOLD",
     "VIRAG_FRAMING_TEXT", "QDRANT_BASE_URL", "QDRANT_COLLECTION_NAME", "QDRANT_VECTOR_SIZE",
-    "QDRANT_DISTANCE_TYPE", "EMBEDDINGS_BASE_URL", "VLLM_SERVED_MODEL_NAME", "VLLM_API_KEY",
-    "EMBEDDINGS_CHUNK_SIZE", "EMBEDDINGS_TIMEOUT_SEC", "TILER_BASE_URL", "TILER_TIMEOUT_SEC",
+    "QDRANT_DISTANCE_TYPE", "RETRIEVER_BASE_URL", "RETRIEVER_MODEL_NAME", "RETRIEVER_API_KEY",
+    "RETRIEVER_CHUNK_SIZE", "RETRIEVER_TIMEOUT_SEC", "TILER_BASE_URL", "TILER_TIMEOUT_SEC",
     "VLM_BASE_URL", "VLM_MODEL_NAME", "VLM_API_KEY", "VLM_TIMEOUT_SEC",
     "VLM_CONNECT_TIMEOUT_SEC", "VLM_MAX_CONNECTIONS", "VLM_MAX_CONCURRENCY", "VLM_MAX_RETRIES",
-    "EMBEDDINGS_CONNECT_TIMEOUT_SEC", "EMBEDDINGS_MAX_CONNECTIONS", "EMBEDDINGS_MAX_RETRIES",
+    "RETRIEVER_CONNECT_TIMEOUT_SEC", "RETRIEVER_MAX_CONNECTIONS", "RETRIEVER_MAX_RETRIES",
     "TILER_CONNECT_TIMEOUT_SEC", "TILER_MAX_CONNECTIONS", "TILER_MAX_RETRIES",
     "HTTP_RETRY_BACKOFF_BASE_SEC", "HTTP_RETRY_BACKOFF_CAP_SEC",
 }
@@ -123,7 +123,7 @@ def test_http_transport_defaults(monkeypatch):
 
     assert s.http_settings.backoff_base == 0.25
     assert s.http_settings.backoff_cap == 8.0
-    for svc in (s.embeddings_settings, s.tiler_settings, s.vlm_settings):
+    for svc in (s.retriever_settings, s.tiler_settings, s.vlm_settings):
         assert svc.connect_timeout == 10
         assert svc.max_connections == 100
         assert svc.max_retries == 3

@@ -50,7 +50,7 @@ async def chat_completions(request: Request):
 async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | None:
     """Retrieve tiles for the query, inject them into the last user message, and
     return the sources list when the caller asked for it (else None)."""
-    embeddings = request.app.state.embeddings
+    retriever = request.app.state.retriever
     store = request.app.state.store
     tiler = request.app.state.tiler
 
@@ -65,7 +65,7 @@ async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | N
 
     log.info("rag query: top_n=%d threshold=%s preview=%r", config["top_n"], config["score_threshold"], query[:120])
 
-    vector = (await embeddings.embed_texts([query]))[0]
+    vector = (await retriever.embed_texts([query]))[0]
     hits = await store.query(vector, top_n=config["top_n"])
 
     if config["score_threshold"] is not None:

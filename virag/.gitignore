@@ -1424,7 +1424,7 @@ erl_crash.dump
 .neptune
 
 ### local runtime 
-deploy/embeddings/serve_embeddings.sh
+deploy/retriever/serve_retriever.sh
 ../.claude
 .claude
 !scripts

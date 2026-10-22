@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from conftest import FakeEmbeddings, FakeHit, FakeStore, FakeTiler, FakeVLM, hit_for
+from conftest import FakeHit, FakeRetriever, FakeStore, FakeTiler, FakeVLM, hit_for
 
 
 def _rag_store():
@@ -13,7 +13,7 @@ def _rag_store():
 
 def test_passthrough_without_rag(make_client):
     vlm = FakeVLM()
-    client = make_client(vlm=vlm, store=FakeStore(), embeddings=FakeEmbeddings(), tiler=FakeTiler())
+    client = make_client(vlm=vlm, store=FakeStore(), retriever=FakeRetriever(), tiler=FakeTiler())
 
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     r = client.post("/v1/chat/completions", json=body)
@@ -25,15 +25,15 @@ def test_passthrough_without_rag(make_client):
 
 
 def test_rag_injects_tiles(make_client):
-    vlm, emb, tiler = FakeVLM(), FakeEmbeddings(), FakeTiler()
-    client = make_client(vlm=vlm, store=_rag_store(), embeddings=emb, tiler=tiler)
+    vlm, retriever, tiler = FakeVLM(), FakeRetriever(), FakeTiler()
+    client = make_client(vlm=vlm, store=_rag_store(), retriever=retriever, tiler=tiler)
 
     r = client.post("/v1/chat/completions", json={
         "model": "m", "messages": [{"role": "user", "content": "what is revenue"}], "rag": True,
     })
 
     assert r.status_code == 200
-    assert emb.text_calls == [["what is revenue"]]           # query embedded once
+    assert retriever.text_calls == [["what is revenue"]]           # query embedded once
     assert tiler.get_tile_calls == [("doc-a", 0), ("doc-a", 1)]
 
     sent = vlm.complete_bodies[0]
@@ -45,7 +45,7 @@ def test_rag_injects_tiles(make_client):
 
 
 def test_rag_sources_in_json(make_client):
-    client = make_client(vlm=FakeVLM(), store=_rag_store(), embeddings=FakeEmbeddings(), tiler=FakeTiler())
+    client = make_client(vlm=FakeVLM(), store=_rag_store(), retriever=FakeRetriever(), tiler=FakeTiler())
 
     r = client.post("/v1/chat/completions", json={
         "model": "m", "messages": [{"role": "user", "content": "q"}],
@@ -65,7 +65,7 @@ def test_rag_integrity_mismatch_skips_tile(make_client):
     })
     vlm = FakeVLM()
     client = make_client(vlm=vlm, store=FakeStore(hits=[bad_hit]),
-                         embeddings=FakeEmbeddings(), tiler=FakeTiler())
+                         retriever=FakeRetriever(), tiler=FakeTiler())
 
     r = client.post("/v1/chat/completions", json={
         "model": "m", "messages": [{"role": "user", "content": "q"}],
@@ -79,7 +79,7 @@ def test_rag_integrity_mismatch_skips_tile(make_client):
 
 
 def test_rag_without_query_text_is_422(make_client):
-    client = make_client(vlm=FakeVLM(), store=_rag_store(), embeddings=FakeEmbeddings(), tiler=FakeTiler())
+    client = make_client(vlm=FakeVLM(), store=_rag_store(), retriever=FakeRetriever(), tiler=FakeTiler())
 
     r = client.post("/v1/chat/completions", json={
         "model": "m", "messages": [{"role": "system", "content": "only system"}], "rag": True,
@@ -91,7 +91,7 @@ def test_rag_without_query_text_is_422(make_client):
 
 def test_streaming_sources_spliced_before_done(make_client):
     vlm = FakeVLM(stream_chunks=[b"data: {\"choices\":[{}]}\n\n", b"data: [DONE]\n\n"])
-    client = make_client(vlm=vlm, store=_rag_store(), embeddings=FakeEmbeddings(), tiler=FakeTiler())
+    client = make_client(vlm=vlm, store=_rag_store(), retriever=FakeRetriever(), tiler=FakeTiler())
 
     r = client.post("/v1/chat/completions", json={
         "model": "m", "messages": [{"role": "user", "content": "q"}],
@@ -105,14 +105,14 @@ def test_streaming_sources_spliced_before_done(make_client):
 
 
 def test_invalid_json_body_is_422(make_client):
-    client = make_client(vlm=FakeVLM(), store=FakeStore(), embeddings=FakeEmbeddings(), tiler=FakeTiler())
+    client = make_client(vlm=FakeVLM(), store=FakeStore(), retriever=FakeRetriever(), tiler=FakeTiler())
     r = client.post("/v1/chat/completions", content="not json",
                     headers={"content-type": "application/json"})
     assert r.status_code == 422
 
 
 def test_non_object_body_is_422(make_client):
-    client = make_client(vlm=FakeVLM(), store=FakeStore(), embeddings=FakeEmbeddings(), tiler=FakeTiler())
+    client = make_client(vlm=FakeVLM(), store=FakeStore(), retriever=FakeRetriever(), tiler=FakeTiler())
     r = client.post("/v1/chat/completions", content=json.dumps([1, 2, 3]),
                     headers={"content-type": "application/json"})
     assert r.status_code == 422

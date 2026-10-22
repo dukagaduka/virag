@@ -42,7 +42,7 @@ class HttpSettings:
 
 
 @dataclass(slots=True, frozen=True)
-class EmbeddingsSettings:
+class RetrieverSettings:
     base_url: str
     model_name: str
     api_key: str
@@ -90,7 +90,7 @@ class Settings:
     rag_settings: RagSettings
     http_settings: HttpSettings
     qdrant_settings: QdrantStoreSettings
-    embeddings_settings: EmbeddingsSettings
+    retriever_settings: RetrieverSettings
     tiler_settings: TilerSettings
     vlm_settings: VLMSettings
     reconcile_settings: ReconcileSettings
@@ -193,51 +193,51 @@ class Settings:
 
 
         # -----------------------------
-        # EMBEDDINGS
+        # RETRIEVER
         # -----------------------------
 
-        embeddings_base_url = os.environ.get(
-            "EMBEDDINGS_BASE_URL",
-            "http://embeddings-vllm-virag:8000/v1"
+        retriever_base_url = os.environ.get(
+            "RETRIEVER_BASE_URL",
+            "http://retriever-vllm-virag:8000/v1"
         )
 
-        embeddings_model_name = os.environ.get(
-            "VLLM_SERVED_MODEL_NAME",
-            "embeddings-model"
+        retriever_model_name = os.environ.get(
+            "RETRIEVER_MODEL_NAME",
+            "retriever-model"
         )
 
-        embeddings_api_key = os.environ.get(
-            "VLLM_API_KEY",
+        retriever_api_key = os.environ.get(
+            "RETRIEVER_API_KEY",
             "dummy"
         )
 
-        embeddings_chunk_size = int_coercion(
-            os.environ.get("EMBEDDINGS_CHUNK_SIZE", "16"),
-            "EMBEDDINGS_CHUNK_SIZE",
+        retriever_chunk_size = int_coercion(
+            os.environ.get("RETRIEVER_CHUNK_SIZE", "16"),
+            "RETRIEVER_CHUNK_SIZE",
             low=1
         )
 
-        embeddings_timeout = int_coercion(
-            os.environ.get("EMBEDDINGS_TIMEOUT_SEC", "60"),
-            "EMBEDDINGS_TIMEOUT_SEC",
+        retriever_timeout = int_coercion(
+            os.environ.get("RETRIEVER_TIMEOUT_SEC", "60"),
+            "RETRIEVER_TIMEOUT_SEC",
             low=1
         )
 
-        embeddings_connect_timeout = int_coercion(
-            os.environ.get("EMBEDDINGS_CONNECT_TIMEOUT_SEC", "10"),
-            "EMBEDDINGS_CONNECT_TIMEOUT_SEC",
+        retriever_connect_timeout = int_coercion(
+            os.environ.get("RETRIEVER_CONNECT_TIMEOUT_SEC", "10"),
+            "RETRIEVER_CONNECT_TIMEOUT_SEC",
             low=1
         )
 
-        embeddings_max_connections = int_coercion(
-            os.environ.get("EMBEDDINGS_MAX_CONNECTIONS", "100"),
-            "EMBEDDINGS_MAX_CONNECTIONS",
+        retriever_max_connections = int_coercion(
+            os.environ.get("RETRIEVER_MAX_CONNECTIONS", "100"),
+            "RETRIEVER_MAX_CONNECTIONS",
             low=1
         )
 
-        embeddings_max_retries = int_coercion(
-            os.environ.get("EMBEDDINGS_MAX_RETRIES", "3"),
-            "EMBEDDINGS_MAX_RETRIES",
+        retriever_max_retries = int_coercion(
+            os.environ.get("RETRIEVER_MAX_RETRIES", "3"),
+            "RETRIEVER_MAX_RETRIES",
             low=0
         )
 
@@ -367,15 +367,15 @@ class Settings:
                 chunk_byte_budget=qdrant_chunk_byte_budget,
                 max_batch_chunks=qdrant_max_batch_chunks,
             ),
-            embeddings_settings=EmbeddingsSettings(
-                base_url=embeddings_base_url,
-                model_name=embeddings_model_name,
-                api_key=embeddings_api_key,
-                chunk_size=embeddings_chunk_size,
-                timeout=embeddings_timeout,
-                connect_timeout=embeddings_connect_timeout,
-                max_connections=embeddings_max_connections,
-                max_retries=embeddings_max_retries,
+            retriever_settings=RetrieverSettings(
+                base_url=retriever_base_url,
+                model_name=retriever_model_name,
+                api_key=retriever_api_key,
+                chunk_size=retriever_chunk_size,
+                timeout=retriever_timeout,
+                connect_timeout=retriever_connect_timeout,
+                max_connections=retriever_max_connections,
+                max_retries=retriever_max_retries,
             ),
             tiler_settings=TilerSettings(
                 base_url=tiler_base_url,

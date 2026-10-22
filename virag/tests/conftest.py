@@ -24,7 +24,7 @@ from virag.api import proxy as proxy_api
 from virag.clients.tiler_client import Tile, TileResult
 from virag.errors import install_error_handlers
 from virag.settings import (
-    EmbeddingsSettings,
+    RetrieverSettings,
     HttpSettings,
     QdrantStoreSettings,
     RagSettings,
@@ -54,7 +54,7 @@ class FakeHit:
 # Fake backends
 # ---------------------------------------------------------------------------
 
-class FakeEmbeddings:
+class FakeRetriever:
 
     def __init__(self, dim: int = 4):
         self.dim = dim
@@ -237,8 +237,8 @@ def make_settings(**overrides) -> Settings:
             base_url="http://qdrant", collection_name="c", vector_size=4, distance_type=Distance.COSINE,
             chunk_byte_budget=24 * 1024 * 1024, max_batch_chunks=1024,
         ),
-        embeddings_settings=EmbeddingsSettings(
-            base_url="http://emb/v1", model_name="emb", api_key="k-emb", chunk_size=16, timeout=60,
+        retriever_settings=RetrieverSettings(
+            base_url="http://retriever/v1", model_name="retriever", api_key="k-retriever", chunk_size=16, timeout=60,
             connect_timeout=10, max_connections=100, max_retries=0,
         ),
         tiler_settings=TilerSettings(
@@ -252,7 +252,7 @@ def make_settings(**overrides) -> Settings:
     )
 
 
-def build_app(*, settings=None, store=None, embeddings=None, tiler=None, vlm=None) -> FastAPI:
+def build_app(*, settings=None, store=None, retriever=None, tiler=None, vlm=None) -> FastAPI:
     """The same routers as create_app(), but no lifespan — state is injected."""
     app = FastAPI()
     install_error_handlers(app)
@@ -264,8 +264,8 @@ def build_app(*, settings=None, store=None, embeddings=None, tiler=None, vlm=Non
     app.state.settings = settings if settings is not None else make_settings()
     if store is not None:
         app.state.store = store
-    if embeddings is not None:
-        app.state.embeddings = embeddings
+    if retriever is not None:
+        app.state.retriever = retriever
     if tiler is not None:
         app.state.tiler = tiler
     if vlm is not None:

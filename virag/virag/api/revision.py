@@ -19,8 +19,8 @@ router = APIRouter()
 )
 async def revision(request: Request):
     store = request.app.state.store
-    embeddings = request.app.state.embeddings
+    retriever = request.app.state.retriever
     tiler = request.app.state.tiler
 
     log.info("revision requested")
-    return await revise(store, tiler, embeddings)
+    return await revise(store, tiler, retriever)

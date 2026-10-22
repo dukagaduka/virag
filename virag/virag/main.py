@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from virag.settings import Settings
 from virag.errors import ApiError, install_error_handlers
 from virag.clients.qdrant_store import QdrantStore
-from virag.clients.embeddings_client import EmbeddingsClient
+from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerService
 from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding, enforce_metadata_schema, secret_hash
@@ -72,8 +72,8 @@ async def lifespan(app: FastAPI):
         store = QdrantStore.from_settings(settings.qdrant_settings)
         stack.push_async_callback(store.close)
 
-        embeddings = EmbeddingsClient.from_settings(settings.embeddings_settings, settings.http_settings)
-        stack.push_async_callback(embeddings.close)
+        retriever = RetrieverClient.from_settings(settings.retriever_settings, settings.http_settings)
+        stack.push_async_callback(retriever.close)
 
         tiler = TilerService.from_settings(settings.tiler_settings, settings.http_settings)
         stack.push_async_callback(tiler.close)
@@ -86,7 +86,7 @@ async def lifespan(app: FastAPI):
 
         # Every dependency is essential; a failed check refuses startup.
         await store.create_collection()
-        await _require_dependency("embeddings", embeddings.check_connection())
+        await _require_dependency("retriever", retriever.check_connection())
         await _require_dependency("tiler", tiler.check_connection())
         await _require_dependency("vlm", vlm.check_connection())
 
@@ -96,28 +96,28 @@ async def lifespan(app: FastAPI):
         await enforce_metadata_schema(tiler)
 
         # Repair any partial/orphaned enrolls left by an earlier crash before serving.
-        await reconcile(store, tiler, embeddings, settings.reconcile_settings)
+        await reconcile(store, tiler, retriever, settings.reconcile_settings)
 
         # Registered last, so it is cancelled first — before the clients it uses close.
         reconcile_task = asyncio.create_task(
-            run_periodic(store, tiler, embeddings, settings.reconcile_settings)
+            run_periodic(store, tiler, retriever, settings.reconcile_settings)
         )
         stack.push_async_callback(_cancel, reconcile_task)
 
         app.state.settings = settings
         app.state.store = store
-        app.state.embeddings = embeddings
+        app.state.retriever = retriever
         app.state.tiler = tiler
         app.state.vlm = vlm
         app.state.qdrant_http = qdrant_http
 
         log.info(
-            "ready: qdrant=%s vector_size=%d collection=%s distance=%s embeddings=%s tiler=%s vlm=%s model=%s render_version=%s",
+            "ready: qdrant=%s vector_size=%d collection=%s distance=%s retriever=%s tiler=%s vlm=%s model=%s render_version=%s",
             settings.qdrant_settings.base_url,
             settings.qdrant_settings.vector_size,
             settings.qdrant_settings.collection_name,
             settings.qdrant_settings.distance_type.value,
-            settings.embeddings_settings.base_url,
+            settings.retriever_settings.base_url,
             settings.tiler_settings.base_url,
             settings.vlm_settings.base_url,
             settings.vlm_settings.model_name,

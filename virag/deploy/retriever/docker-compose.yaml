@@ -1,19 +1,19 @@
 services:
-  embeddings-vllm-virag:
-    image: ${VLLM_DEPLOY_IMAGE}
-    container_name: ${VLLM_DEPLOY_CONTAINER_NAME}
+  retriever-vllm-virag:
+    image: ${RETRIEVER_DEPLOY_IMAGE}
+    container_name: ${RETRIEVER_DEPLOY_CONTAINER_NAME}
     entrypoint: ["/bin/bash", "-lc"]
     command: ["bash /start.sh"]
     shm_size: "16g"
 
     ports:
-      - "${VLLM_DEPLOY_HOST}:${VLLM_DEPLOY_PORT}:8000"
+      - "${RETRIEVER_DEPLOY_HOST}:${RETRIEVER_DEPLOY_PORT}:8000"
     volumes:
-      - ${VLLM_DEPLOY_MODEL_PATH}:/model:ro
+      - ${RETRIEVER_DEPLOY_MODEL_PATH}:/model:ro
       # LoRA adapter — internal path is the constant /adapter; only the host path
-      # (VLLM_DEPLOY_ADAPTER_PATH) varies. Point it at the base model dir if unused.
-      - ${VLLM_DEPLOY_ADAPTER_PATH}:/adapter:ro
-      - ./serve_embeddings.sh:/start.sh:ro
+      # (RETRIEVER_DEPLOY_ADAPTER_PATH) varies. Point it at the base model dir if unused.
+      - ${RETRIEVER_DEPLOY_ADAPTER_PATH}:/adapter:ro
+      - ./serve_retriever.sh:/start.sh:ro
 
     ulimits:
       memlock: -1
