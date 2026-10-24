@@ -25,26 +25,27 @@ _HOP_BY_HOP = {
 
 _METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
-# The Qdrant passthrough is a debug/ops surface, not a hot path: a small fixed pool.
-_QDRANT_TIMEOUT = 30
-_QDRANT_CONNECT_TIMEOUT = 10
-_QDRANT_MAX_CONNECTIONS = 16
-
 
 class QdrantProxyService(HttpService):
     """Raw REST access to Qdrant for the /qdrant passthrough; QdrantStore keeps its
-    own client for the data path."""
+    own gRPC client for the data path."""
+
+    # A debug/ops surface, not a hot path: a small fixed pool, never replayed.
+    CONNECT_TIMEOUT = 10
+    MAX_CONNECTIONS = 16
+
 
     @classmethod
     def from_settings(cls, qs: QdrantStoreSettings, hs: HttpSettings) -> QdrantProxyService:
         return cls(
             base_url=qs.base_url,
-            timeout=_QDRANT_TIMEOUT,
-            connect_timeout=_QDRANT_CONNECT_TIMEOUT,
-            max_connections=_QDRANT_MAX_CONNECTIONS,
+            timeout=qs.timeout_sec,
+            connect_timeout=cls.CONNECT_TIMEOUT,
+            max_connections=cls.MAX_CONNECTIONS,
+            max_concurrency=0,
             max_retries=0,
-            backoff_base=hs.backoff_base,
-            backoff_cap=hs.backoff_cap,
+            backoff_base=hs.backoff_base_sec,
+            backoff_cap=hs.backoff_cap_sec,
         )
 
 

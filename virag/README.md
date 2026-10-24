@@ -89,7 +89,7 @@ deploy/retriever/   vLLM retriever stack: docker-compose.yaml, .env.example, ser
 ## Development
 
 ```bash
-pip install -e '.[dev]'    # fastapi, httpx2, qdrant-client, pytest
+pip install -e '.[dev]'    # fastapi, pydantic-settings, httpx2, qdrant-client, pytest
 pytest -q                  # tests live in tests/
 ```
 

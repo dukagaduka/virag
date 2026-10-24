@@ -20,23 +20,23 @@ from virag.errors import ApiError
 from virag.utils import error_body
 
 
-# Upstream replies that signal a transient overload/outage worth replaying.
-RETRY_STATUSES = frozenset({429, 502, 503, 504})
-
-# Transport failures where the request can be safely replayed. ReadTimeout and
-# PoolTimeout are deliberately absent: a slow upstream or our own exhausted pool
-# only gets worse under extra load.
-RETRY_ERRORS = (
-    httpx2.ConnectError,
-    httpx2.ConnectTimeout,
-    httpx2.RemoteProtocolError,
-    httpx2.ReadError,
-    httpx2.WriteError,
-)
-
-
 class HttpService(ABC):
     """An upstream reached over one pooled, keep-alive HTTP client."""
+
+    # Upstream replies that signal a transient overload/outage worth replaying.
+    RETRY_STATUSES = frozenset({429, 502, 503, 504})
+
+    # Transport failures where the request can be safely replayed. ReadTimeout and
+    # PoolTimeout are deliberately absent: a slow upstream or our own exhausted pool
+    # only gets worse under extra load.
+    RETRY_ERRORS = (
+        httpx2.ConnectError,
+        httpx2.ConnectTimeout,
+        httpx2.RemoteProtocolError,
+        httpx2.ReadError,
+        httpx2.WriteError,
+    )
+
 
     def __init__(
         self,
@@ -48,7 +48,7 @@ class HttpService(ABC):
         max_retries: int,
         backoff_base: float,
         backoff_cap: float,
-        max_concurrency: int = 0,
+        max_concurrency: int,
         headers: dict | None = None,
     ):
 
@@ -116,7 +116,7 @@ class HttpService(ABC):
                 request = self.http.build_request(method, url, **kwargs)
                 response = await self.http.send(request, stream=stream)
 
-            except RETRY_ERRORS:
+            except self.RETRY_ERRORS:
                 if last:
                     raise
 
@@ -125,7 +125,7 @@ class HttpService(ABC):
                 attempt += 1
                 continue
 
-            if last or response.status_code not in RETRY_STATUSES:
+            if last or response.status_code not in self.RETRY_STATUSES:
                 return response
 
             delay = self._retry_after(response) or self._backoff(attempt)
@@ -249,6 +249,12 @@ class HttpService(ABC):
 class OpenAIService(HttpService):
     """An OpenAI-compatible upstream (vLLM or hosted): Bearer auth on every request
     and a `/models` check that the configured model is actually served."""
+
+    # A 1x1 PNG (base64) — the smallest valid image to probe how a model takes image inputs.
+    PROBE_IMAGE = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+
 
     def __init__(
         self,

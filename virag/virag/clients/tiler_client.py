@@ -112,13 +112,13 @@ class TilerService(HttpService):
     def from_settings(cls, ts: TilerSettings, hs: HttpSettings) -> TilerService:
         return cls(
             base_url=ts.base_url,
-            timeout=ts.timeout,
+            timeout=ts.timeout_sec,
             max_concurrency=ts.max_concurrency,
-            connect_timeout=ts.connect_timeout,
+            connect_timeout=ts.connect_timeout_sec,
             max_connections=ts.max_connections,
             max_retries=ts.max_retries,
-            backoff_base=hs.backoff_base,
-            backoff_cap=hs.backoff_cap,
+            backoff_base=hs.backoff_base_sec,
+            backoff_cap=hs.backoff_cap_sec,
         )
 
 

@@ -15,7 +15,8 @@ from virag.errors import ApiError
 from virag.utils import gather
 
 
-_HTTP = dict(timeout=5, connect_timeout=5, max_connections=4, backoff_base=0, backoff_cap=0)
+_HTTP = dict(timeout=5, connect_timeout=5, max_connections=4, max_concurrency=0, backoff_base=0, backoff_cap=0)
+_RETRIEVER = dict(batch_size=32, bulk_priority=0, image_batching="auto")
 
 
 class _Service(HttpService):
@@ -114,7 +115,7 @@ def test_read_timeout_is_not_retried():
 
 def test_backoff_is_capped_and_jittered():
     svc = _Service("http://up", max_retries=0, timeout=5, connect_timeout=5, max_connections=4,
-                   backoff_base=1, backoff_cap=4)
+                   max_concurrency=0, backoff_base=1, backoff_cap=4)
 
     delays = [svc._backoff(10) for _ in range(200)]
 
@@ -124,7 +125,7 @@ def test_backoff_is_capped_and_jittered():
 
 def test_retry_after_is_honoured_and_capped():
     svc = _Service("http://up", max_retries=0, timeout=5, connect_timeout=5, max_connections=4,
-                   backoff_base=1, backoff_cap=4)
+                   max_concurrency=0, backoff_base=1, backoff_cap=4)
 
     assert svc._retry_after(httpx2.Response(429, headers={"retry-after": "2"})) == 2
     assert svc._retry_after(httpx2.Response(429, headers={"retry-after": "60"})) == 4
@@ -200,7 +201,7 @@ def test_gather_cancels_siblings_and_raises_plain_error():
 # ---------------------------------------------------------------------------
 
 def test_retriever_sends_bearer_and_orders_vectors():
-    retriever = RetrieverClient("http://retriever/v1", "retriever", "k-retriever", max_retries=0, **_HTTP)
+    retriever = RetrieverClient("http://retriever/v1", "retriever", "k-retriever", max_retries=0, **_RETRIEVER, **_HTTP)
 
     def handler(req, n):
         assert req.headers["authorization"] == "Bearer k-retriever"
@@ -215,7 +216,7 @@ def test_retriever_sends_bearer_and_orders_vectors():
 
 
 def test_openai_check_rejects_missing_model():
-    retriever = RetrieverClient("http://retriever/v1", "retriever", "k", max_retries=0, **_HTTP)
+    retriever = RetrieverClient("http://retriever/v1", "retriever", "k", max_retries=0, **_RETRIEVER, **_HTTP)
     _mock(retriever, lambda req, n: httpx2.Response(200, json={"data": [{"id": "other"}]}))
 
     with pytest.raises(ApiError) as exc:
@@ -267,7 +268,7 @@ def test_tiler_stream_yields_events():
 
 
 def test_tiler_bulk_get_tile_is_capped_interactive_is_not():
-    tiler = TilerService("http://tiler", max_retries=0, max_concurrency=2, **_HTTP)
+    tiler = TilerService("http://tiler", max_retries=0, **{**_HTTP, "max_concurrency": 2})
     in_flight = {"now": 0, "peak": 0}
 
     async def handler(req, n):

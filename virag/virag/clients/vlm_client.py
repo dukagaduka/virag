@@ -10,13 +10,6 @@ from virag.settings import HttpSettings, VLMSettings
 from virag.utils import error_body
 
 
-# A 1x1 PNG — the smallest valid image to probe whether the model accepts image inputs.
-_PROBE_IMAGE = (
-    "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-)
-
-
 class VLMClient(OpenAIService):
     """Upstream vision chat model. `max_concurrency` (via `_guard`) shields a fragile
     or remote VLM from simultaneous multimodal requests; a slot is held for the whole
@@ -34,12 +27,12 @@ class VLMClient(OpenAIService):
             model_name=vs.model_name,
             api_key=vs.api_key,
             max_concurrency=vs.max_concurrency,
-            timeout=vs.timeout,
-            connect_timeout=vs.connect_timeout,
+            timeout=vs.timeout_sec,
+            connect_timeout=vs.connect_timeout_sec,
             max_connections=vs.max_connections,
             max_retries=vs.max_retries,
-            backoff_base=hs.backoff_base,
-            backoff_cap=hs.backoff_cap,
+            backoff_base=hs.backoff_base_sec,
+            backoff_cap=hs.backoff_cap_sec,
         )
 
 
@@ -58,7 +51,7 @@ class VLMClient(OpenAIService):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Reply with the single word: ok"},
-                        {"type": "image_url", "image_url": {"url": _PROBE_IMAGE}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.PROBE_IMAGE}"}},
                     ],
                 }
             ],

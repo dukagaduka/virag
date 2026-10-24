@@ -18,6 +18,8 @@ def _base_env(monkeypatch):
 
 
 _ALL_KEYS = {
+    "VIRAG_SELF_HEAL", "VIRAG_RECONCILE_INTERVAL_SEC", "VIRAG_PENDING_TTL_SEC",
+    "QDRANT_GRPC_PORT", "QDRANT_TIMEOUT_SEC", "QDRANT_MAX_RETRIES", "QDRANT_CHUNK_SIZE", "QDRANT_MAX_BATCH_CHUNKS",
     "VIRAG_HOST", "VIRAG_PORT", "TILER_DB_SECRET", "VIRAG_TOP_N", "VIRAG_SCORE_THRESHOLD",
     "VIRAG_FRAMING_TEXT", "QDRANT_BASE_URL", "QDRANT_COLLECTION_NAME", "QDRANT_VECTOR_SIZE",
     "QDRANT_DISTANCE_TYPE", "RETRIEVER_BASE_URL", "RETRIEVER_MODEL_NAME", "RETRIEVER_API_KEY",
@@ -122,10 +124,10 @@ def test_http_transport_defaults(monkeypatch):
     _base_env(monkeypatch)
     s = Settings.from_env()
 
-    assert s.http_settings.backoff_base == 0.25
-    assert s.http_settings.backoff_cap == 8.0
+    assert s.http_settings.backoff_base_sec == 0.25
+    assert s.http_settings.backoff_cap_sec == 8.0
     for svc in (s.retriever_settings, s.tiler_settings, s.vlm_settings):
-        assert svc.connect_timeout == 10
+        assert svc.connect_timeout_sec == 10
         assert svc.max_connections == 100
         assert svc.max_retries == 3
 
@@ -134,7 +136,7 @@ def test_vlm_timeout_below_old_floor_allowed(monkeypatch):
     _base_env(monkeypatch)
     monkeypatch.setenv("VLM_TIMEOUT_SEC", "30")
 
-    assert Settings.from_env().vlm_settings.timeout == 30
+    assert Settings.from_env().vlm_settings.timeout_sec == 30
 
 
 def test_vlm_concurrency_cannot_exceed_pool(monkeypatch):
@@ -188,4 +190,20 @@ def test_tiler_concurrency_default_and_pool_bound(monkeypatch):
 
     monkeypatch.setenv("TILER_MAX_CONNECTIONS", "8")
     with pytest.raises(SettingsError, match="TILER_MAX_CONCURRENCY"):
+        Settings.from_env()
+
+
+def test_empty_required_var_counts_as_missing(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("VLM_BASE_URL", "")
+
+    with pytest.raises(SettingsError, match="VLM_BASE_URL"):
+        Settings.from_env()
+
+
+def test_aliased_var_is_named_in_errors(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("VIRAG_RECONCILE_INTERVAL_SEC", "-1")
+
+    with pytest.raises(SettingsError, match=r"^`VIRAG_RECONCILE_INTERVAL_SEC`"):
         Settings.from_env()

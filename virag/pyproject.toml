@@ -12,7 +12,9 @@ dependencies = [
     "fastapi>=0.140,<1",
     "uvicorn[standard]>=0.30",
     "numpy>=2.4,<3",
-    "qdrant-client>=1.17,<2",
+    "qdrant-client>=1.20,<1.21",
+    "pydantic>=2.11,<3",
+    "pydantic-settings>=2.16,<3",
     "httpx2>=2.16,<3",
     "python-multipart>=0.0.9",
 ]

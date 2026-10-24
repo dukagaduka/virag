@@ -7,7 +7,7 @@ with document-image tiles retrieved from a Qdrant + [doc-tiler](../../doc-tiler)
 backend, then forwarded. The client keeps talking to one OpenAI-shaped endpoint and
 opts into retrieval per request.
 
-- **Stack:** Python 3.11+, FastAPI, async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async, over gRPC).
+- **Stack:** Python 3.11+, FastAPI, pydantic-settings (configuration), async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async, over gRPC).
 - **Backends (all external):** a retriever server (vLLM, OpenAI-compatible), the
   doc-tiler service, a Qdrant instance, and the upstream VLM.
 - **Scope:** the gateway only. Tiling/rendering lives in doc-tiler; embedding lives in
@@ -235,7 +235,7 @@ journal + drain.
 ```
 virag/
   main.py            # app, lifespan (clients, dependency checks, binding, reconcile), router order
-  settings.py        # Settings.from_env() — every env var and its validation
+  settings.py        # pydantic-settings sections: every env var, its default and bounds
   binding.py         # the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
   reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and the shared re-embed stream
   revision.py        # RevisionManager: background revision / rollback job, journal sync

@@ -1,10 +1,17 @@
-"""Basic Store Service settings"""
+"""Service settings: every environment variable, its default and its bounds — declared once.
+
+Each section is a pydantic-settings model read from its own env prefix, and a field's
+name is the variable's suffix (`RetrieverSettings.batch_size` ← `RETRIEVER_BATCH_SIZE`),
+so the declarations below double as the reference. An empty variable counts as unset.
+The few irregular names are spelled out with `validation_alias`.
+"""
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+from typing import Literal
 
+from pydantic import Field, ValidationError, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from qdrant_client.models import Distance
 
 
@@ -12,570 +19,207 @@ class SettingsError(Exception):
     """Raised when service configuration is invalid."""
 
 
-_IMAGE_BATCHING_MODES = ("auto", "on", "off")
-
 _DEFAULT_FRAMING_TEXT = (
     "The following image tiles are retrieved document context. "
     "Use them to answer the question."
 )
 
 
-@dataclass(slots=True, frozen=True)
-class RagSettings:
-    top_n: int
-    score_threshold: float | None
-    framing_text: str
+class _Section(BaseSettings):
+    """Shared config: immutable, empty variables count as unset, aliased fields can
+    still be set by name (tests, code)."""
+
+    model_config = SettingsConfigDict(
+        frozen=True,
+        env_ignore_empty=True,
+        extra="ignore",
+        validate_by_name=True,
+        protected_namespaces=(),
+    )
 
 
-@dataclass(slots=True, frozen=True)
-class QdrantStoreSettings:
+class _UpstreamSettings(_Section):
+    """Transport knobs every HTTP upstream shares: pool, deadlines, retries, concurrency cap."""
+
     base_url: str
-    grpc_port: int
-    timeout: int
-    max_retries: int
-    collection_name: str
-    vector_size: int
-    distance_type: Distance
-    chunk_byte_budget: int
-    max_batch_chunks: int
+    timeout_sec: int = Field(ge=1)              # read/write/pool deadline: max silence between bytes
+    connect_timeout_sec: int = Field(10, ge=1)
+    max_connections: int = Field(100, ge=1)     # pooled keep-alive connections
+    max_concurrency: int = Field(0, ge=0)       # 0 = unlimited
+    max_retries: int = Field(3, ge=0)           # transient failures only
+
+    @model_validator(mode="after")
+    def _concurrency_within_pool(self) -> _UpstreamSettings:
+        # Above the pool size a concurrency cap never binds — the pool would queue instead.
+        if self.max_concurrency > self.max_connections:
+            prefix = self.model_config.get("env_prefix", "")
+
+            raise ValueError(
+                f"`{prefix}MAX_CONCURRENCY` ({self.max_concurrency}) must not exceed "
+                f"`{prefix}MAX_CONNECTIONS` ({self.max_connections})."
+            )
+
+        return self
 
 
-@dataclass(slots=True, frozen=True)
-class HttpSettings:
-    backoff_base: float
-    backoff_cap: float
+class RagSettings(_Section):
+    """RAG defaults; a request's own `rag` object overrides them."""
+
+    model_config = SettingsConfigDict(env_prefix="VIRAG_")
+
+    top_n: int = Field(5, ge=1)
+    score_threshold: float | None = None        # unset = no threshold
+    framing_text: str = _DEFAULT_FRAMING_TEXT
 
 
-@dataclass(slots=True, frozen=True)
-class RetrieverSettings:
+class HttpSettings(_Section):
+    """Retry backoff shared by every upstream: full jitter, uniform over
+    [0, min(cap, base * 2^attempt)]; a numeric Retry-After wins, still capped."""
+
+    model_config = SettingsConfigDict(env_prefix="HTTP_RETRY_")
+
+    backoff_base_sec: float = Field(0.25, ge=0)
+    backoff_cap_sec: float = Field(8.0, ge=0)
+
+
+class QdrantStoreSettings(_Section):
+    """Qdrant: the data path speaks gRPC to the host of `base_url`; REST (the URL's port)
+    still serves the /qdrant proxy and the client's version check."""
+
+    model_config = SettingsConfigDict(env_prefix="QDRANT_")
+
+    base_url: str = "http://qdrant-service:6333"
+    grpc_port: int = Field(6334, ge=1, le=65535)
+    timeout_sec: int = Field(60, ge=1)          # per-call deadline
+    max_retries: int = Field(3, ge=0, le=4)     # gRPC caps a call at 5 attempts in total
+    collection_name: str = "store-collection"   # the serving alias
+    vector_size: int = Field(ge=1)
+    distance_type: Distance = Distance.COSINE
+    chunk_size: int = Field(24, ge=1)           # per-upsert budget, MB
+    max_batch_chunks: int = Field(1024, ge=1)   # hard cap on points per upsert
+
+    @property
+    def chunk_byte_budget(self) -> int:
+        return self.chunk_size * 1024 * 1024
+
+
+class RetrieverSettings(_UpstreamSettings):
+    """The retrieval embedding model behind an OpenAI-compatible `/embeddings` API."""
+
+    model_config = SettingsConfigDict(env_prefix="RETRIEVER_")
+
+    base_url: str = "http://retriever-vllm-virag:8000/v1"
+    model_name: str = "retriever-model"
+    api_key: str = "dummy"
+    timeout_sec: int = Field(60, ge=1)
+    batch_size: int = Field(32, ge=1)           # items per request
+    max_concurrency: int = Field(32, ge=0)      # bulk (ingest) calls only; queries bypass it
+    bulk_priority: int = Field(0, ge=0)         # 0 = never send vLLM `priority`
+    image_batching: Literal["auto", "on", "off"] = "auto"
+
+
+class TilerSettings(_UpstreamSettings):
+    model_config = SettingsConfigDict(env_prefix="TILER_")
+
+    base_url: str = "http://tiler-virag:8080"
+    timeout_sec: int = Field(120, ge=1)         # for the tile stream: the max gap between events
+    max_concurrency: int = Field(32, ge=0)      # bulk tile regeneration only; chat RAG bypasses it
+
+
+class VLMSettings(_UpstreamSettings):
+    """The upstream OpenAI-compatible vision chat model (external to the deployment)."""
+
+    model_config = SettingsConfigDict(env_prefix="VLM_")
+
     base_url: str
     model_name: str
-    api_key: str
-    batch_size: int
-    max_concurrency: int
-    bulk_priority: int
-    image_batching: str
-    timeout: int
-    connect_timeout: int
-    max_connections: int
-    max_retries: int
+    api_key: str = "dummy"
+    timeout_sec: int = Field(480, ge=1)         # covers a long prefill on big pixel-RAG prompts
 
 
-@dataclass(slots=True, frozen=True)
-class TilerSettings:
-    base_url: str
-    max_concurrency: int
-    timeout: int
-    connect_timeout: int
-    max_connections: int
-    max_retries: int
+class EnrollSettings(_Section):
+    model_config = SettingsConfigDict(env_prefix="VIRAG_ENROLL_")
+
+    batch_size: int = Field(32, ge=1)           # tiles per embed+upsert step
 
 
-@dataclass(slots=True, frozen=True)
-class VLMSettings:
-    base_url: str
-    model_name: str
-    api_key: str
-    timeout: int
-    connect_timeout: int
-    max_connections: int
-    max_concurrency: int
-    max_retries: int
+class ReconcileSettings(_Section):
+    model_config = SettingsConfigDict(env_prefix="VIRAG_")
+
+    self_heal: bool = True
+    interval_sec: int = Field(300, ge=0, validation_alias="VIRAG_RECONCILE_INTERVAL_SEC")  # 0 = startup only
+    pending_ttl_sec: int = Field(3600, ge=1)    # must exceed the longest enroll
 
 
-@dataclass(slots=True, frozen=True)
-class EnrollSettings:
-    batch_size: int
+class Settings(_Section):
+    model_config = SettingsConfigDict(env_prefix="VIRAG_")
 
+    host: str = "127.0.0.1"
+    port: int = Field(8080, ge=1, le=65535)
+    # Single binding secret shared with the tiler (and stamped on the Qdrant collection);
+    # read from TILER_DB_SECRET so all three agree on one value.
+    db_secret: str = Field("", validation_alias="TILER_DB_SECRET")
 
-@dataclass(slots=True, frozen=True)
-class ReconcileSettings:
-    self_heal: bool
-    interval_sec: int
-    pending_ttl_sec: int
+    rag_settings: RagSettings = Field(default_factory=RagSettings)
+    http_settings: HttpSettings = Field(default_factory=HttpSettings)
+    qdrant_settings: QdrantStoreSettings = Field(default_factory=QdrantStoreSettings)  # type: ignore[arg-type]
+    retriever_settings: RetrieverSettings = Field(default_factory=RetrieverSettings)
+    tiler_settings: TilerSettings = Field(default_factory=TilerSettings)
+    vlm_settings: VLMSettings = Field(default_factory=VLMSettings)  # type: ignore[arg-type]
+    enroll_settings: EnrollSettings = Field(default_factory=EnrollSettings)
+    reconcile_settings: ReconcileSettings = Field(default_factory=ReconcileSettings)
 
-
-@dataclass(slots=True, frozen=True)
-class Settings:
-    host: str
-    port: int
-    db_secret: str
-
-    rag_settings: RagSettings
-    http_settings: HttpSettings
-    qdrant_settings: QdrantStoreSettings
-    retriever_settings: RetrieverSettings
-    tiler_settings: TilerSettings
-    vlm_settings: VLMSettings
-    enroll_settings: EnrollSettings
-    reconcile_settings: ReconcileSettings
 
     @classmethod
     def from_env(cls) -> Settings:
-        service_host = os.environ.get("VIRAG_HOST", "127.0.0.1")
-
-        service_port = int_coercion(
-            os.environ.get("VIRAG_PORT", "8080"),
-            "VIRAG_PORT",
-            low=1,
-            high=65535,
-        )
-
-        # Single binding secret shared with the tiler (and stamped on the Qdrant
-        # collection); read from TILER_DB_SECRET so all three agree on one value.
-        service_db_secret = os.environ.get("TILER_DB_SECRET", "")
-
-        rag_top_n = int_coercion(
-            os.environ.get("VIRAG_TOP_N", "5"),
-            "VIRAG_TOP_N",
-            low=1,
-        )
-
-        rag_score_threshold_raw = os.environ.get("VIRAG_SCORE_THRESHOLD")
-        if rag_score_threshold_raw in (None, ""):
-            rag_score_threshold = None
-        else:
-            try:
-                rag_score_threshold = float(rag_score_threshold_raw)
-            except ValueError as e:
-                raise SettingsError("`VIRAG_SCORE_THRESHOLD` must be a float.") from e
-
-        rag_framing_text = os.environ.get("VIRAG_FRAMING_TEXT") or _DEFAULT_FRAMING_TEXT
-
-        # -----------------------------
-        # HTTP (shared upstream retry policy)
-        # -----------------------------
-
-        http_backoff_base = float_coercion(
-            os.environ.get("HTTP_RETRY_BACKOFF_BASE_SEC", "0.25"),
-            "HTTP_RETRY_BACKOFF_BASE_SEC",
-            low=0,
-        )
-
-        http_backoff_cap = float_coercion(
-            os.environ.get("HTTP_RETRY_BACKOFF_CAP_SEC", "8"),
-            "HTTP_RETRY_BACKOFF_CAP_SEC",
-            low=0,
-        )
-
-        # -----------------------------
-        # QDRANT
-        # -----------------------------
-
-        qdrant_base_url = os.environ.get(
-            "QDRANT_BASE_URL",
-            "http://qdrant-service:6333",
-        )
-
-        # The data path speaks gRPC (one multiplexed HTTP/2 channel); QDRANT_BASE_URL
-        # names the host and the REST port, still used by the /qdrant proxy.
-        qdrant_grpc_port = int_coercion(
-            os.environ.get("QDRANT_GRPC_PORT", "6334"),
-            "QDRANT_GRPC_PORT",
-            low=1,
-            high=65535,
-        )
-
-        qdrant_timeout = int_coercion(
-            os.environ.get("QDRANT_TIMEOUT_SEC", "60"),
-            "QDRANT_TIMEOUT_SEC",
-            low=1,
-        )
-
-        # gRPC caps a retry policy at 5 attempts in total.
-        qdrant_max_retries = int_coercion(
-            os.environ.get("QDRANT_MAX_RETRIES", "3"),
-            "QDRANT_MAX_RETRIES",
-            low=0,
-            high=4,
-        )
-
-        qdrant_collection_name = os.environ.get(
-            "QDRANT_COLLECTION_NAME",
-            "store-collection",
-        )
-
-        qdrant_vector_size = int_coercion(
-            require_env("QDRANT_VECTOR_SIZE"),
-            "QDRANT_VECTOR_SIZE",
-            low=1,
-        )
-
-        qdrant_distance_type_value = os.environ.get(
-            "QDRANT_DISTANCE_TYPE",
-            "Cosine",
-        )
-
+        """Read every section from the environment; any invalid or missing variable
+        becomes one SettingsError naming the variables at fault."""
         try:
-            qdrant_distance_type = Distance(qdrant_distance_type_value)
-        except ValueError as e:
-            raise SettingsError(
-                f"Incorrect `QDRANT_DISTANCE_TYPE`: "
-                f"{qdrant_distance_type_value!r}. "
-                f"Must be one of {[t.value for t in Distance]}."
-            ) from e
-
-        qdrant_chunk_size_mb = int_coercion(
-            os.environ.get("QDRANT_CHUNK_SIZE", "24"),
-            "QDRANT_CHUNK_SIZE",
-            low=1,
-        )
-
-        qdrant_chunk_byte_budget = qdrant_chunk_size_mb * 1024 * 1024
-
-        qdrant_max_batch_chunks = int_coercion(
-            os.environ.get("QDRANT_MAX_BATCH_CHUNKS", "1024"),
-            "QDRANT_MAX_BATCH_CHUNKS",
-            low=1,
-        )
-
-
-        # -----------------------------
-        # RETRIEVER
-        # -----------------------------
-
-        retriever_base_url = os.environ.get(
-            "RETRIEVER_BASE_URL",
-            "http://retriever-vllm-virag:8000/v1"
-        )
-
-        retriever_model_name = os.environ.get(
-            "RETRIEVER_MODEL_NAME",
-            "retriever-model"
-        )
-
-        retriever_api_key = os.environ.get(
-            "RETRIEVER_API_KEY",
-            "dummy"
-        )
-
-        retriever_batch_size = int_coercion(
-            os.environ.get("RETRIEVER_BATCH_SIZE", "32"),
-            "RETRIEVER_BATCH_SIZE",
-            low=1
-        )
-
-        # Caps bulk (ingest) calls only; interactive queries bypass it.
-        retriever_max_concurrency = int_coercion(
-            os.environ.get("RETRIEVER_MAX_CONCURRENCY", "32"),
-            "RETRIEVER_MAX_CONCURRENCY",
-            low=0
-        )
-
-        # 0 = never send `priority` (portable); > 0 needs a vLLM retriever started
-        # with `--scheduling-policy priority` (lower value = served earlier).
-        retriever_bulk_priority = int_coercion(
-            os.environ.get("RETRIEVER_BULK_PRIORITY", "0"),
-            "RETRIEVER_BULK_PRIORITY",
-            low=0
-        )
-
-        retriever_image_batching = os.environ.get("RETRIEVER_IMAGE_BATCHING", "auto").strip().lower()
-
-        if retriever_image_batching not in _IMAGE_BATCHING_MODES:
-            raise SettingsError(
-                f"Incorrect `RETRIEVER_IMAGE_BATCHING`: {retriever_image_batching!r}. "
-                f"Must be one of {list(_IMAGE_BATCHING_MODES)}."
-            )
-
-        retriever_timeout = int_coercion(
-            os.environ.get("RETRIEVER_TIMEOUT_SEC", "60"),
-            "RETRIEVER_TIMEOUT_SEC",
-            low=1
-        )
-
-        retriever_connect_timeout = int_coercion(
-            os.environ.get("RETRIEVER_CONNECT_TIMEOUT_SEC", "10"),
-            "RETRIEVER_CONNECT_TIMEOUT_SEC",
-            low=1
-        )
-
-        retriever_max_connections = int_coercion(
-            os.environ.get("RETRIEVER_MAX_CONNECTIONS", "100"),
-            "RETRIEVER_MAX_CONNECTIONS",
-            low=1
-        )
-
-        retriever_max_retries = int_coercion(
-            os.environ.get("RETRIEVER_MAX_RETRIES", "3"),
-            "RETRIEVER_MAX_RETRIES",
-            low=0
-        )
-
-        concurrency_within_pool(
-            retriever_max_concurrency,
-            retriever_max_connections,
-            "RETRIEVER",
-        )
-
-        # -----------------------------
-        # TILER
-        # -----------------------------
-
-        tiler_base_url = os.environ.get(
-            "TILER_BASE_URL",
-            "http://tiler-virag:8080"
-        )
-
-        tiler_timeout = int_coercion(
-            os.environ.get("TILER_TIMEOUT_SEC", "120"),
-            "TILER_TIMEOUT_SEC",
-            low=1
-        )
-
-        tiler_connect_timeout = int_coercion(
-            os.environ.get("TILER_CONNECT_TIMEOUT_SEC", "10"),
-            "TILER_CONNECT_TIMEOUT_SEC",
-            low=1
-        )
-
-        tiler_max_connections = int_coercion(
-            os.environ.get("TILER_MAX_CONNECTIONS", "100"),
-            "TILER_MAX_CONNECTIONS",
-            low=1
-        )
-
-        tiler_max_retries = int_coercion(
-            os.environ.get("TILER_MAX_RETRIES", "3"),
-            "TILER_MAX_RETRIES",
-            low=0
-        )
-
-        # Caps bulk tile regeneration (self-heal, revision) only; chat RAG bypasses it.
-        tiler_max_concurrency = int_coercion(
-            os.environ.get("TILER_MAX_CONCURRENCY", "32"),
-            "TILER_MAX_CONCURRENCY",
-            low=0
-        )
-
-        concurrency_within_pool(
-            tiler_max_concurrency,
-            tiler_max_connections,
-            "TILER",
-        )
-
-        # -----------------------------
-        # VLM (upstream, OpenAI-compatible)
-        # -----------------------------
-
-        vlm_base_url = require_env("VLM_BASE_URL")
-
-        vlm_model_name = require_env("VLM_MODEL_NAME")
-
-        vlm_api_key = os.environ.get(
-            "VLM_API_KEY",
-            "dummy"
-        )
-
-        vlm_timeout = int_coercion(
-            os.environ.get("VLM_TIMEOUT_SEC", "480"),
-            "VLM_TIMEOUT_SEC",
-            low=1
-        )
-
-        vlm_connect_timeout = int_coercion(
-            os.environ.get("VLM_CONNECT_TIMEOUT_SEC", "10"),
-            "VLM_CONNECT_TIMEOUT_SEC",
-            low=1
-        )
-
-        vlm_max_connections = int_coercion(
-            os.environ.get("VLM_MAX_CONNECTIONS", "100"),
-            "VLM_MAX_CONNECTIONS",
-            low=1
-        )
-
-        vlm_max_concurrency = int_coercion(
-            os.environ.get("VLM_MAX_CONCURRENCY", "0"),
-            "VLM_MAX_CONCURRENCY",
-            low=0,
-        )
-
-        concurrency_within_pool(
-            vlm_max_concurrency,
-            vlm_max_connections,
-            "VLM",
-        )
-
-        vlm_max_retries = int_coercion(
-            os.environ.get("VLM_MAX_RETRIES", "3"),
-            "VLM_MAX_RETRIES",
-            low=0,
-        )
-
-        # -----------------------------
-        # ENROLL
-        # -----------------------------
-
-        # Tiles gathered per embed+upsert step (enroll, self-heal, revision).
-        enroll_batch_size = int_coercion(
-            os.environ.get("VIRAG_ENROLL_BATCH_SIZE", "32"),
-            "VIRAG_ENROLL_BATCH_SIZE",
-            low=1,
-        )
-
-        # -----------------------------
-        # RECONCILE (enroll self-repair)
-        # -----------------------------
-
-        reconcile_self_heal = bool_coercion(
-            os.environ.get("VIRAG_SELF_HEAL", "true"),
-            "VIRAG_SELF_HEAL",
-        )
-
-        reconcile_interval_sec = int_coercion(
-            os.environ.get("VIRAG_RECONCILE_INTERVAL_SEC", "300"),
-            "VIRAG_RECONCILE_INTERVAL_SEC",
-            low=0,
-        )
-
-        reconcile_pending_ttl_sec = int_coercion(
-            os.environ.get("VIRAG_PENDING_TTL_SEC", "3600"),
-            "VIRAG_PENDING_TTL_SEC",
-            low=1,
-        )
-
-
-        return cls(
-            host=service_host,
-            port=service_port,
-            db_secret=service_db_secret,
-            rag_settings=RagSettings(
-                top_n=rag_top_n,
-                score_threshold=rag_score_threshold,
-                framing_text=rag_framing_text,
-            ),
-            http_settings=HttpSettings(
-                backoff_base=http_backoff_base,
-                backoff_cap=http_backoff_cap,
-            ),
-            qdrant_settings=QdrantStoreSettings(
-                base_url=qdrant_base_url,
-                grpc_port=qdrant_grpc_port,
-                timeout=qdrant_timeout,
-                max_retries=qdrant_max_retries,
-                collection_name=qdrant_collection_name,
-                vector_size=qdrant_vector_size,
-                distance_type=qdrant_distance_type,
-                chunk_byte_budget=qdrant_chunk_byte_budget,
-                max_batch_chunks=qdrant_max_batch_chunks,
-            ),
-            retriever_settings=RetrieverSettings(
-                base_url=retriever_base_url,
-                model_name=retriever_model_name,
-                api_key=retriever_api_key,
-                batch_size=retriever_batch_size,
-                max_concurrency=retriever_max_concurrency,
-                bulk_priority=retriever_bulk_priority,
-                image_batching=retriever_image_batching,
-                timeout=retriever_timeout,
-                connect_timeout=retriever_connect_timeout,
-                max_connections=retriever_max_connections,
-                max_retries=retriever_max_retries,
-            ),
-            tiler_settings=TilerSettings(
-                base_url=tiler_base_url,
-                max_concurrency=tiler_max_concurrency,
-                timeout=tiler_timeout,
-                connect_timeout=tiler_connect_timeout,
-                max_connections=tiler_max_connections,
-                max_retries=tiler_max_retries,
-            ),
-            vlm_settings=VLMSettings(
-                base_url=vlm_base_url,
-                model_name=vlm_model_name,
-                api_key=vlm_api_key,
-                timeout=vlm_timeout,
-                connect_timeout=vlm_connect_timeout,
-                max_connections=vlm_max_connections,
-                max_concurrency=vlm_max_concurrency,
-                max_retries=vlm_max_retries,
-            ),
-            enroll_settings=EnrollSettings(
-                batch_size=enroll_batch_size,
-            ),
-            reconcile_settings=ReconcileSettings(
-                self_heal=reconcile_self_heal,
-                interval_sec=reconcile_interval_sec,
-                pending_ttl_sec=reconcile_pending_ttl_sec,
-            ),
-        )
-
-
-def require_env(name: str) -> str:
-    """Return the value of a required environment variable."""
-    value = os.environ.get(name)
-
-    if value is None:
-        raise SettingsError(f"`{name}` environment variable is required.")
-
-    return value
-
-
-def concurrency_within_pool(max_concurrency: int, max_connections: int, prefix: str) -> None:
-    """Above the pool size a concurrency cap never binds — the pool would queue instead."""
-    if max_concurrency > max_connections:
-        raise SettingsError(
-            f"`{prefix}_MAX_CONCURRENCY` ({max_concurrency}) must not exceed "
-            f"`{prefix}_MAX_CONNECTIONS` ({max_connections})."
-        )
-
-
-def bool_coercion(value: str, name: str) -> bool:
-    """Convert a string to a boolean, accepting the usual truthy/falsy spellings."""
-    normalized = value.strip().lower()
-
-    if normalized in ("1", "true", "yes", "on"):
-        return True
-
-    if normalized in ("0", "false", "no", "off"):
-        return False
-
-    raise SettingsError(f"`{name}` must be a boolean (got {value!r}).")
-
-
-def float_coercion(
-    value: str,
-    name: str,
-    low: float | None = None,
-) -> float:
-    """Convert a string to a float and validate its lower bound."""
-    try:
-        coerced_value = float(value)
-    except ValueError as e:
-        raise SettingsError(f"`{name}` must be a float.") from e
-
-    if low is not None and coerced_value < low:
-        raise SettingsError(
-            f"`{name}` must be greater than or equal to {low}. "
-            f"Got {coerced_value}."
-        )
-
-    return coerced_value
-
-
-def int_coercion(
-    value: str,
-    name: str,
-    low: int | None = None,
-    high: int | None = None,
-) -> int:
-    """Convert a string to an integer and validate its bounds."""
-    try:
-        coerced_value = int(value)
-    except ValueError as e:
-        raise SettingsError(f"`{name}` must be an integer.") from e
-
-    if low is not None and coerced_value < low:
-        raise SettingsError(
-            f"`{name}` must be greater than or equal to {low}. "
-            f"Got {coerced_value}."
-        )
-
-    if high is not None and coerced_value > high:
-        raise SettingsError(
-            f"`{name}` must be less than or equal to {high}. "
-            f"Got {coerced_value}."
-        )
-
-    return coerced_value
+            return cls()
+
+        except ValidationError as e:
+            raise SettingsError(cls._describe(e)) from e
+
+
+    @staticmethod
+    def _describe(error: ValidationError) -> str:
+        """Render a validation error in terms of environment variable names."""
+        model = _SECTIONS.get(error.title)
+        problems = []
+
+        for item in error.errors():
+            if item["loc"] and model is not None:
+                problems.append(f"`{Settings._env_name(model, str(item['loc'][0]))}`: {item['msg']}")
+            else:
+                problems.append(item["msg"].removeprefix("Value error, "))
+
+        return "; ".join(problems)
+
+
+    @staticmethod
+    def _env_name(model: type[BaseSettings], loc: str) -> str:
+        """The variable behind an error location — a field name, or already an alias."""
+        info = model.model_fields.get(loc)
+        if info is None:
+            return loc
+
+        if isinstance(info.validation_alias, str):
+            return info.validation_alias
+
+        return f"{model.model_config.get('env_prefix', '')}{loc}".upper()
+
+
+_SECTIONS: dict[str, type[BaseSettings]] = {
+    section.__name__: section
+    for section in (
+        Settings,
+        RagSettings,
+        HttpSettings,
+        QdrantStoreSettings,
+        RetrieverSettings,
+        TilerSettings,
+        VLMSettings,
+        EnrollSettings,
+        ReconcileSettings,
+    )
+}

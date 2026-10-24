@@ -11,14 +11,14 @@ import pytest
 from virag.clients.retriever_client import RetrieverClient
 from virag.errors import ApiError
 
-from test_http_service import _HTTP, _mock, _run
+from test_http_service import _HTTP, _RETRIEVER, _mock, _run
 
 
 DIM = 3
 
 
 def _retriever(**kwargs) -> RetrieverClient:
-    options = {"max_retries": 0, **_HTTP, **kwargs}
+    options = {"max_retries": 0, **_RETRIEVER, **_HTTP, **kwargs}
 
     return RetrieverClient("http://retriever/v1", "retriever", "k", **options)
 

@@ -15,7 +15,7 @@ from virag.settings import EnrollSettings, ReconcileSettings
 
 from fastapi.testclient import TestClient
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, build_app
+from conftest import FakeRetriever, FakeStore, FakeTiler, build_app, make_store
 
 
 def _doc(doc_id, tile_count, *, complete=True, enrolled_at=1):
@@ -142,7 +142,7 @@ def test_revision_api_starts_in_background_and_reports_status():
 # ---------------------------------------------------------------------------
 
 def _store() -> QdrantStore:
-    store = QdrantStore("http://qdrant", "c", 4)
+    store = make_store()
     store.physical_name = "c__v1"
 
     return store

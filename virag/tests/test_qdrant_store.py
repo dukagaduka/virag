@@ -11,6 +11,8 @@ import pytest
 from virag.clients.qdrant_store import QdrantStore
 from virag.errors import ApiError
 
+from conftest import make_store
+
 
 class _RpcError(grpc.RpcError):
 
@@ -25,7 +27,7 @@ class _RpcError(grpc.RpcError):
 
 
 def _store() -> QdrantStore:
-    return QdrantStore("http://qdrant", "c", 4)
+    return make_store()
 
 
 def test_service_config_retries_points_and_safe_collection_calls():

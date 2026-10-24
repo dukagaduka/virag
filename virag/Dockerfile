@@ -6,8 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONDONTWRITEBYTECODE=1
 
 # Unprivileged runtime user — nothing here ever runs as root.
 ENV APP_UID=10001 \
@@ -19,9 +18,12 @@ WORKDIR /app
 
 # Dependencies come from pyproject.toml (hatchling build backend); the list is
 # extracted with stdlib tomllib so this layer caches on pyproject.toml alone.
+# pip's download cache lives in a BuildKit cache mount — outside the image, kept
+# between builds — so changing one dependency doesn't re-download all of them.
 COPY pyproject.toml .
-RUN python -c "import tomllib; open('/tmp/reqs.txt','w').write(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" \
- && pip install --no-cache-dir -r /tmp/reqs.txt \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c "import tomllib; open('/tmp/reqs.txt','w').write(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" \
+ && pip install -r /tmp/reqs.txt \
  && rm /tmp/reqs.txt
 
 COPY --chown=${APP_UID}:${APP_GID} virag/ ./virag/

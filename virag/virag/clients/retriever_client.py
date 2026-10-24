@@ -13,17 +13,6 @@ from virag.utils import error_body, gather
 
 log = logging.getLogger(__name__)
 
-# A 1x1 PNG — the smallest valid image to probe how the model takes image inputs.
-_PROBE_IMAGE = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-)
-
-# Replies meaning the upstream rejected the *content* of a request (bad item, body
-# too large, unsupported batch shape) rather than failing transiently. Only these
-# split a batch into single-item requests; transient failures are retried as-is by
-# the transport, since splitting would multiply load on an already struggling upstream.
-_SPLIT_STATUSES = frozenset({400, 413, 422})
-
 
 class RetrieverClient(OpenAIService):
     """The retrieval embedding model behind any OpenAI-compatible `/embeddings` API.
@@ -37,15 +26,22 @@ class RetrieverClient(OpenAIService):
     large ingest never queues a user's query behind it.
     """
 
+    # Replies meaning the upstream rejected the *content* of a request (bad item, body
+    # too large, unsupported batch shape) rather than failing transiently. Only these
+    # split a batch into single-item requests; transient failures are retried as-is by
+    # the transport, since splitting would multiply load on an already struggling upstream.
+    SPLIT_STATUSES = frozenset({400, 413, 422})
+
+
     def __init__(
         self,
         base_url: str,
         model_name: str,
         api_key: str,
         *,
-        batch_size: int = 32,
-        bulk_priority: int = 0,
-        image_batching: str = "auto",
+        batch_size: int,
+        bulk_priority: int,
+        image_batching: str,
         **http_options,
     ):
 
@@ -75,12 +71,12 @@ class RetrieverClient(OpenAIService):
             bulk_priority=rs.bulk_priority,
             image_batching=rs.image_batching,
             max_concurrency=rs.max_concurrency,
-            timeout=rs.timeout,
-            connect_timeout=rs.connect_timeout,
+            timeout=rs.timeout_sec,
+            connect_timeout=rs.connect_timeout_sec,
             max_connections=rs.max_connections,
             max_retries=rs.max_retries,
-            backoff_base=hs.backoff_base,
-            backoff_cap=hs.backoff_cap,
+            backoff_base=hs.backoff_base_sec,
+            backoff_cap=hs.backoff_cap_sec,
         )
 
 
@@ -116,7 +112,7 @@ class RetrieverClient(OpenAIService):
 
     async def _resolve_image_batching(self) -> bool:
         """Decide whether images go several per request; require image support at all."""
-        image = self._image_conversation(_PROBE_IMAGE, "image/png")
+        image = self._image_conversation(self.PROBE_IMAGE, "image/png")
 
         if self.image_batching != "off":
             batch_vectors = await self._probe([image, image])
@@ -238,7 +234,7 @@ class RetrieverClient(OpenAIService):
                 "POST",
                 self.route,
                 action="embedding",
-                passthrough_statuses=_SPLIT_STATUSES,
+                passthrough_statuses=self.SPLIT_STATUSES,
                 json=body,
             )
 

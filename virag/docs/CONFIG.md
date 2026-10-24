@@ -1,14 +1,23 @@
 # Configuration
 
 All application configuration is read from environment variables at startup by
-`Settings.from_env()` (`virag/settings.py`). Two variables are **required** and abort
-startup if unset; everything else has a default. A ready-to-edit template — including
-the Compose/deployment variables — lives at
-[`deploy/service/.env.example`](../deploy/service/.env.example) and
+`Settings.from_env()` (`virag/settings.py`). Three variables are **required** and abort
+startup if unset — `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME`; everything
+else has a default. A ready-to-edit template — including the Compose/deployment
+variables — lives at [`deploy/service/.env.example`](../deploy/service/.env.example) and
 [`deploy/retriever/.env.example`](../deploy/retriever/.env.example).
 
-Invalid values fail fast with a `SettingsError` (wrong type, out of range, unknown
-enum) rather than surfacing later as a runtime error.
+Every variable, its default and its bounds are declared once, as pydantic-settings
+fields in `virag/settings.py`: each section reads its own prefix and a field's name is
+the variable's suffix (`RetrieverSettings.batch_size` ← `RETRIEVER_BATCH_SIZE`). An
+**empty** variable counts as unset (so it takes the default, or fails if required).
+Invalid values fail fast with a `SettingsError` naming the variable (wrong type, out of
+range, unknown enum, a concurrency cap above its pool) rather than surfacing later as a
+runtime error.
+
+The Qdrant image is pinned (`QDRANT_DEPLOY_IMAGE=qdrant/qdrant:v1.20.0`) together with
+`qdrant-client` in `pyproject.toml`: the client refuses a server more than one minor
+version apart, so bump both at once.
 
 ---
 

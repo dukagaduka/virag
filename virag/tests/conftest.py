@@ -275,27 +275,36 @@ def make_settings(**overrides) -> Settings:
         port=8080,
         db_secret=overrides.pop("db_secret", ""),
         rag_settings=rag,
-        http_settings=HttpSettings(backoff_base=0, backoff_cap=0),
+        http_settings=HttpSettings(backoff_base_sec=0, backoff_cap_sec=0),
         qdrant_settings=QdrantStoreSettings(
-            base_url="http://qdrant", grpc_port=6334, timeout=60, max_retries=0,
+            base_url="http://qdrant", grpc_port=6334, timeout_sec=60, max_retries=0,
             collection_name="c", vector_size=4, distance_type=Distance.COSINE,
-            chunk_byte_budget=24 * 1024 * 1024, max_batch_chunks=1024,
+            chunk_size=24, max_batch_chunks=1024,
         ),
         retriever_settings=RetrieverSettings(
             base_url="http://retriever/v1", model_name="retriever", api_key="k-retriever", batch_size=16,
-            max_concurrency=0, bulk_priority=0, image_batching="auto", timeout=60,
-            connect_timeout=10, max_connections=100, max_retries=0,
+            max_concurrency=0, bulk_priority=0, image_batching="auto", timeout_sec=60,
+            connect_timeout_sec=10, max_connections=100, max_retries=0,
         ),
         tiler_settings=TilerSettings(
-            base_url="http://tiler", max_concurrency=0, timeout=120, connect_timeout=10, max_connections=100, max_retries=0,
+            base_url="http://tiler", max_concurrency=0, timeout_sec=120, connect_timeout_sec=10, max_connections=100, max_retries=0,
         ),
         vlm_settings=VLMSettings(
-            base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout=120,
-            connect_timeout=10, max_connections=100, max_concurrency=0, max_retries=0,
+            base_url="http://vlm/v1", model_name="vlm", api_key="k-vlm", timeout_sec=120,
+            connect_timeout_sec=10, max_connections=100, max_concurrency=0, max_retries=0,
         ),
         enroll_settings=overrides.pop("enroll_settings", EnrollSettings(batch_size=16)),
         reconcile_settings=ReconcileSettings(self_heal=True, interval_sec=0, pending_ttl_sec=3600),
     )
+
+
+def make_store(settings: Settings | None = None):
+    """A real QdrantStore (no network until used) configured like production."""
+    from virag.clients.qdrant_store import QdrantStore
+
+    settings = settings or make_settings()
+
+    return QdrantStore.from_settings(settings.qdrant_settings, settings.http_settings)
 
 
 def build_app(*, settings=None, store=None, retriever=None, tiler=None, vlm=None) -> FastAPI:
