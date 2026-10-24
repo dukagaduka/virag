@@ -188,10 +188,9 @@ documents enroll fully.
 
 **Collection scheme.** virag serves through a stable Qdrant **alias** whose name is the
 configured `QDRANT_COLLECTION_NAME`. The alias points to a versioned physical collection
-(`<name>__v1`, `__v2`, …); all point operations go through the alias. On startup, if a
-legacy plain collection named `QDRANT_COLLECTION_NAME` exists (from before this scheme),
-its points are copied into `__v1` (count-verified before the source is dropped), the plain
-collection is deleted, and the alias is created — no data loss.
+(`<name>__v1`, `__v2`, …); all point operations go through the alias. A plain
+collection already sitting under `QDRANT_COLLECTION_NAME` (the pre-alias layout) is
+refused at startup — the alias cannot take a name a collection holds.
 
 **Reconcile** (`reconcile.py`) runs once at startup and then on
 `VIRAG_RECONCILE_INTERVAL_SEC` (0 disables the loop; the startup pass still runs). Two

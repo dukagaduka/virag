@@ -27,7 +27,6 @@ from qdrant_client.models import (
     MatchAny,
     MatchValue,
     PayloadSchemaType,
-    PointStruct,
     VectorParams
 )
 
@@ -52,25 +51,6 @@ _RETRY_COLLECTION_METHODS = ("Get", "List", "CollectionExists", "ListAliases", "
 _UNAVAILABLE_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
 
 
-def _unavailable_as_503(method):
-    """Turn an unreachable Qdrant (after the channel's own retries) into ApiError(503)."""
-    @functools.wraps(method)
-    async def wrapper(self, *args, **kwargs):
-        try:
-            return await method(self, *args, **kwargs)
-
-        except grpc.RpcError as e:
-            if e.code() not in _UNAVAILABLE_CODES:  # type: ignore[attr-defined]
-                raise
-
-            raise ApiError(
-                status_code=503,
-                message=f"Qdrant is unavailable during {method.__name__}",
-                details={"grpc_status": e.code().name, "error": e.details()},  # type: ignore[attr-defined]
-            ) from e
-
-    return wrapper
-
 # doc_ids per filtered delete request — one MatchAny filter instead of N requests.
 DELETE_DOCS_CHUNK = 256
 
@@ -92,6 +72,29 @@ class QdrantStore:
     revision can journal which documents changed while it was building and wait for
     writers of the old collection to finish before syncing them into the new one.
     """
+
+    # Defined first: it decorates methods below while the class body is still executing
+    # (a staticmethod object is callable there since Python 3.10).
+    @staticmethod
+    def _unavailable_as_503(method):
+        """Turn an unreachable Qdrant (after the channel's own retries) into ApiError(503)."""
+        @functools.wraps(method)
+        async def wrapper(self, *args, **kwargs):
+            try:
+                return await method(self, *args, **kwargs)
+
+            except grpc.RpcError as e:
+                if e.code() not in _UNAVAILABLE_CODES:  # type: ignore[attr-defined]
+                    raise
+
+                raise ApiError(
+                    status_code=503,
+                    message=f"Qdrant is unavailable during {method.__name__}",
+                    details={"grpc_status": e.code().name, "error": e.details()},  # type: ignore[attr-defined]
+                ) from e
+
+        return wrapper
+
 
     def __init__(
         self,
@@ -282,41 +285,18 @@ class QdrantStore:
             return alias_map[self.serving_name]
 
         if await self.qdrant.collection_exists(self.serving_name):
-            # Legacy plain collection (pre-alias) — migrate it under the alias scheme.
-            return await self._migrate_legacy()
+            # A plain collection under the serving name predates the alias scheme; the
+            # alias cannot claim a taken name, so refuse rather than fail obscurely.
+            message = (
+                f"Qdrant collection `{self.serving_name}` exists as a plain collection "
+                f"(pre-alias layout); drop it, or choose another QDRANT_COLLECTION_NAME"
+            )
+            log.critical("FATAL: %s", message)
+
+            raise RuntimeError(message)
 
         physical = f"{self.serving_name}__v1"
         await self._create_physical(physical)
-        await self._alias_to(physical)
-
-        return physical
-
-
-    async def _migrate_legacy(self) -> str:
-        """One-time: copy a plain `serving_name` collection into `__v1` and alias it.
-
-        The plain name must be freed before the alias can claim it; this runs at startup
-        before any traffic, so the brief window with neither is invisible.
-        """
-        physical = f"{self.serving_name}__v1"
-
-        if not await self.qdrant.collection_exists(physical):
-            await self._create_physical(physical)
-            meta = await self._collection_metadata(self.serving_name)
-            if meta:
-                await self.qdrant.update_collection(collection_name=physical, metadata=meta)
-            await self._copy_points(self.serving_name, physical)
-
-        # Never drop the source until the copy is provably complete.
-        src_count = (await self.qdrant.count(collection_name=self.serving_name, exact=True)).count
-        dst_count = (await self.qdrant.count(collection_name=physical, exact=True)).count
-        if dst_count != src_count:
-            raise RuntimeError(
-                f"legacy migration count mismatch: {self.serving_name}={src_count} "
-                f"but {physical}={dst_count}; refusing to drop the source"
-            )
-
-        await self.qdrant.delete_collection(collection_name=self.serving_name)
         await self._alias_to(physical)
 
         return physical
@@ -365,29 +345,6 @@ class QdrantStore:
                 )
             ]
         )
-
-
-    async def _copy_points(self, src: str, dst: str) -> None:
-        offset = None
-        while True:
-            points, offset = await self.qdrant.scroll(
-                collection_name=src,
-                limit=256,
-                offset=offset,
-                with_payload=True,
-                with_vectors=True,
-            )
-            if points:
-                await self.qdrant.upsert(
-                    collection_name=dst,
-                    wait=True,
-                    points=[
-                        PointStruct(id=p.id, vector=p.vector, payload=p.payload)  # type: ignore
-                        for p in points
-                    ],
-                )
-            if offset is None:
-                break
 
 
     # ------------------------------------------------------------------ #
