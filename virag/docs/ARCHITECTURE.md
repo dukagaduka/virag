@@ -7,7 +7,7 @@ with document-image tiles retrieved from a Qdrant + [doc-tiler](../../doc-tiler)
 backend, then forwarded. The client keeps talking to one OpenAI-shaped endpoint and
 opts into retrieval per request.
 
-- **Stack:** Python 3.11+, FastAPI, async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async).
+- **Stack:** Python 3.11+, FastAPI, async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async, over gRPC).
 - **Backends (all external):** a retriever server (vLLM, OpenAI-compatible), the
   doc-tiler service, a Qdrant instance, and the upstream VLM.
 - **Scope:** the gateway only. Tiling/rendering lives in doc-tiler; embedding lives in
@@ -122,7 +122,10 @@ Four typed async clients, each built from its settings block and given a
   `/enroll` consumes), `get_tile()`, `get_info()` (for binding), `get_schema()` (metadata
   schema guard), `patch_metadata()` (the enroll pending markers), `search_docs()` /
   `iter_docs()` (reconcile), `doc_exists()`.
-- **`QdrantStore`** — collection lifecycle behind a serving alias over versioned physical
+- **`QdrantStore`** — speaks **gRPC** to Qdrant: one multiplexed HTTP/2 channel (no pool
+  of idle HTTP/1.1 connections to race the server's keep-alive), retries done by the
+  channel's service config (`UNAVAILABLE`, idempotent methods only), an unreachable
+  Qdrant surfaced as `503`. Collection lifecycle behind a serving alias over versioned physical
   collections, `upsert` (optional deterministic ids, byte-budget sub-batching), `query`,
   `delete_by_doc` / `iter_doc_ids` (reconcile), the revision blue-green swap
   (`create_revision_collection` / `swap_alias`), and collection-level metadata (used by
@@ -169,7 +172,7 @@ documents enroll fully.
 - **Deterministic point ids.** A point's id is `uuid5(namespace, "{doc_id}:{tile_num}")`,
   so re-enrolling a document overwrites its own points in place rather than duplicating.
 - **Byte-budget batching.** `QdrantStore.upsert` splits into sub-batches so no single
-  request exceeds Qdrant's body limit: `QDRANT_CHUNK_SIZE` (per-request body budget in MB)
+  request exceeds Qdrant's request limit: `QDRANT_CHUNK_SIZE` (per-request budget in MB)
   and `QDRANT_MAX_BATCH_CHUNKS` (hard cap on points per request).
 - **The invariant `Qdrant ⊆ Tiler`.** Every Qdrant point is backed by a tiler tile,
   enforced by write order (the tiler persists a tile, *then* virag writes its point) and

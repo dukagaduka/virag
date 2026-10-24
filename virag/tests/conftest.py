@@ -277,7 +277,8 @@ def make_settings(**overrides) -> Settings:
         rag_settings=rag,
         http_settings=HttpSettings(backoff_base=0, backoff_cap=0),
         qdrant_settings=QdrantStoreSettings(
-            base_url="http://qdrant", collection_name="c", vector_size=4, distance_type=Distance.COSINE,
+            base_url="http://qdrant", grpc_port=6334, timeout=60, max_retries=0,
+            collection_name="c", vector_size=4, distance_type=Distance.COSINE,
             chunk_byte_budget=24 * 1024 * 1024, max_batch_chunks=1024,
         ),
         retriever_settings=RetrieverSettings(

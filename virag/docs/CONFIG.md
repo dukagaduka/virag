@@ -54,11 +54,14 @@ interval — repairing partial/orphaned enrolls and propagating tiler deletes. S
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `QDRANT_BASE_URL` | no | `http://qdrant-service:6333` | Qdrant endpoint. |
+| `QDRANT_BASE_URL` | no | `http://qdrant-service:6333` | Qdrant host and REST port. virag's data path uses gRPC on this host (`QDRANT_GRPC_PORT`); REST serves the `/qdrant` proxy and the client's version check. |
+| `QDRANT_GRPC_PORT` | no | `6334` | Qdrant gRPC port. |
+| `QDRANT_TIMEOUT_SEC` | no | `60` | Per-call gRPC deadline (≥ 1). |
+| `QDRANT_MAX_RETRIES` | no | `3` | Replays on `UNAVAILABLE` (0–4; gRPC caps a call at 5 attempts), with the shared `HTTP_RETRY_BACKOFF_*` backoff. Only idempotent calls: every point op and the collection reads/metadata update — never create/delete/alias changes. A still-unreachable Qdrant surfaces as `503`. |
 | `QDRANT_COLLECTION_NAME` | no | `store-collection` | Collection to enroll into / query. |
 | `QDRANT_VECTOR_SIZE` | **yes** | — | Embedding dimensionality (≥ 1). Must match the embedding model. |
 | `QDRANT_DISTANCE_TYPE` | no | `Cosine` | One of `Cosine`, `Dot`, `Euclid`, `Manhattan`. |
-| `QDRANT_CHUNK_SIZE` | no | `24` | Per-upsert request body budget, in **megabytes** (≥ 1). `upsert` splits into sub-batches so no single request exceeds this; keep it under Qdrant's ~32 MB body limit. |
+| `QDRANT_CHUNK_SIZE` | no | `24` | Per-upsert message budget, in **megabytes** (≥ 1). `upsert` splits into sub-batches so no single request exceeds this. Over gRPC a vector float costs ~4 B, so `QDRANT_MAX_BATCH_CHUNKS` usually binds first (1024 × 2048-d ≈ 8 MB); Qdrant's 32 MB body limit is a REST limit (a 35 MB gRPC upsert was accepted in testing). |
 | `QDRANT_MAX_BATCH_CHUNKS` | no | `1024` | Hard cap on points per upsert request (≥ 1), applied on top of the byte budget. |
 
 The configured `QDRANT_COLLECTION_NAME` is the name of a stable serving **alias**; virag

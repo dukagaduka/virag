@@ -1430,5 +1430,6 @@ deploy/retriever/serve_retriever.sh
 !scripts
 vendor/*
 *.smoke-data
+*.test-data
 
 

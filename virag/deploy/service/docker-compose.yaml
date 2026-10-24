@@ -78,8 +78,11 @@ services:
     image: ${QDRANT_DEPLOY_IMAGE}
     container_name: ${QDRANT_DEPLOY_CONTAINER_NAME}
 
+    # REST (6333) serves the /qdrant proxy and host debugging; virag's data path uses
+    # gRPC (6334) inside the network — the second mapping is for host-side gRPC tools.
     ports:
       - ${QDRANT_DEPLOY_HOST}:${QDRANT_DEPLOY_PORT}:6333
+      - ${QDRANT_DEPLOY_HOST}:${QDRANT_DEPLOY_GRPC_PORT}:6334
     volumes:
       - ${QDRANT_DEPLOY_VOLUME_PATH}:/qdrant/storage
 

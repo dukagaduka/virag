@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Sequence
 
+import grpc
 import numpy as np
 
 from qdrant_client import AsyncQdrantClient
@@ -30,14 +32,44 @@ from qdrant_client.models import (
 )
 
 from virag.errors import ApiError
-from virag.settings import QdrantStoreSettings
+from virag.settings import HttpSettings, QdrantStoreSettings
 
 
 log = logging.getLogger(__name__)
 
-# Empirical cost of one JSON-serialized float (repr + separator); see enroll
-# 400s where 920x2048 vectors produced a ~40 MB body (~21.5 B/float measured).
-BYTES_PER_FLOAT_JSON = 24
+# Cost of one vector float on the wire: 4 B packed in protobuf, rounded up for
+# framing. (The REST/JSON body measured ~21.5 B/float — see the old enroll 400s.)
+BYTES_PER_FLOAT = 6
+
+# gRPC methods replayed on UNAVAILABLE: every point op (upserts carry deterministic
+# ids, deletes are by filter) and the collection calls that are reads or rewrite the
+# same values. Create / Delete / UpdateAliases are not: a replay after an unacknowledged
+# success would report a false "already exists" / "alias not found".
+_RETRY_SERVICES = ("qdrant.Points",)
+_RETRY_COLLECTION_METHODS = ("Get", "List", "CollectionExists", "ListAliases", "ListCollectionAliases", "Update")
+
+# Statuses meaning "Qdrant is unreachable right now" — surfaced as a 503.
+_UNAVAILABLE_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+
+
+def _unavailable_as_503(method):
+    """Turn an unreachable Qdrant (after the channel's own retries) into ApiError(503)."""
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+
+        except grpc.RpcError as e:
+            if e.code() not in _UNAVAILABLE_CODES:  # type: ignore[attr-defined]
+                raise
+
+            raise ApiError(
+                status_code=503,
+                message=f"Qdrant is unavailable during {method.__name__}",
+                details={"grpc_status": e.code().name, "error": e.details()},  # type: ignore[attr-defined]
+            ) from e
+
+    return wrapper
 
 # doc_ids per filtered delete request — one MatchAny filter instead of N requests.
 DELETE_DOCS_CHUNK = 256
@@ -67,6 +99,11 @@ class QdrantStore:
         collection_name: str,
         vector_size: int,
         *,
+        grpc_port: int = 6334,
+        timeout: int = 60,
+        max_retries: int = 3,
+        backoff_base: float = 0.25,
+        backoff_cap: float = 8.0,
         distance_type: Distance = Distance.COSINE,
         chunk_byte_budget: int = 24 * 1024 * 1024,
         max_batch_chunks: int = 1024
@@ -89,8 +126,17 @@ class QdrantStore:
         self.chunk_byte_budget = chunk_byte_budget
         self.max_batch_chunks = max_batch_chunks
 
+        # gRPC: one multiplexed HTTP/2 channel — no pool of idle HTTP/1.1 connections to
+        # race the server's keep-alive — and retries done by the channel itself.
         self.qdrant = AsyncQdrantClient(
-            url=self.base_url
+            url=self.base_url,
+            prefer_grpc=True,
+            grpc_port=grpc_port,
+            timeout=timeout,
+            grpc_options={
+                "grpc.enable_retries": 1,
+                "grpc.service_config": self._service_config(max_retries, backoff_base, backoff_cap),
+            },
         )
 
         # In-flight document writers: token -> (doc_id, physical collection at start).
@@ -101,17 +147,23 @@ class QdrantStore:
 
 
     @classmethod
-    def from_settings(cls, qs: QdrantStoreSettings) -> QdrantStore:
+    def from_settings(cls, qs: QdrantStoreSettings, hs: HttpSettings) -> QdrantStore:
         return cls(
             base_url=qs.base_url,
             collection_name=qs.collection_name,
             vector_size=qs.vector_size,
+            grpc_port=qs.grpc_port,
+            timeout=qs.timeout,
+            max_retries=qs.max_retries,
+            backoff_base=hs.backoff_base,
+            backoff_cap=hs.backoff_cap,
             distance_type=qs.distance_type,
             chunk_byte_budget=qs.chunk_byte_budget,
             max_batch_chunks=qs.max_batch_chunks,
         )
 
 
+    @_unavailable_as_503
     async def upsert(
         self,
         vectors: Sequence[Sequence[float]],
@@ -172,13 +224,14 @@ class QdrantStore:
             else 0
         )
 
-        est_point_bytes = self.vector_size * BYTES_PER_FLOAT_JSON + payload_bytes
+        est_point_bytes = self.vector_size * BYTES_PER_FLOAT + payload_bytes
 
         by_bytes = max(1, self.chunk_byte_budget // est_point_bytes)
 
         return min(self.max_batch_chunks, by_bytes)
 
 
+    @_unavailable_as_503
     async def query(
         self,
         vector: Sequence[float],
@@ -213,6 +266,7 @@ class QdrantStore:
     # ------------------------------------------------------------------ #
     async def create_collection(self):
         self.physical_name = await self._resolve_or_create()
+        
         await self._validate(self.physical_name)
         await self._ensure_indexes(self.physical_name)
 
@@ -533,6 +587,7 @@ class QdrantStore:
         )
 
 
+    @_unavailable_as_503
     async def delete_by_doc(
         self,
         doc_id: str,
@@ -550,6 +605,7 @@ class QdrantStore:
         )
 
 
+    @_unavailable_as_503
     async def delete_by_docs(
         self,
         doc_ids: Sequence[str],
@@ -569,6 +625,7 @@ class QdrantStore:
             )
 
 
+    @_unavailable_as_503
     async def iter_doc_ids(self, *, collection: str | None = None) -> set[str]:
         """Scroll the whole collection and return the distinct doc_ids it holds."""
         doc_ids: set[str] = set()
@@ -596,3 +653,33 @@ class QdrantStore:
 
     async def close(self):
         await self.qdrant.close()
+
+
+    @staticmethod
+    def _service_config(max_retries: int, backoff_base: float, backoff_cap: float) -> str:
+        """gRPC service config: replay `_RETRY_*` methods on UNAVAILABLE with the channel's
+        own jittered exponential backoff (the same base/cap as the HTTP upstreams)."""
+        if max_retries <= 0:
+            return json.dumps({})
+
+        names = [{"service": service} for service in _RETRY_SERVICES]
+        names += [{"service": "qdrant.Collections", "method": method} for method in _RETRY_COLLECTION_METHODS]
+
+        # gRPC requires strictly positive backoffs.
+        initial = max(backoff_base, 0.01)
+        ceiling = max(backoff_cap, initial)
+
+        return json.dumps({
+            "methodConfig": [
+                {
+                    "name": names,
+                    "retryPolicy": {
+                        "maxAttempts": max_retries + 1,
+                        "initialBackoff": f"{initial:.3f}s",
+                        "maxBackoff": f"{ceiling:.3f}s",
+                        "backoffMultiplier": 2,
+                        "retryableStatusCodes": ["UNAVAILABLE"],
+                    },
+                }
+            ]
+        })

@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
     # Every client registers its own shutdown as soon as it exists, so a failed
     # dependency check below still closes whatever was already opened (LIFO).
     async with AsyncExitStack() as stack:
-        store = QdrantStore.from_settings(settings.qdrant_settings)
+        store = QdrantStore.from_settings(settings.qdrant_settings, settings.http_settings)
         stack.push_async_callback(store.close)
 
         retriever = RetrieverClient.from_settings(settings.retriever_settings, settings.http_settings)

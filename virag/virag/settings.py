@@ -30,6 +30,9 @@ class RagSettings:
 @dataclass(slots=True, frozen=True)
 class QdrantStoreSettings:
     base_url: str
+    grpc_port: int
+    timeout: int
+    max_retries: int
     collection_name: str
     vector_size: int
     distance_type: Distance
@@ -162,6 +165,29 @@ class Settings:
         qdrant_base_url = os.environ.get(
             "QDRANT_BASE_URL",
             "http://qdrant-service:6333",
+        )
+
+        # The data path speaks gRPC (one multiplexed HTTP/2 channel); QDRANT_BASE_URL
+        # names the host and the REST port, still used by the /qdrant proxy.
+        qdrant_grpc_port = int_coercion(
+            os.environ.get("QDRANT_GRPC_PORT", "6334"),
+            "QDRANT_GRPC_PORT",
+            low=1,
+            high=65535,
+        )
+
+        qdrant_timeout = int_coercion(
+            os.environ.get("QDRANT_TIMEOUT_SEC", "60"),
+            "QDRANT_TIMEOUT_SEC",
+            low=1,
+        )
+
+        # gRPC caps a retry policy at 5 attempts in total.
+        qdrant_max_retries = int_coercion(
+            os.environ.get("QDRANT_MAX_RETRIES", "3"),
+            "QDRANT_MAX_RETRIES",
+            low=0,
+            high=4,
         )
 
         qdrant_collection_name = os.environ.get(
@@ -425,6 +451,9 @@ class Settings:
             ),
             qdrant_settings=QdrantStoreSettings(
                 base_url=qdrant_base_url,
+                grpc_port=qdrant_grpc_port,
+                timeout=qdrant_timeout,
+                max_retries=qdrant_max_retries,
                 collection_name=qdrant_collection_name,
                 vector_size=qdrant_vector_size,
                 distance_type=qdrant_distance_type,
