@@ -38,12 +38,33 @@ class SecretMismatch(GeometryMismatch):
     """
 
 
+class OutdatedVolume(GeometryMismatch):
+    """Fatal: the volume predates columns the current schema needs.
+
+    Old volumes are not migrated in place; subclassing GeometryMismatch makes the
+    same startup catch sites treat it as fatal.
+    """
+
+
 async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
     """Initialise service_meta on a fresh volume, or fail on geometry drift.
 
-    Geometry-tier mismatch raises GeometryMismatch (fatal); a pixel-tier-only
-    change is logged as a warning and allowed.
+    A volume older than the current schema raises OutdatedVolume and a geometry-tier
+    mismatch raises GeometryMismatch (both fatal); a pixel-tier-only change is logged
+    as a warning and allowed.
     """
+    missing = await store.missing_columns()
+
+    if missing:
+        message = (
+            f"FATAL: volume was created by an older tiler and lacks {missing}; it is not "
+            "migrated in place. Refusing to start. Point TILER_DB_PATH/TILER_BLOB_DIR at "
+            "a fresh volume and re-ingest."
+        )
+        log.critical(message)
+
+        raise OutdatedVolume(message)
+
     row = await store.get_service_meta()
     geometry = settings.geometry
     render_version = settings.render_version

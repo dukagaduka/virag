@@ -5,9 +5,10 @@ import io
 import os
 from pathlib import Path
 
+import pymupdf
 import pytest
 import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
+from httpx2 import ASGITransport, AsyncClient
 
 DEFAULT_SCHEMA = """
 version: 1
@@ -76,13 +77,11 @@ async def client(tmp_path):
 # Fixture documents
 # --------------------------------------------------------------------------- #
 def make_pdf(pages: int = 3, width: float = 595, height: float = 842) -> bytes:
-    import fitz
-
-    doc = fitz.open()
+    doc = pymupdf.open()
     for i in range(pages):
         page = doc.new_page(width=width, height=height)
         page.insert_text((72, 100 + i * 10), f"Tiler test page {i}", fontsize=24)
-        page.draw_rect(fitz.Rect(40, 40, width - 40, height - 40))
+        page.draw_rect(pymupdf.Rect(40, 40, width - 40, height - 40))
     data = doc.tobytes()
     doc.close()
     return data

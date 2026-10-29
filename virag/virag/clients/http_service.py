@@ -96,17 +96,25 @@ class HttpService(ABC):
         url: str,
         *,
         retry: bool = True,
+        retry_read_timeouts: bool = False,
         stream: bool = False,
         **kwargs,
     ) -> httpx2.Response:
         """Send one request, replaying it on a transient failure (RETRY_ERRORS or a
         RETRY_STATUSES reply) with jittered exponential backoff.
 
+        A read timeout is replayed only with `retry_read_timeouts`: for interactive
+        calls a slow upstream only gets slower under replays, but an idempotent bulk
+        call (already capped in concurrency) should ride out an upstream that stalls
+        now and then rather than fail its whole batch.
+
         The final response is returned whatever its status, so passthrough callers
         can relay it verbatim. A `stream=True` response must be closed by the caller.
         """
         attempts = self.max_retries + 1 if retry else 1
         attempt = 0
+
+        retryable = self.RETRY_ERRORS + (httpx2.ReadTimeout,) if retry_read_timeouts else self.RETRY_ERRORS
 
         while True:
             last = attempt >= attempts - 1
@@ -116,7 +124,7 @@ class HttpService(ABC):
                 request = self.http.build_request(method, url, **kwargs)
                 response = await self.http.send(request, stream=stream)
 
-            except self.RETRY_ERRORS:
+            except retryable:
                 if last:
                     raise
 
@@ -143,6 +151,7 @@ class HttpService(ABC):
         *,
         action: str,
         retry: bool = True,
+        retry_read_timeouts: bool = False,
         passthrough_statuses: Collection[int] = (),
         **kwargs,
     ) -> httpx2.Response:
@@ -150,14 +159,16 @@ class HttpService(ABC):
         becomes an ApiError(503) naming the `action`. Statuses listed in
         `passthrough_statuses` are returned instead, for the caller to handle."""
         try:
-            response = await self.send(method, url, retry=retry, **kwargs)
+            response = await self.send(
+                method,
+                url,
+                retry=retry,
+                retry_read_timeouts=retry_read_timeouts,
+                **kwargs,
+            )
 
         except httpx2.RequestError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Cannot reach {url} during {action}",
-                details={"error": repr(e)},
-            ) from e
+            raise self._transport_error(url, action, e) from e
 
         if not response.is_success and response.status_code not in passthrough_statuses:
             raise ApiError(
@@ -186,11 +197,7 @@ class HttpService(ABC):
             response = await self.send(method, url, retry=retry, stream=True, **kwargs)
 
         except httpx2.RequestError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Cannot reach {url} during {action}",
-                details={"error": repr(e)},
-            ) from e
+            raise self._transport_error(url, action, e) from e
 
         try:
             if not response.is_success:
@@ -228,6 +235,22 @@ class HttpService(ABC):
                 message=f"Cannot decode {response.url} response or unexpected response structure during {action}",
                 details={"base_message": str(e)},
             ) from e
+
+
+    @staticmethod
+    def _transport_error(url: str, action: str, error: httpx2.RequestError) -> ApiError:
+        """ApiError(503) for a transport failure — a timeout is told apart from an
+        unreachable upstream, since a reachable-but-silent server needs other action."""
+        if isinstance(error, httpx2.TimeoutException):
+            message = f"Timed out waiting for {url} during {action}"
+        else:
+            message = f"Cannot reach {url} during {action}"
+
+        return ApiError(
+            status_code=503,
+            message=message,
+            details={"error": repr(error)},
+        )
 
 
     def _backoff(self, attempt: int) -> float:

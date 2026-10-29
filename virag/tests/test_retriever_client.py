@@ -275,3 +275,25 @@ def test_check_rejects_unsupported_priority():
 
     with pytest.raises(ApiError, match="scheduling-policy priority"):
         _run(retriever.check_connection())
+
+
+def test_bulk_rides_out_a_stalled_upstream_queries_do_not():
+    def stall_once():
+        state = {"stalled": False}
+
+        def handler(req, n):
+            if not state["stalled"]:
+                state["stalled"] = True
+                raise httpx2.ReadTimeout("stalled", request=req)
+            return _ok(json.loads(req.content))
+
+        return handler
+
+    bulk = _retriever(max_retries=2)
+    _mock(bulk, stall_once())
+    assert len(_run(bulk.embed_texts(["a"], bulk=True))) == 1
+
+    query = _retriever(max_retries=2)
+    _mock(query, stall_once())
+    with pytest.raises(ApiError, match="Timed out"):
+        _run(query.embed_texts(["a"]))

@@ -13,23 +13,25 @@ license = { text = "Proprietary" }
 # Single source of truth for runtime dependencies. The Docker build reads this
 # list straight out of pyproject (see Dockerfile) — there is no requirements.txt.
 dependencies = [
-    "fastapi==0.115.6",
-    "uvicorn[standard]==0.34.0",
-    "playwright==1.49.1",
-    "pymupdf==1.25.1",
-    "pillow==11.1.0",
-    "aiosqlite==0.20.0",
-    "pysqlite3-binary==0.5.4",
-    "python-multipart==0.0.20",
-    "pyyaml==6.0.2",
-    "prometheus-client==0.21.1",
+    "fastapi==0.162.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.1",
+    "uvicorn[standard]==0.54.0",
+    "playwright==1.64.1",
+    "pymupdf==1.28.2",
+    "pillow==13.0.0",
+    "aiosqlite==0.22.1",
+    "pysqlite3-binary==0.5.4.post2",
+    "python-multipart==0.0.32",
+    "pyyaml==6.0.3",
+    "prometheus-client==0.26.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest==8.3.4",
-    "pytest-asyncio==0.25.0",
-    "httpx==0.28.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "httpx2==2.16.0",
 ]
 
 [tool.pytest.ini_options]

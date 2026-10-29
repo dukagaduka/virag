@@ -17,21 +17,23 @@ from .ssrf import BlockedTarget, resolve_and_check
 
 log = logging.getLogger("tiler.netguard")
 
-_MAX_HEADER_BYTES = 64 * 1024
-_HOP_BY_HOP = {
-    b"proxy-connection",
-    b"proxy-authorization",
-    b"connection",
-    b"keep-alive",
-    b"te",
-    b"trailer",
-    b"transfer-encoding",
-    b"upgrade",
-}
-
 
 class GuardProxy:
     """A one-request-per-connection forward proxy bound to 127.0.0.1."""
+
+    MAX_HEADER_BYTES = 64 * 1024
+
+    # Connection-scoped request headers that must not be forwarded upstream.
+    HOP_BY_HOP = {
+        b"proxy-connection",
+        b"proxy-authorization",
+        b"connection",
+        b"keep-alive",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"upgrade",
+    }
 
 
     def __init__(self, *, allow_private: bool = False, connect_timeout: float = 15.0):
@@ -78,11 +80,11 @@ class GuardProxy:
             )
 
         except Exception:
-            await _close(writer)
+            await self._close(writer)
             return
 
-        if len(head) > _MAX_HEADER_BYTES:
-            await _respond(writer, 431, "Request Header Fields Too Large")
+        if len(head) > self.MAX_HEADER_BYTES:
+            await self._respond(writer, 431, "Request Header Fields Too Large")
             return
 
         lines = head.split(b"\r\n")
@@ -91,7 +93,7 @@ class GuardProxy:
             method, target, version = lines[0].split(b" ", 2)
 
         except ValueError:
-            await _respond(writer, 400, "Bad Request")
+            await self._respond(writer, 400, "Bad Request")
             return
 
         try:
@@ -103,14 +105,14 @@ class GuardProxy:
         except BlockedTarget as exc:
             self.blocked.append(str(exc))
             log.warning("SSRF guard blocked a browser request: %s", exc)
-            await _respond(writer, 403, "Blocked by SSRF policy")
+            await self._respond(writer, 403, "Blocked by SSRF policy")
 
         except asyncio.TimeoutError:
-            await _respond(writer, 504, "Upstream timeout")
+            await self._respond(writer, 504, "Upstream timeout")
 
         except Exception as exc:  # pragma: no cover - transport noise
             log.debug("proxy connection failed: %s", exc)
-            await _close(writer)
+            await self._close(writer)
 
 
     async def _dial(self, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -150,7 +152,7 @@ class GuardProxy:
         up_reader, up_writer = await self._dial(host, port)
         writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await writer.drain()
-        await _pipe_both(reader, writer, up_reader, up_writer)
+        await self._pipe_both(reader, writer, up_reader, up_writer)
 
 
     async def _do_plain(
@@ -189,7 +191,7 @@ class GuardProxy:
 
             name = line.split(b":", 1)[0].strip().lower()
 
-            if name in _HOP_BY_HOP:
+            if name in self.HOP_BY_HOP:
                 continue
 
             out.append(line)
@@ -197,63 +199,73 @@ class GuardProxy:
         out.append(b"Connection: close")
         up_writer.write(b"\r\n".join(out) + b"\r\n\r\n")
         await up_writer.drain()
-        await _pipe_both(reader, writer, up_reader, up_writer)
+        await self._pipe_both(reader, writer, up_reader, up_writer)
 
 
-async def _pipe_both(
-    c_reader: asyncio.StreamReader,
-    c_writer: asyncio.StreamWriter,
-    u_reader: asyncio.StreamReader,
-    u_writer: asyncio.StreamWriter,
-) -> None:
-    """Splice client and upstream in both directions until either closes."""
-    await asyncio.gather(
-        _pump(c_reader, u_writer), _pump(u_reader, c_writer), return_exceptions=True
-    )
-    await asyncio.gather(_close(c_writer), _close(u_writer), return_exceptions=True)
+    @staticmethod
+    async def _pipe_both(
+        c_reader: asyncio.StreamReader,
+        c_writer: asyncio.StreamWriter,
+        u_reader: asyncio.StreamReader,
+        u_writer: asyncio.StreamWriter,
+    ) -> None:
+        """Splice client and upstream in both directions until either closes."""
+        await asyncio.gather(
+            GuardProxy._pump(c_reader, u_writer),
+            GuardProxy._pump(u_reader, c_writer),
+            return_exceptions=True,
+        )
+        await asyncio.gather(
+            GuardProxy._close(c_writer),
+            GuardProxy._close(u_writer),
+            return_exceptions=True,
+        )
 
 
-async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Copy bytes from `reader` to `writer` until EOF."""
-    try:
-        while chunk := await reader.read(65536):
-            writer.write(chunk)
-            await writer.drain()
-
-    except Exception:
-        pass
-
-    finally:
+    @staticmethod
+    async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Copy bytes from `reader` to `writer` until EOF."""
         try:
-            writer.write_eof()
+            while chunk := await reader.read(65536):
+                writer.write(chunk)
+                await writer.drain()
 
         except Exception:
             pass
 
+        finally:
+            try:
+                writer.write_eof()
 
-async def _respond(writer: asyncio.StreamWriter, status: int, reason: str) -> None:
-    """Send a minimal plaintext HTTP response and close the connection."""
-    body = reason.encode()
-
-    try:
-        writer.write(
-            f"HTTP/1.1 {status} {reason}\r\nContent-Length: {len(body)}\r\n"
-            f"Content-Type: text/plain\r\nConnection: close\r\n\r\n".encode()
-            + body
-        )
-        await writer.drain()
-
-    except Exception:
-        pass
-
-    await _close(writer)
+            except Exception:
+                pass
 
 
-async def _close(writer: asyncio.StreamWriter) -> None:
-    """Close a writer, swallowing shutdown-race errors."""
-    try:
-        writer.close()
-        await writer.wait_closed()
+    @staticmethod
+    async def _respond(writer: asyncio.StreamWriter, status: int, reason: str) -> None:
+        """Send a minimal plaintext HTTP response and close the connection."""
+        body = reason.encode()
 
-    except Exception:
-        pass
+        try:
+            writer.write(
+                f"HTTP/1.1 {status} {reason}\r\nContent-Length: {len(body)}\r\n"
+                f"Content-Type: text/plain\r\nConnection: close\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+
+        except Exception:
+            pass
+
+        await GuardProxy._close(writer)
+
+
+    @staticmethod
+    async def _close(writer: asyncio.StreamWriter) -> None:
+        """Close a writer, swallowing shutdown-race errors."""
+        try:
+            writer.close()
+            await writer.wait_closed()
+
+        except Exception:
+            pass

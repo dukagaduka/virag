@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from conftest import base_env, make_png, png_form, running_app
 
@@ -40,6 +42,22 @@ async def test_geometry_change_is_fatal(tmp_path, changed):
         async with running_app(base_env(tmp_path, **changed)) as (_, _svc):
             pass
     assert exit_info.value.code == 1  # exits non-zero, serves nothing
+
+
+async def test_outdated_volume_is_fatal(tmp_path, caplog):
+    env = base_env(tmp_path)
+    async with running_app(env) as (client, _):
+        pass  # initialise the volume
+
+    # Simulate a volume created before PDF strip slicing existed.
+    with sqlite3.connect(env["TILER_DB_PATH"]) as db:
+        db.execute("ALTER TABLE docs DROP COLUMN page_heights")
+
+    with pytest.raises(SystemExit) as exit_info:
+        async with running_app(env) as (_, _svc):
+            pass
+    assert exit_info.value.code == 1
+    assert any("docs.page_heights" in r.message for r in caplog.records)
 
 
 async def test_pixel_tier_change_only_warns(tmp_path, caplog):

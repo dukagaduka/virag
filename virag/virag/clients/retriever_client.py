@@ -21,9 +21,10 @@ class RetrieverClient(OpenAIService):
     `messages` (a vLLM extension); several images per request only when the upstream
     accepts a batch of conversations (see `image_batching` and `check_connection`).
 
-    Calls marked `bulk` (enroll, reconcile, revision) are capped by `max_concurrency`
-    and may carry `bulk_priority`; interactive calls (chat queries) bypass both, so a
-    large ingest never queues a user's query behind it.
+    Calls marked `bulk` (enroll, reconcile, revision) are capped by `max_concurrency`,
+    may carry `bulk_priority` and also replay read timeouts (an upstream that stalls
+    now and then must not fail a whole batch); interactive calls (chat queries) bypass
+    all three, so a large ingest never queues a user's query behind it.
     """
 
     # Replies meaning the upstream rejected the *content* of a request (bad item, body
@@ -234,6 +235,7 @@ class RetrieverClient(OpenAIService):
                 "POST",
                 self.route,
                 action="embedding",
+                retry_read_timeouts=bulk,
                 passthrough_statuses=self.SPLIT_STATUSES,
                 json=body,
             )

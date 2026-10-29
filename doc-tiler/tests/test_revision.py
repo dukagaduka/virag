@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from conftest import pdf_form
+from conftest import base_env, make_pdf, pdf_form, running_app
 
 
 def _render_count(service, doc_type: str, path: str) -> float:
@@ -58,3 +58,29 @@ async def test_revision_heals_incomplete_doc(client, sample_pdf):
     row = await svc.store.get_doc(doc_id)
     assert row.complete is True
     assert row.tile_count == 3                      # sample_pdf has 3 pages
+
+
+async def test_revision_keeps_pdf_strip_slicing(tmp_path):
+    """A revised sliced PDF keeps its strip layout: page_heights survive, the tile count
+    is unchanged and every strip still regenerates to its stored hash."""
+    env = base_env(
+        tmp_path,
+        TILER_PDF_SLICE_ENABLE="true",
+        TILER_PDF_TILE_HEIGHT="500",
+        TILER_PDF_TILE_OVERLAP="100",
+    )
+    async with running_app(env) as (client, svc):
+        manifest = (await client.post("/tile", **pdf_form(make_pdf(pages=3)))).json()
+        doc_id = manifest["doc_id"]
+
+        r = await client.post("/revision", params={"force": "true"})
+        assert r.status_code == 200, r.text
+        assert r.json()["revised"] == 1
+
+        row = await svc.store.get_doc(doc_id)
+        assert row.page_heights                                     # still sliced
+        assert row.tile_count == manifest["tile_count"] > 3
+
+        for tile_num in range(row.tile_count):
+            got = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": tile_num})
+            assert got.status_code == 200, got.text                # verified against the stored hash

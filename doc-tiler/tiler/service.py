@@ -36,11 +36,11 @@ from .store.meta import DocRow, MetaStore, TileRow
 
 log = logging.getLogger("tiler.service")
 
-MAX_PDF_CHUNK = 16  # pages per process-pool task: bounds pickle size per hop
-
 
 class TilerService:
     """Owns the pools, stores and caches; runs ingest and tile regeneration."""
+
+    MAX_PDF_CHUNK = 16  # pages per process-pool task: bounds pickle size per hop
 
 
     def __init__(self, settings: Settings, schema: MetadataSchema):
@@ -136,7 +136,7 @@ class TilerService:
         if pages <= 0:
             raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
 
-        chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.render_workers))))
+        chunk = max(1, min(self.MAX_PDF_CHUNK, math.ceil(pages / max(1, s.render_workers))))
         groups = [list(range(i, min(i + chunk, pages))) for i in range(0, pages, chunk)]
 
         if not s.pdf_slice:
@@ -392,7 +392,7 @@ class TilerService:
         if pages <= 0:
             raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
 
-        chunk = max(1, min(MAX_PDF_CHUNK, math.ceil(pages / max(1, s.render_workers))))
+        chunk = max(1, min(self.MAX_PDF_CHUNK, math.ceil(pages / max(1, s.render_workers))))
         groups = [list(range(i, min(i + chunk, pages))) for i in range(0, pages, chunk)]
 
         if not s.pdf_slice:
@@ -677,6 +677,9 @@ class TilerService:
             blob_rel_path=row.blob_rel_path,
             source_url=row.source_url,
             page_height=rendered.page_height,
+            # Without it a sliced PDF would fall back to page-per-tile: strips past the
+            # page count 422 and the rest regenerate as whole pages (hash mismatch).
+            page_heights=rendered.page_heights,
             tile_count=len(rendered.tiles),
             mime_type=row.mime_type,
             metadata=row.metadata,
@@ -979,6 +982,6 @@ class TilerService:
             checks["browser"] = "disabled"
 
         return ok, checks
-    
+
 
 __all__ = ["TilerService", "RenderedTile", "RenderedDoc", "ApiError"]

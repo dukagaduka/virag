@@ -13,6 +13,23 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 class ApiError(Exception):
     """Domain error carrying the wire status + machine-readable code."""
 
+    # Wire status -> the default machine-readable `code` (used for framework errors).
+    STATUS_CODES = {
+        400: "BAD_REQUEST",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        405: "METHOD_NOT_ALLOWED",
+        409: "CONFLICT",
+        413: "PAYLOAD_TOO_LARGE",
+        415: "UNSUPPORTED_MEDIA",
+        416: "RANGE_NOT_SATISFIABLE",
+        422: "UNPROCESSABLE",
+        500: "INTERNAL_ERROR",
+        502: "UPSTREAM_FAILURE",
+        503: "NOT_READY",
+        504: "RENDER_TIMEOUT",
+    }
+
 
     def __init__(
         self,
@@ -84,22 +101,6 @@ def gateway_timeout(msg: str, code: str = "RENDER_TIMEOUT", **details: Any) -> A
     return ApiError(504, code, msg, details or None)
 
 
-_STATUS_CODES = {
-    400: "BAD_REQUEST",
-    403: "FORBIDDEN",
-    404: "NOT_FOUND",
-    405: "METHOD_NOT_ALLOWED",
-    409: "CONFLICT",
-    413: "PAYLOAD_TOO_LARGE",
-    415: "UNSUPPORTED_MEDIA",
-    416: "RANGE_NOT_SATISFIABLE",
-    422: "UNPROCESSABLE",
-    500: "INTERNAL_ERROR",
-    502: "UPSTREAM_FAILURE",
-    503: "NOT_READY",
-    504: "RENDER_TIMEOUT",
-}
-
 
 def install_error_handlers(app: Any) -> None:
     """Register exception handlers that shape all errors into the envelope."""
@@ -112,7 +113,7 @@ def install_error_handlers(app: Any) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
         """Wrap a raw Starlette HTTP exception in the error envelope."""
-        code = _STATUS_CODES.get(exc.status_code, "ERROR")
+        code = ApiError.STATUS_CODES.get(exc.status_code, "ERROR")
 
         return JSONResponse(
             status_code=exc.status_code,

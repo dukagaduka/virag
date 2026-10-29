@@ -9,22 +9,29 @@ FROM python:3.11-slim AS runtime
 # ---------------------------------------------------------------------------
 # System deps: Chromium's runtime libraries + deterministic fonts (see
 # docs/ARCHITECTURE.md, "Rendering determinism").
+#
+# apt's package lists and downloaded .debs live in BuildKit cache mounts — outside
+# the image, kept between builds — so a rebuild does not re-download them. The
+# slim image's docker-clean hook (which deletes .debs after install) is disabled
+# for that reason; nothing of the cache ends up in a layer.
 # ---------------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+ && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache \
+ && apt-get update && apt-get install -y --no-install-recommends \
       fonts-noto fonts-noto-cjk fonts-noto-color-emoji fonts-liberation \
       libglib2.0-0 libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
       libcups2 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 \
       libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
       libxext6 libx11-6 libxcb1 libexpat1 libudev1 curl tini \
-    && rm -rf /var/lib/apt/lists/* \
-    && fc-cache -f
+ && fc-cache -f
 
 ENV TZ=UTC \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # ---------------------------------------------------------------------------
@@ -47,35 +54,44 @@ WORKDIR /app
 # pyproject.toml is the single source of truth for dependencies (built with
 # hatchling). We extract just the runtime dependency list with stdlib tomllib and
 # pip-install it, so this heavy layer is cached on pyproject.toml alone and does
-# not depend on the application source copied later.
+# not depend on the application source copied later. pip's download cache is a
+# BuildKit cache mount, so changing one dependency doesn't re-download the rest.
+# pip is upgraded first for --resume-retries: on a flaky link a dropped download
+# resumes instead of failing the whole build.
 COPY pyproject.toml .
-RUN python -c "import tomllib; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c "import tomllib; \
 open('/tmp/reqs.txt','w').write(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" \
- && pip install --no-cache-dir -r /tmp/reqs.txt \
+ && pip install --upgrade "pip>=25.1" \
+ && pip install --retries 10 --timeout 120 --resume-retries 10 -r /tmp/reqs.txt \
  && rm /tmp/reqs.txt
 
 # We run Chromium headless only, so we ship just the lightweight headless shell
-# (launch(headless=True) uses it on Playwright 1.49+, not the full browser). It
-# comes either from a vendored copy in the build context (offline / air-gapped /
-# unreachable-CDN builds — see scripts/vendor-chromium.sh) or from the CDN with
-# retries, since a single timed-out socket should not fail the build. `vendor/` is
-# normally empty apart from .keep.
+# (launch(headless=True) uses it on Playwright 1.49+, not the full browser).
+#
+# A vendored copy in the build context (scripts/vendor-chromium.sh) only *seeds*
+# the browsers dir; `playwright install` always runs after it — a no-op when the
+# seed matches the pinned Playwright revision (so offline / air-gapped builds keep
+# working), a CDN download with retries when it doesn't. Revisions other than the
+# pinned one are then removed, so a stale seed never ships. The launch smoke test
+# below is the real check. `vendor/` is normally empty apart from .keep.
 COPY vendor/ /tmp/vendor/
 RUN set -eu; \
-    if ls /tmp/vendor/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell >/dev/null 2>&1; then \
-      echo "using vendored headless shell from the build context"; \
-      mkdir -p ${PLAYWRIGHT_BROWSERS_PATH}; \
+    mkdir -p ${PLAYWRIGHT_BROWSERS_PATH}; \
+    if ls -d /tmp/vendor/ms-playwright/chromium_headless_shell-* >/dev/null 2>&1; then \
+      echo "seeding browsers from the vendored copy in the build context"; \
       cp -a /tmp/vendor/ms-playwright/. ${PLAYWRIGHT_BROWSERS_PATH}/; \
-    else \
-      for attempt in 1 2 3 4 5; do \
-        python -m playwright install chromium-headless-shell && break; \
-        echo "playwright install failed (attempt ${attempt}); retrying..."; \
-        sleep 15; \
-      done; \
     fi; \
     rm -rf /tmp/vendor; \
-    ls ${PLAYWRIGHT_BROWSERS_PATH}/chromium_headless_shell-*/chrome-linux/headless_shell >/dev/null 2>&1 \
-      || { echo "FATAL: Chromium headless shell was not installed"; exit 1; }; \
+    for attempt in 1 2 3 4 5; do \
+      python -m playwright install chromium-headless-shell && break; \
+      echo "playwright install failed (attempt ${attempt}); retrying..."; \
+      sleep 15; \
+    done; \
+    python -c "import json, pathlib, shutil, playwright; \
+browsers = json.loads((pathlib.Path(playwright.__file__).parent / 'driver/package/browsers.json').read_text())['browsers']; \
+keep = 'chromium_headless_shell-' + next(b['revision'] for b in browsers if b['name'] == 'chromium-headless-shell'); \
+[shutil.rmtree(d) for d in pathlib.Path('${PLAYWRIGHT_BROWSERS_PATH}').glob('chromium_headless_shell-*') if d.name != keep]"; \
     chmod -R a+rX ${PLAYWRIGHT_BROWSERS_PATH}
 
 # Fail the build — not the first request — if the browser cannot actually launch
@@ -124,9 +140,11 @@ FROM runtime AS test
 USER root
 # Dev/test dependencies come from pyproject's optional-dependencies.dev group
 # (pyproject.toml is already at /app from the runtime stage).
-RUN python -c "import tomllib; \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -c "import tomllib; \
 open('/tmp/dev.txt','w').write(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['project']['optional-dependencies']['dev']))" \
- && pip install --no-cache-dir -r /tmp/dev.txt \
+ && pip install --upgrade "pip>=25.1" \
+ && pip install --retries 10 --timeout 120 --resume-retries 10 -r /tmp/dev.txt \
  && rm /tmp/dev.txt
 COPY --chown=10001:10001 tests/ ./tests/
 # pytest config lives in pyproject.toml ([tool.pytest.ini_options]), already at /app.

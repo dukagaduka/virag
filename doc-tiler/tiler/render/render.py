@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import io
 
-import fitz  # PyMuPDF
+import pymupdf
 from PIL import Image, ImageOps
 
 from ..config import JPEG_PROGRESSIVE, JPEG_SUBSAMPLING
@@ -78,7 +78,7 @@ def _fit_width(img: Image.Image, width: int) -> Image.Image:
 
     new_h = resized_height(img.width, img.height, width)
 
-    return img.resize((width, new_h), Image.LANCZOS)
+    return img.resize((width, new_h), Image.Resampling.LANCZOS)
 
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +87,7 @@ def _fit_width(img: Image.Image, width: int) -> Image.Image:
 def pdf_page_count(blob: bytes) -> int:
     """Number of pages in a PDF blob; raise DecodeError if it cannot be opened."""
     try:
-        with fitz.open(stream=blob, filetype="pdf") as doc:
+        with pymupdf.open(stream=blob, filetype="pdf") as doc:
             if doc.needs_pass:
                 raise DecodeError("PDF is password protected")
 
@@ -109,7 +109,7 @@ def render_pdf_pages(
 ) -> list[EncodedTile]:
     """Render the requested pages (all when None), one tile per page, tile_num == page_num."""
     try:
-        doc = fitz.open(stream=blob, filetype="pdf")
+        doc = pymupdf.open(stream=blob, filetype="pdf")
 
     except Exception as exc:
         raise DecodeError(f"cannot open PDF: {exc}") from exc
@@ -155,7 +155,7 @@ def render_pdf_page_strips(
     regenerated strip is byte-identical to the one hashed at ingest.
     """
     try:
-        doc = fitz.open(stream=blob, filetype="pdf")
+        doc = pymupdf.open(stream=blob, filetype="pdf")
 
     except Exception as exc:
         raise DecodeError(f"cannot open PDF: {exc}") from exc
@@ -207,7 +207,7 @@ def crop_pdf_page_strip(
     The crop box mirrors `render_pdf_page_strips` exactly → byte-identical output.
     """
     try:
-        doc = fitz.open(stream=blob, filetype="pdf")
+        doc = pymupdf.open(stream=blob, filetype="pdf")
 
     except Exception as exc:
         raise DecodeError(f"cannot open PDF: {exc}") from exc

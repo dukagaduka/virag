@@ -113,6 +113,32 @@ def test_read_timeout_is_not_retried():
     assert len(seen) == 1
 
 
+def test_read_timeout_is_retried_when_asked():
+    svc = _Service("http://up", max_retries=2, **_HTTP)
+
+    def handler(req, n):
+        if n == 1:
+            raise httpx2.ReadTimeout("stalled", request=req)
+        return httpx2.Response(200)
+
+    seen = _mock(svc, handler)
+
+    assert _run(svc.send("GET", "http://up/x", retry_read_timeouts=True)).status_code == 200
+    assert len(seen) == 2
+
+
+def test_timeout_is_reported_as_timeout():
+    svc = _Service("http://up", max_retries=0, **_HTTP)
+
+    def handler(req, n):
+        raise httpx2.ReadTimeout("stalled", request=req)
+
+    _mock(svc, handler)
+
+    with pytest.raises(ApiError, match="Timed out waiting for"):
+        _run(svc._request("GET", "http://up/x", action="the test"))
+
+
 def test_backoff_is_capped_and_jittered():
     svc = _Service("http://up", max_retries=0, timeout=5, connect_timeout=5, max_connections=4,
                    max_concurrency=0, backoff_base=1, backoff_cap=4)

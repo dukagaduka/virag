@@ -240,6 +240,14 @@ def build_search_query(
 class MetaStore:
     """Async wrapper over the SQLite database backing docs, tiles, and search."""
 
+    # Columns that older volumes lacked (binding secret, streaming ingest, PDF strip
+    # slicing). They are in DDL for fresh volumes; an old volume without them is not
+    # migrated — the guard refuses it at startup instead.
+    REQUIRED_COLUMNS = {
+        "service_meta": ("secret_hash",),
+        "docs": ("complete", "page_heights"),
+    }
+
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -285,32 +293,20 @@ class MetaStore:
             for stmt in DDL:
                 await self.db.execute(stmt)
 
-            # Migrate volumes created before the binding secret existed: the column
-            # backfills to '' (an empty slot), matching a tiler run without a secret.
-            cur = await self.db.execute("PRAGMA table_info(service_meta)")
-            columns = {row["name"] for row in await cur.fetchall()}
-
-            if "secret_hash" not in columns:
-                await self.db.execute(
-                    "ALTER TABLE service_meta ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''"
-                )
-
-            # Migrate volumes created before streaming ingest: pre-existing docs were
-            # written atomically, so they backfill to complete=1.
-            cur = await self.db.execute("PRAGMA table_info(docs)")
-            doc_columns = {row["name"] for row in await cur.fetchall()}
-
-            if "complete" not in doc_columns:
-                await self.db.execute(
-                    "ALTER TABLE docs ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
-                )
-
-            # Migrate volumes created before PDF strip slicing: page_heights backfills to
-            # NULL, i.e. "not sliced" — get_tile then falls back to page-per-tile PDF.
-            if "page_heights" not in doc_columns:
-                await self.db.execute("ALTER TABLE docs ADD COLUMN page_heights TEXT")
-
             await self.db.commit()
+
+
+    async def missing_columns(self) -> list[str]:
+        """`table.column` names from REQUIRED_COLUMNS this volume lacks (an old volume)."""
+        missing = []
+
+        for table, columns in self.REQUIRED_COLUMNS.items():
+            cur = await self.db.execute(f"PRAGMA table_info({table})")
+            present = {row["name"] for row in await cur.fetchall()}
+
+            missing += [f"{table}.{column}" for column in columns if column not in present]
+
+        return missing
 
 
     async def create_metadata_indexes(self, statements: Iterable[str]) -> list[str]:

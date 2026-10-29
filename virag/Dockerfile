@@ -20,10 +20,13 @@ WORKDIR /app
 # extracted with stdlib tomllib so this layer caches on pyproject.toml alone.
 # pip's download cache lives in a BuildKit cache mount — outside the image, kept
 # between builds — so changing one dependency doesn't re-download all of them.
+# pip is upgraded first for --resume-retries: on a flaky link a dropped download
+# resumes instead of failing the whole build.
 COPY pyproject.toml .
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -c "import tomllib; open('/tmp/reqs.txt','w').write(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))" \
- && pip install -r /tmp/reqs.txt \
+ && pip install --upgrade "pip>=25.1" \
+ && pip install --retries 10 --timeout 120 --resume-retries 10 -r /tmp/reqs.txt \
  && rm /tmp/reqs.txt
 
 COPY --chown=${APP_UID}:${APP_GID} virag/ ./virag/
