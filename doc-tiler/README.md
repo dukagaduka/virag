@@ -16,9 +16,6 @@ is the contract the embedding stage stores as its payload to later call `/get_ti
 ## Quickstart
 
 ```bash
-# optional but recommended: vendor Chromium before building so the build needs no CDN
-python -m playwright install chromium-headless-shell && ./scripts/vendor-chromium.sh
-
 cd deploy
 cp .env.example .env          # set TILER_DB_SECRET, adjust geometry/pixel if needed
 docker compose up --build

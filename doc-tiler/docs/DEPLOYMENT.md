@@ -9,11 +9,6 @@ mounted config file for the metadata schema. Everything below is driven from
 ## Quickstart (Compose)
 
 ```bash
-# 0. (recommended) vendor Chromium first, so the build needs no CDN access — see below
-python -m playwright install chromium-headless-shell
-./scripts/vendor-chromium.sh
-
-# 1. configure and start
 cd deploy
 cp .env.example .env          # set TILER_DB_SECRET and any geometry/pixel overrides
 docker compose up --build     # builds the runtime image, starts the service
@@ -23,18 +18,18 @@ curl -s localhost:8080/readyz | jq
 The service listens on **`:8080`** inside the container (`uvicorn --port 8080`), mapped
 to the host by the Compose port binding. Interactive API docs: `http://localhost:8080/docs`.
 
-Step 0 is optional — without it the build fetches Chromium from the Playwright CDN — but
-it must run **before** the build, so do it first (see "Vendoring Chromium" below).
+The build needs BuildKit (the `Dockerfile` uses cache mounts), which Docker runs through
+the `buildx` plugin — install `docker-buildx-plugin` if `docker build` reports it
+missing.
 
 ## Image
 
 A two-stage build (`Dockerfile`):
 
-- **`runtime`** (default) — the production image: FastAPI + the vendored
-  `chromium-headless-shell`, deterministic fonts, no test dependencies. Dependencies are
-  extracted from `pyproject.toml` with stdlib `tomllib` so the heavy pip layer caches on
-  `pyproject.toml` alone. The build **fails** if Chromium can't actually launch, rather
-  than deferring the failure to the first request.
+- **`runtime`** (default) — the production image: FastAPI + Playwright's
+  `chromium-headless-shell`, deterministic fonts, no test dependencies. The build
+  **fails** if Chromium can't actually launch, rather than deferring the failure to the
+  first request.
 - **`test`** — the same runtime plus the suite and its `dev` dependencies, for
   `docker compose --profile test run --rm tests`. Running the suite on the same image
   (same Chromium, same fonts) is what makes the rendering tests meaningful.
@@ -49,32 +44,46 @@ Startup is wrapped in `tini` (PID 1, reaps Chromium's zombie renderers) →
 geometry/secret guard **before** `exec`'ing uvicorn, so a misconfigured volume produces
 one clear log line instead of a generic ASGI startup failure.
 
-### Vendoring Chromium (run before the build)
+### Layers and what is pinned
 
-The image ships only the lightweight `chromium-headless-shell` (what
-`launch(headless=True)` uses on Playwright 1.49+ — the ~550 MB full bundle is dead weight
-for a headless-only service). At build time the `Dockerfile` picks it up from one of two
-places:
+The layers run from the most stable to the most volatile, so a rebuild only redoes what
+changed:
 
-1. a **vendored copy** in `vendor/ms-playwright/` (if present), or
-2. the **Playwright CDN**, downloaded with retries (the fallback).
+| Layer | Pinned by | Rebuilt when |
+|---|---|---|
+| Base image | `BASE_IMAGE` digest in the `Dockerfile` | the digest is bumped |
+| System packages (fonts, freetype, Chromium's libraries) | the dated `snapshot.debian.org` archive the base image was built from | the base digest is bumped |
+| Playwright + `chromium-headless-shell` | the `playwright==X.Y.Z` pin in `pyproject.toml` | the pin changes |
+| Remaining Python dependencies | their pins in `pyproject.toml` | `pyproject.toml` changes |
+| Application | — | the source changes |
 
-For an air-gapped build — or just to stop a flaky CDN socket from failing `docker build`
-— vendor it first, on a machine that *does* have network:
+- **Chromium is downloaded once per machine and pin** (from the Playwright CDN, with
+  retries) and reused from the layer cache afterwards: editing another dependency or the
+  code does not touch it. A small build stage cuts the `playwright` line out of
+  `pyproject.toml`, and only that line feeds the browser layer, so `pyproject.toml` stays
+  the single source of the version.
+- The image ships only the lightweight headless shell (what `launch(headless=True)` uses on
+  Playwright 1.49+); the ~550 MB full browser is dead weight for a headless-only service.
+- **System packages come from a dated Debian snapshot**, not the live mirrors: the same
+  base digest gives byte-identical fonts and libraries on any machine at any later date.
+  `--build-arg APT_SNAPSHOT=false` installs from the live mirrors instead (not
+  reproducible — use only if snapshot.debian.org is unreachable).
+- **To ship the image to a machine without CDN access**, push it to a registry, or
+  `docker save tiler:3.2.0 | ssh host docker load`.
 
-```bash
-python -m playwright install chromium-headless-shell   # populate the local Playwright cache
-./scripts/vendor-chromium.sh                           # copy that cache into ./vendor/ms-playwright
-docker compose up --build                              # now the build consumes ./vendor, no CDN
-```
+### Upgrading Chromium, fonts or the base
 
-- The vendored revision must match the `playwright` pin in `pyproject.toml`. It doesn't
-  have to be checked by hand: the image runs a Chromium launch smoke test at build time,
-  so a mismatch fails the **build**, not production.
-- `scripts/vendor-chromium.sh [source-cache-dir]` defaults its source to
-  `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`.
-- `vendor/*` is gitignored (only `.keep` is tracked) — it is a per-machine build
-  artifact, produced *before* the build, never committed.
+Every pinned layer above affects rendered pixels — the Chromium revision through
+`render_version`, the fonts and libraries silently. Upgrading is a deliberate act:
+
+1. Bump the `playwright` pin in `pyproject.toml` and/or the `BASE_IMAGE` digest.
+2. Rebuild and redeploy.
+3. Run the tiler's `POST /revision` (re-renders docs whose `render_version` changed; use
+   `force=true` after a base-only bump, which `render_version` does not see), then the
+   consumer's re-embed (virag's `POST /revision`).
+
+Until step 3 finishes, regenerated web/MHTML tiles may not match their stored
+`image_hash` (see `TILER_RENDER_MISMATCH_POLICY` in [CONFIG.md](CONFIG.md)).
 
 ## State & the named volume
 

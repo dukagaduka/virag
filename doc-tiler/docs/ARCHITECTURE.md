@@ -356,7 +356,9 @@ mismatch there is a bug.
 Pin the Chromium build (`TILER_CHROMIUM_REVISION`, baked in; no auto-update). Launched
 headless via Playwright (`headless=True` runs the lightweight `chromium-headless-shell`;
 the full browser is not shipped). Install deterministic fonts (`fonts-noto`,
-`fonts-noto-cjk`, `fonts-noto-color-emoji`, `fonts-liberation`). Viewport width
+`fonts-noto-cjk`, `fonts-noto-color-emoji`, `fonts-liberation`) — from a dated Debian
+snapshot tied to the pinned base image, so they do not drift between builds (fonts are
+not part of `render_version`; see [DEPLOYMENT.md](DEPLOYMENT.md)). Viewport width
 `TILER_TILE_WIDTH`, `device_scale_factor=1`, `TZ=UTC`, fixed locale. Disable
 animations; wait for `document.fonts.ready` + optional network-idle.
 

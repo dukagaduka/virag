@@ -1426,6 +1426,4 @@ erl_crash.dump
 ### local runtime 
 deploy/.env 
 .claude
-!scripts
-vendor/*
 TODO.md

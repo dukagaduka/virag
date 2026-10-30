@@ -128,5 +128,5 @@ The vLLM retriever server can take minutes to load a model; the tiler build (Chr
 can be slow too. Because `virag` retries until its fatal dependency checks pass, bring
 the stack up together and let it settle — `/ready` flips to `200` once the retriever, the
 tiler and the VLM all answer and the tiler↔Qdrant binding is satisfied. For the tiler's
-own build (vendoring Chromium, geometry/secret guard) see
+own build (pinned Chromium layer, geometry/secret guard) see
 [`../../doc-tiler/docs/DEPLOYMENT.md`](../../doc-tiler/docs/DEPLOYMENT.md).
