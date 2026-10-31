@@ -51,6 +51,7 @@ class DocSummary(BaseModel):
     doc_type: DocType
     tile_count: int
     complete: bool = True
+    quarantined: bool = False
     render_version: str | None = None
     created_at: int
     source_url: str | None = None

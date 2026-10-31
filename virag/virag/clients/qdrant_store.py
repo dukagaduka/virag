@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import logging
 import re
 import time
@@ -13,6 +12,7 @@ from typing import Sequence
 
 import grpc
 import numpy as np
+import orjson
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
@@ -223,11 +223,7 @@ class QdrantStore:
         # Estimate the serialized cost of one point and derive how many fit
         # into the byte budget, capped by `max_batch_chunks`. Payloads are
         # homogeneous, so a single sample is enough to size the batch.
-        payload_bytes = (
-            len(json.dumps(payloads[0], default=str).encode("utf-8"))
-            if payloads
-            else 0
-        )
+        payload_bytes = len(orjson.dumps(payloads[0], default=str)) if payloads else 0
 
         est_point_bytes = self.vector_size * self.BYTES_PER_FLOAT + payload_bytes
 
@@ -535,13 +531,16 @@ class QdrantStore:
         return getattr(info.config, "metadata", None) or {}
 
 
-    async def get_collection_metadata(self) -> dict:
-        return await self._collection_metadata(self.physical_name)
+    async def get_collection_metadata(self, *, collection: str | None = None) -> dict:
+        """Metadata of the serving collection, or of `collection` (a revision build or
+        the rollback target)."""
+        return await self._collection_metadata(collection or self.physical_name)
 
 
-    async def set_collection_metadata(self, metadata: dict) -> None:
+    async def set_collection_metadata(self, metadata: dict, *, collection: str | None = None) -> None:
+        """Merge `metadata` into the serving collection's (or `collection`'s) metadata."""
         await self.qdrant.update_collection(
-            collection_name=self.physical_name,
+            collection_name=collection or self.physical_name,
             metadata=metadata,
         )
 
@@ -620,7 +619,7 @@ class QdrantStore:
         """gRPC service config: replay `RETRY_*` methods on UNAVAILABLE with the channel's
         own jittered exponential backoff (the same base/cap as the HTTP upstreams)."""
         if max_retries <= 0:
-            return json.dumps({})
+            return "{}"
 
         names = [{"service": service} for service in cls.RETRY_SERVICES]
         names += [{"service": "qdrant.Collections", "method": method} for method in cls.RETRY_COLLECTION_METHODS]
@@ -629,7 +628,7 @@ class QdrantStore:
         initial = max(backoff_base, 0.01)
         ceiling = max(backoff_cap, initial)
 
-        return json.dumps({
+        return orjson.dumps({
             "methodConfig": [
                 {
                     "name": names,
@@ -642,4 +641,4 @@ class QdrantStore:
                     },
                 }
             ]
-        })
+        }).decode()

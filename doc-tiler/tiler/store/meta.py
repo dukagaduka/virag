@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 import aiosqlite
+import orjson
 
 from ..meta.schema import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
 from ..models import DocType
@@ -68,7 +68,23 @@ DDL = (
         FOREIGN KEY (doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE
     )
     """,
+    # Docs a revision could not re-render at `render_version`; their tiles answer 410.
+    # A table of its own (not a docs column), so existing volumes need no migration.
+    """
+    CREATE TABLE IF NOT EXISTS quarantine (
+        doc_id          TEXT PRIMARY KEY,
+        render_version  TEXT NOT NULL,
+        reason          TEXT NOT NULL,
+        quarantined_at  INTEGER NOT NULL,
+        FOREIGN KEY (doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_docs_created ON docs(created_at, doc_id)",
+)
+
+# Selected next to the docs columns, so every DocRow knows whether it is quarantined.
+QUARANTINE_REASON = (
+    "(SELECT reason FROM quarantine WHERE quarantine.doc_id = docs.doc_id) AS quarantine_reason"
 )
 
 OPS = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
@@ -114,6 +130,13 @@ class DocRow:
     updated_at: int
     complete: bool = True
     page_heights: list[int] | None = None
+    quarantine_reason: str | None = None
+
+
+    @property
+    def quarantined(self) -> bool:
+        """True when a revision failed to re-render this doc (its tiles answer 410)."""
+        return self.quarantine_reason is not None
 
 
     @classmethod
@@ -122,6 +145,7 @@ class DocRow:
         raw = row["metadata"]
         keys = row.keys()
         raw_ph = row["page_heights"] if "page_heights" in keys else None
+        reason = row["quarantine_reason"] if "quarantine_reason" in keys else None
 
         return cls(
             doc_id=row["doc_id"],
@@ -131,12 +155,13 @@ class DocRow:
             page_height=row["page_height"],
             tile_count=row["tile_count"],
             mime_type=row["mime_type"],
-            metadata=json.loads(raw) if raw else {},
+            metadata=orjson.loads(raw) if raw else {},
             render_version=row["render_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             complete=bool(row["complete"]),
-            page_heights=json.loads(raw_ph) if raw_ph else None,
+            page_heights=orjson.loads(raw_ph) if raw_ph else None,
+            quarantine_reason=reason,
         )
 
 
@@ -157,6 +182,14 @@ class SearchFilter:
     key: str
     op: str
     value: Any
+
+
+def dumps(value: Any, *, sort_keys: bool = False) -> str | None:
+    """Serialize a JSON column as TEXT (SQLite reads a BLOB as JSONB); empty → NULL."""
+    if not value:
+        return None
+
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS if sort_keys else None).decode()
 
 
 def encode_cursor(created_at: int, doc_id: str) -> str:
@@ -225,7 +258,8 @@ def build_search_query(
 
     sql = (
         "SELECT doc_id, doc_type, blob_rel_path, source_url, page_height, page_heights, "
-        "tile_count, mime_type, metadata, render_version, complete, created_at, updated_at FROM docs"
+        "tile_count, mime_type, metadata, render_version, complete, created_at, updated_at, "
+        f"{QUARANTINE_REASON} FROM docs"
     )
 
     if where:
@@ -413,7 +447,9 @@ class MetaStore:
     # ------------------------------------------------------------------ #
     async def get_doc(self, doc_id: str) -> DocRow | None:
         """Return the doc row for `doc_id`, or None if absent."""
-        cur = await self.db.execute("SELECT * FROM docs WHERE doc_id = ?", (doc_id,))
+        cur = await self.db.execute(
+            f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE doc_id = ?", (doc_id,)
+        )
         row = await cur.fetchone()
 
         return DocRow.from_row(row) if row else None
@@ -457,10 +493,11 @@ class MetaStore:
         tiles: Sequence[RenderedTile],
         page_heights: list[int] | None = None,
     ) -> DocRow:
-        """Single transaction: upsert the doc row and replace its tile rows."""
+        """Single transaction: upsert the doc row and replace its tile rows (a fresh
+        render also lifts any quarantine)."""
         now = int(time.time())
-        meta_json = json.dumps(metadata, sort_keys=True) if metadata else None
-        page_heights_json = json.dumps(page_heights) if page_heights else None
+        meta_json = dumps(metadata, sort_keys=True)
+        page_heights_json = dumps(page_heights)
 
         async with self._lock:
             try:
@@ -499,11 +536,7 @@ class MetaStore:
                         now,
                     ),
                 )
-                await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
-                await self.db.executemany(
-                    "INSERT INTO tiles (doc_id, tile_num, height, image_hash) VALUES (?,?,?,?)",
-                    [(doc_id, t.tile_num, t.height, t.image_hash) for t in tiles],
-                )
+                await self._replace_tiles(doc_id, tiles)
                 await self.db.commit()
 
             except BaseException:
@@ -535,7 +568,7 @@ class MetaStore:
         that dies mid-way leaves a swept-able partial rather than a servable half-doc.
         """
         now = int(time.time())
-        meta_json = json.dumps(metadata, sort_keys=True) if metadata else None
+        meta_json = dumps(metadata, sort_keys=True)
 
         async with self._lock:
             try:
@@ -572,12 +605,60 @@ class MetaStore:
                         now,
                     ),
                 )
-                await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
+                await self._replace_tiles(doc_id, ())
                 await self.db.commit()
 
             except BaseException:
                 await self.db.rollback()
                 raise
+
+
+    async def replace_render(
+        self,
+        doc_id: str,
+        *,
+        page_height: int,
+        page_heights: list[int] | None,
+        tile_count: int,
+        render_version: str,
+        tiles: Sequence[RenderedTile],
+    ) -> None:
+        """Single transaction: swap a doc's tiles and layout for a fresh render.
+
+        Revision's write: only what a render produces changes — metadata and identity
+        stay as they are — and any quarantine is lifted.
+        """
+        async with self._lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                await self.db.execute(
+                    "UPDATE docs SET page_height = ?, page_heights = ?, tile_count = ?, "
+                    "render_version = ?, updated_at = ? WHERE doc_id = ?",
+                    (
+                        page_height,
+                        dumps(page_heights),
+                        tile_count,
+                        render_version,
+                        int(time.time()),
+                        doc_id,
+                    ),
+                )
+                await self._replace_tiles(doc_id, tiles)
+                await self.db.commit()
+
+            except BaseException:
+                await self.db.rollback()
+                raise
+
+
+    async def _replace_tiles(self, doc_id: str, tiles: Sequence[RenderedTile]) -> None:
+        """Inside an open transaction: replace a doc's tile rows and lift its quarantine."""
+        await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
+        await self.db.execute("DELETE FROM quarantine WHERE doc_id = ?", (doc_id,))
+        await self.db.executemany(
+            "INSERT INTO tiles (doc_id, tile_num, height, image_hash) VALUES (?,?,?,?)",
+            [(doc_id, t.tile_num, t.height, t.image_hash) for t in tiles],
+        )
 
 
     async def append_tiles(self, doc_id: str, tiles: Sequence[RenderedTile]) -> None:
@@ -609,7 +690,7 @@ class MetaStore:
                 (
                     tile_count,
                     page_height,
-                    json.dumps(page_heights) if page_heights else None,
+                    dumps(page_heights),
                     int(time.time()),
                     doc_id,
                 ),
@@ -627,13 +708,79 @@ class MetaStore:
         return [row["doc_id"] for row in await cur.fetchall()]
 
 
+    # ------------------------------------------------------------------ #
+    # revision
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _revisable(render_version: str, force: bool) -> tuple[str, list[Any]]:
+        """WHERE clause for the docs a revision re-renders: complete docs rendered by
+        another render_version, minus those already quarantined at this one — or every
+        complete doc with `force`. Incomplete docs are the sweeper's, not revision's."""
+        if force:
+            return "complete = 1", []
+
+        return (
+            "complete = 1 AND render_version <> ? AND doc_id NOT IN "
+            "(SELECT doc_id FROM quarantine WHERE render_version = ?)",
+            [render_version, render_version],
+        )
+
+
+    async def count_revisable(self, render_version: str, *, force: bool = False) -> int:
+        """Return how many docs a revision at `render_version` would re-render."""
+        where, params = self._revisable(render_version, force)
+        cur = await self.db.execute(f"SELECT COUNT(*) AS n FROM docs WHERE {where}", params)
+        row = await cur.fetchone()
+
+        return int(row["n"])
+
+
+    async def list_revisable(
+        self, render_version: str, *, force: bool, after: str, limit: int
+    ) -> list[DocRow]:
+        """One page of revisable docs, keyset-paged by doc_id — stable while re-rendered
+        docs drop out of the stale set."""
+        where, params = self._revisable(render_version, force)
+        cur = await self.db.execute(
+            f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE {where} AND doc_id > ? "
+            "ORDER BY doc_id LIMIT ?",
+            [*params, after, limit],
+        )
+
+        return [DocRow.from_row(r) for r in await cur.fetchall()]
+
+
+    async def quarantine(self, doc_id: str, render_version: str, reason: str) -> None:
+        """Mark a doc a revision could not re-render at `render_version`."""
+        async with self._lock:
+            await self.db.execute(
+                "INSERT OR REPLACE INTO quarantine (doc_id, render_version, reason, quarantined_at) "
+                "VALUES (?,?,?,?)",
+                (doc_id, render_version, reason, int(time.time())),
+            )
+            await self.db.commit()
+
+
+    async def count_quarantined(self) -> int:
+        """Return the number of quarantined documents."""
+        cur = await self.db.execute("SELECT COUNT(*) AS n FROM quarantine")
+        row = await cur.fetchone()
+
+        return int(row["n"])
+
+
+    async def backup(self, path: str) -> None:
+        """Write a consistent copy of the database to `path` (online, WAL-safe)."""
+        async with self._lock:
+            await self.db.execute("VACUUM INTO ?", (path,))
+
+
     async def set_metadata(self, doc_id: str, metadata: dict[str, Any]) -> None:
         """Replace a doc's metadata JSON; the expression indexes follow automatically."""
         async with self._lock:
             await self.db.execute(
                 "UPDATE docs SET metadata = ?, updated_at = ? WHERE doc_id = ?",
-                (json.dumps(metadata, sort_keys=True) if metadata else None,
-                 int(time.time()), doc_id),
+                (dumps(metadata, sort_keys=True), int(time.time()), doc_id),
             )
             await self.db.commit()
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 
 import httpx2
+import orjson
 
 from virag.clients.http_service import HttpService
 from virag.errors import ApiError
@@ -81,11 +81,6 @@ class TilerService(HttpService):
 
 
     @property
-    def readyz_route(self):
-        return f"{self.base_url}/readyz"
-
-
-    @property
     def info_route(self):
         return f"{self.base_url}/info"
 
@@ -123,7 +118,9 @@ class TilerService(HttpService):
 
 
     async def check_connection(self) -> None:
-        await self._request("GET", self.readyz_route, action="the check")
+        # /info, not /readyz: a tiler revising its corpus is up but not ready, and virag
+        # waits for it behind its serving gate instead of refusing to start.
+        await self._request("GET", self.info_route, action="the check")
 
 
     async def tile(
@@ -185,7 +182,7 @@ class TilerService(HttpService):
             try:
                 async for line in response.aiter_lines():
                     if line.strip():
-                        yield json.loads(line)
+                        yield orjson.loads(line)
 
             except httpx2.RequestError as e:
                 raise ApiError(
@@ -318,7 +315,7 @@ class TilerService(HttpService):
         if url is not None:
             data["url"] = url
         if metadata is not None:
-            data["metadata"] = json.dumps(metadata)
+            data["metadata"] = orjson.dumps(metadata).decode()
 
         return data
 

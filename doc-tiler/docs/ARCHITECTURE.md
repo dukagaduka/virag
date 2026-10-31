@@ -313,9 +313,8 @@ if row is None:
 elif geometry(row) != cur:
     log.FATAL("DB initialised with a different geometry; refusing to start.")
     sys.exit(1)                                            # HARD FAIL
-if row.render_version != current_render_version:          # pixel tier (soft)
-    log.WARNING("Pixel params changed since init; regenerated tiles may not match "
-                "stored image_hash — governed by TILER_RENDER_MISMATCH_POLICY.")
+if docs rendered by another render_version exist:         # pixel tier
+    start NOT SERVING; revise them, then serve             # see §9 "Revision"
 ```
 
 Geometry mismatch is caught **once, globally, before serving anything** — there is no
@@ -328,26 +327,31 @@ The `secret_hash` column carries the **binding secret** that pairs this volume w
 specific consumer/vector-DB; its guard behaves like the geometry guard (immutable per
 volume, fatal on mismatch). See [SECURITY.md](SECURITY.md).
 
-### `render_version` and pixel-tier drift (soft)
+### `render_version`: bound to the volume, resolved by revision
 
 - **Geometry tier** = `{TILER_TILE_WIDTH, TILER_TILE_HEIGHT, TILER_TILE_OVERLAP,
   TILER_MIN_TILE_HEIGHT}` — enforced hard at startup.
 - **Pixel tier** = `{TILER_JPEG_QUALITY, JPEG_SUBSAMPLING (4:2:0), JPEG_PROGRESSIVE
   (off), TILER_PDF_DPI, resize_filter=LANCZOS, TILER_CHROMIUM_REVISION,
-  pillow_version, pymupdf_version}` — folded into `render_version`, checked softly.
+  pillow_version, pymupdf_version}` (+ the PDF slicing sizes when slicing is on) —
+  folded into `render_version`.
 
-`render_version` is a stable short hash of both tiers, stored once in `service_meta`
-and stamped on each doc. Library versions are in the pixel tier because a Pillow
+`render_version` is a stable short hash of both tiers (orjson with sorted keys,
+byte-identical to the stdlib `json.dumps(sort_keys=True, separators=(",", ":"))` it
+replaced — a test pins that), stamped on each doc and on `service_meta`. It is as
+fundamental as geometry: **the tiler never serves a doc rendered by another
+`render_version`**. Unlike geometry, a change is not fatal — the docs keep their blobs,
+so the service starts *not serving* and re-renders them first (§9 "Revision"). Library versions are in the pixel tier because a Pillow
 upgrade changes JPEG bytes exactly like a quality change does.
 `TILER_CHROMIUM_REVISION` defaults to the revision Playwright has pinned (read from its
 `browsers.json` without launching a browser), so the value is stable even in a PDF-only
 deployment.
 
-`image_hash` (stored at ingest) is the anchor: `get_tile?verify=true` recomputes and
-compares, catching web/MHTML re-render drift or a Chromium/JPEG/DPI change.
-`TILER_RENDER_MISMATCH_POLICY`: `strict` → `409`; `lenient` → serve fresh render + warn
-(use during a deliberate Chromium upgrade). PDF/IMG are byte-deterministic, so a
-mismatch there is a bug.
+`image_hash` (stored at ingest or revision) is the anchor: `get_tile?verify=true`
+recomputes and compares. Since every served doc was rendered by the current
+`render_version`, a mismatch can only be non-determinism (web/MHTML re-render drift, a
+base-image change `render_version` does not see) and always answers `409`. PDF/IMG are
+byte-deterministic, so a mismatch there is a bug.
 
 ---
 
@@ -381,7 +385,8 @@ content rasterizes. Ingest and regeneration call the *same* functions in
 ## 9. Idempotency, dedup, deletion
 
 - Idempotent ingest keyed by `doc_id = sha256(blob)`; identical bytes return the stored
-  manifest without re-render (unless `force`).
+  manifest without re-render (unless `force`, or the doc is quarantined — then it is
+  re-rendered, lifting the quarantine).
 - Blob write skipped if the path exists.
 - URL caveat: re-fetching a changed URL yields a new `doc_id`; `source_url` is
   traceability, not identity.
@@ -412,14 +417,49 @@ This reclaims storage from crashed/abandoned streaming ingests; because an incom
 was never fully enrolled downstream, reaping it is safe. The TTL defaults to `0` (disabled)
 and **must exceed the longest render** so an active render is never reaped.
 
-### Revision (re-render in place)
+### Revision (re-render before serving)
 
-`POST /revision` re-renders, from their stored original blobs, every doc whose stored
-`render_version` differs from the current one (or all docs with `force=true`), plus any
-incomplete doc. Tiles are replaced atomically in place — `doc_id` is stable — so after a
-pixel-tier change `get_tile` reproduces at the current `render_version`. It touches only
-the tiler's own tiles, never any downstream (Qdrant); the `/revision` render path is
-counted under `path="revise"` in the metrics.
+`tiler/revision.py` owns a **serving gate** and the job that opens it. At startup the
+tiler counts the *revisable* docs: complete, rendered by another `render_version`, not
+already quarantined at this one. None → it serves. Otherwise data routes answer
+`503 NOT_READY` (a router dependency; ops routes and `/revision` stay up) and the job runs
+— at once with `TILER_REVISION_ON_RENDER_MISMATCH=true`, else on `POST /revision`:
+
+1. **Backup.** The DB is copied with `VACUUM INTO` (via a `.partial` file, then renamed)
+   to `<db>.bak-<service_meta.render_version>`, once per source version — a resumed job
+   keeps the first copy. Old image + backup is the rollback; blobs are never touched.
+2. **Re-render.** Revisable docs are read keyset-paged by `doc_id` (stable while
+   re-rendered docs leave the set) and re-rendered from their blobs,
+   `TILER_REVISION_CONCURRENCY` at a time. Each doc's tiles, `tile_count`, `page_height(s)`
+   and `render_version` are swapped in **one transaction** (`replace_render`); `doc_id`,
+   metadata and identity stay as they are. Revision renders do not take bulk slots —
+   nothing interactive runs meanwhile.
+3. **Quarantine.** A doc that fails twice goes to the `quarantine` table (its own table,
+   so existing volumes need no migration) with the reason and the `render_version` it
+   failed at; its tiles answer `410`. A re-ingest of its bytes, a forced revision, or a
+   revision at another `render_version` retries it. A render-worker crash or an
+   unavailable Chromium is not the doc's fault: it aborts the job (`failed`, still not
+   serving) instead of quarantining everything after it.
+4. **Open.** With nothing revisable left, `service_meta.render_version` is stamped and
+   the gate opens.
+
+Incomplete docs are never revised (the sweeper owns them). Selection by `render_version`
+makes the job resumable for free; a forced one (`force=true`: every complete doc) is
+not. Progress is in `GET /revision` and a `done/total, rate, ETA` log line every 30 s.
+Because nothing is served or written during the job, it races with nothing: no metadata
+PATCH to lose, no ingest in flight, no cached tile of the old layout (the process starts
+with empty caches). The gate, like `_inflight` and the caches, lives in the one tiler
+process. The render path is counted under `path="revise"` in the metrics; it never
+touches any downstream (Qdrant).
+
+### Bulk slots (ingest vs `get_tile`)
+
+The render pool and the browser pool are FIFO and shared. Ingest work (`/tile`,
+`/tile/stream`, URL capture) holds at most `TILER_N_BULK_RENDER_WORKERS` pool tasks and
+`TILER_N_BULK_BROWSERS` Chromium renders at once (default: half of each pool), so a
+900-page PDF fanning out over the pool never queues an interactive `get_tile` behind all
+its chunks. Bulk slots are granted in task-creation order, so the in-order consumer of a
+sliced PDF stream never waits on a group that is itself waiting for a slot.
 
 ---
 
@@ -428,13 +468,14 @@ counted under `path="revise"` in the metrics.
 ```
 tiler/
   __init__.py        # routes sqlite3 → pysqlite3 (STAT4) before aiosqlite loads; __version__
-  main.py            # app, lifespan (guard, pools, DB, schema+index creation), routes
-  service.py         # core: ingest, regeneration, the three-layer pool wiring
+  main.py            # app, lifespan (guard, pools, DB, schema+index creation, revision gate), routes
+  service.py         # core: ingest, regeneration, the three-layer pool wiring, bulk slots
+  revision.py        # serving gate + the job that brings stored docs to the current render_version
   config.py          # env + render_version + geometry/pixel tiers
   guard.py           # startup geometry + binding-secret guard (service_meta)
   preflight.py       # standalone startup validation (runs before uvicorn)
-  media.py  metrics.py  errors.py  models.py       # mime sniff, Prometheus, error envelope, pydantic
-  api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  ops.py
+  media.py  metrics.py  errors.py  models.py  responses.py  # mime sniff, Prometheus, error envelope, pydantic, orjson response
+  api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  revision.py  ops.py
   render/ browser.py  render.py  geometry.py  types.py  # render = PDF raster/PIL/hash; geometry = tiling forward+reverse; types = worker/tile result dataclasses
   store/  blobs.py  meta.py  cache.py
   meta/   schema.py                                # load schema, meta_expr(), CREATE INDEX loop

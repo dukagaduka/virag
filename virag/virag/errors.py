@@ -1,7 +1,8 @@
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+
+from virag.responses import OrjsonResponse
 
 
 class ApiError(Exception):
@@ -53,11 +54,11 @@ def install_error_handlers(app: FastAPI) -> None:
     """Register handlers that render errors as the uniform `{"error": {...}}` body."""
 
     @app.exception_handler(ApiError)
-    async def _handle_api_error(request: Request, exc: ApiError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content=exc.body())
+    async def _handle_api_error(request: Request, exc: ApiError) -> OrjsonResponse:
+        return OrjsonResponse(status_code=exc.status_code, content=exc.body())
 
     @app.exception_handler(Exception)
-    async def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+    async def _handle_unexpected(request: Request, exc: Exception) -> OrjsonResponse:
         err = ApiError(status_code=500, message="Internal server error")
-        return JSONResponse(status_code=err.status_code, content=err.body())
+        return OrjsonResponse(status_code=err.status_code, content=err.body())
 

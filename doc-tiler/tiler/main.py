@@ -8,18 +8,21 @@ import os
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from . import __version__, guard, metrics
 from .api import docs as docs_api
 from .api import ingest as ingest_api
 from .api import metadata as metadata_api
 from .api import ops as ops_api
+from .api import revision as revision_api
 from .api import search as search_api
 from .api import tiles as tiles_api
+from .api.deps import require_serving
 from .config import ConfigError, Settings, load_settings
 from .errors import install_error_handlers
 from .meta.schema import MetadataSchema, SchemaError, index_statements, load_schema
+from .responses import OrjsonResponse
 from .service import TilerService
 
 log = logging.getLogger("tiler")
@@ -78,8 +81,13 @@ async def bootstrap(settings: Settings, schema: MetadataSchema) -> TilerService:
     await svc.start_pools()
     metrics.DOCS.set(await svc.store.count_docs())
 
+    # Opens the gate, or starts / awaits the revision of docs from another render_version.
+    await svc.revision.prepare()
+    state = "ready" if svc.revision.serving else f"not serving (revision {svc.revision.status['state']})"
+
     log.info(
-        "ready: geometry=%s render_version=%s browsers=%d render_workers=%d",
+        "%s: geometry=%s render_version=%s browsers=%d render_workers=%d",
+        state,
         settings.geometry,
         settings.render_version,
         settings.browsers,
@@ -125,6 +133,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+        await svc.revision.close()
         await svc.stop_pools()
         await svc.store.close()
 
@@ -153,14 +162,19 @@ def create_app() -> FastAPI:
         version=__version__,
         description=DESCRIPTION,
         lifespan=lifespan,
+        default_response_class=OrjsonResponse,
     )
     install_error_handlers(app)
 
-    app.include_router(ingest_api.router, tags=["tiles"])
-    app.include_router(tiles_api.router, tags=["tiles"])
-    app.include_router(docs_api.router, tags=["docs"])
-    app.include_router(metadata_api.router, tags=["metadata"])
-    app.include_router(search_api.router, tags=["docs"])
+    # Data routes are gated by the revision; ops and /revision itself always answer.
+    serving = [Depends(require_serving)]
+
+    app.include_router(ingest_api.router, tags=["tiles"], dependencies=serving)
+    app.include_router(tiles_api.router, tags=["tiles"], dependencies=serving)
+    app.include_router(docs_api.router, tags=["docs"], dependencies=serving)
+    app.include_router(metadata_api.router, tags=["metadata"], dependencies=serving)
+    app.include_router(search_api.router, tags=["docs"], dependencies=serving)
+    app.include_router(revision_api.router, tags=["revision"])
     app.include_router(ops_api.router, tags=["ops"])
 
     return app

@@ -3,15 +3,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
 import logging
 from contextlib import AsyncExitStack
 
 import httpx2
+import orjson
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from virag.errors import ApiError
+from virag.responses import OrjsonResponse
 
 
 log = logging.getLogger(__name__)
@@ -193,10 +194,10 @@ async def _complete_response(vlm, body: dict, sources: list[dict] | None) -> Res
 
     if response.status_code == 200 and sources is not None:
         try:
-            data = response.json()
+            data = orjson.loads(response.content)
             data["sources"] = sources
 
-            return JSONResponse(status_code=200, content=data)
+            return OrjsonResponse(status_code=200, content=data)
 
         except ValueError:
             pass
@@ -245,10 +246,10 @@ async def _relay(response, sources: list[dict] | None):
         return
 
     sources_event = (
-        "data: "
-        + json.dumps({"object": "chat.completion.chunk", "choices": [], "sources": sources})
-        + "\n\n"
-    ).encode()
+        b"data: "
+        + orjson.dumps({"object": "chat.completion.chunk", "choices": [], "sources": sources})
+        + b"\n\n"
+    )
 
     done_marker = b"data: [DONE]"
     spliced = False
@@ -279,7 +280,7 @@ async def _read_body(request: Request) -> dict:
     raw = await request.body()
 
     try:
-        body = json.loads(raw)
+        body = orjson.loads(raw)
 
     except ValueError as e:
         raise ApiError(

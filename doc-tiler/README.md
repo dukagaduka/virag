@@ -68,11 +68,12 @@ model.
 
 ```
 tiler/            the service package
-  main.py         app + lifespan (guard → indexes → pools), routes
-  service.py      core: ingest, regeneration, the three-layer pool wiring
+  main.py         app + lifespan (guard → indexes → pools → revision gate), routes
+  service.py      core: ingest, regeneration, the three-layer pool wiring, bulk slots
+  revision.py     serving gate + re-render of docs from another render_version
   config.py       env, geometry/pixel tiers, render_version
   guard.py        startup geometry + binding-secret guard
-  api/            ingest, tiles, docs, metadata, search, ops
+  api/            ingest, tiles, docs, metadata, search, revision, ops
   render/         geometry (forward+reverse), render (PDF/PIL), browser (Chromium), types
   store/          blobs (content-addressed FS), meta (SQLite), cache (async LRU)
   meta/schema.py  declared schema, meta_expr(), validation

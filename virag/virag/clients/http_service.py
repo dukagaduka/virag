@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager, nullcontext
 from typing import Any, Callable
 
 import httpx2
+import orjson
 
 from virag.errors import ApiError
 from virag.utils import error_body
@@ -110,9 +111,12 @@ class HttpService(ABC):
 
         The final response is returned whatever its status, so passthrough callers
         can relay it verbatim. A `stream=True` response must be closed by the caller.
+        A `json=` body is serialized once, by orjson, and reused by every attempt.
         """
         attempts = self.max_retries + 1 if retry else 1
         attempt = 0
+
+        kwargs = self._encode_json(kwargs)
 
         retryable = self.RETRY_ERRORS + (httpx2.ReadTimeout,) if retry_read_timeouts else self.RETRY_ERRORS
 
@@ -225,7 +229,7 @@ class HttpService(ABC):
         """Decode a JSON body, optionally reshaping it with `parse`; a malformed body or
         an unexpected structure becomes an ApiError(422)."""
         try:
-            data = response.json()
+            data = orjson.loads(response.content)
 
             return parse(data) if parse is not None else data
 
@@ -235,6 +239,19 @@ class HttpService(ABC):
                 message=f"Cannot decode {response.url} response or unexpected response structure during {action}",
                 details={"base_message": str(e)},
             ) from e
+
+
+    @staticmethod
+    def _encode_json(kwargs: dict) -> dict:
+        """Swap a `json=` body for orjson-encoded `content=` (httpx2 would use stdlib json,
+        far slower on tile- and vector-sized bodies, and on the event loop)."""
+        if "json" not in kwargs:
+            return kwargs
+
+        body = kwargs.pop("json")
+        headers = {**(kwargs.pop("headers", None) or {}), "Content-Type": "application/json"}
+
+        return {**kwargs, "content": orjson.dumps(body), "headers": headers}
 
 
     @staticmethod

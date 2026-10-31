@@ -59,6 +59,16 @@ interval — repairing partial/orphaned enrolls and propagating tiler deletes. S
 | `VIRAG_RECONCILE_INTERVAL_SEC` | no | `300` | Seconds between periodic reconcile passes (≥ 0). `0` disables the loop — the one-shot startup pass still runs. |
 | `VIRAG_PENDING_TTL_SEC` | no | `3600` | A pending enroll older than this is treated as crashed/partial (≥ 1). Must exceed the longest enroll, or an in-flight enroll could be swept. Also the longest a revision/rollback waits after its swap for enrolls still writing into the old collection. |
 
+## Serving gate
+
+Chat and enroll answer `503` while the tiler revises or the collection was embedded from
+another `render_version` than the tiler renders. See [ARCHITECTURE.md](ARCHITECTURE.md) §9.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `VIRAG_REVISION_ON_RENDER_MISMATCH` | no | `true` | When the tiler's `render_version` differs from the collection's, start `/revision` by itself (once per tiler `render_version`). `false` → stay not-ready until `POST /revision`. |
+| `VIRAG_TILER_WATCH_INTERVAL_SEC` | no | `10` | How often the gate re-checks the tiler (`GET /info`) and the collection (≥ 1). |
+
 ## Qdrant
 
 | Variable | Required | Default | Meaning |

@@ -76,7 +76,8 @@ class FakeStore:
     def __init__(self, hits: list[FakeHit] | None = None):
         self._hits = hits or []
         self.upserts: list[dict] = []
-        self.metadata: dict | None = None
+        self.metadata: dict | None = None                     # the serving collection's
+        self.collection_metadata: dict[str, dict] = {}        # every other collection's
         self._doc_ids: set[str] = set()
         self.deletes: list[str] = []
         self.delete_collections: list[str | None] = []
@@ -99,18 +100,27 @@ class FakeStore:
 
     async def create_revision_collection(self) -> str:
         self.revision_collection = "c__v2"
+        self.collection_metadata["c__v2"] = dict(self.metadata or {})     # binding carried
         return self.revision_collection
 
     async def drop_collection(self, name: str) -> None:
         self.dropped.append(name)
 
+    def _serve(self, physical: str) -> None:
+        """Repoint the fake alias, moving the serving metadata along with it."""
+        self.collection_metadata[self.physical_name] = self.metadata or {}
+        self.metadata = self.collection_metadata.pop(physical, {})
+        self.physical_name = physical
+
     async def swap_alias(self, new_physical: str) -> None:
         self.swapped_to = new_physical
-        self.previous_name, self.physical_name = self.physical_name, new_physical
+        self.previous_name = self.physical_name
+        self._serve(new_physical)
 
     async def rollback(self):
         restored, abandoned = self.previous_name, self.physical_name
-        self.physical_name, self.previous_name = restored, None
+        self._serve(restored)
+        self.previous_name = None
         return restored, abandoned, self.rollback_retired_at
 
     @asynccontextmanager
@@ -130,11 +140,16 @@ class FakeStore:
     async def drain(self, physical: str, timeout: float) -> bool:
         return True
 
-    async def get_collection_metadata(self) -> dict:
+    async def get_collection_metadata(self, *, collection=None) -> dict:
+        if collection not in (None, self.physical_name):
+            return self.collection_metadata.get(collection, {})
         return self.metadata or {}
 
-    async def set_collection_metadata(self, metadata: dict) -> None:
-        self.metadata = dict(metadata)
+    async def set_collection_metadata(self, metadata: dict, *, collection=None) -> None:
+        if collection not in (None, self.physical_name):
+            self.collection_metadata[collection] = {**self.collection_metadata.get(collection, {}), **metadata}
+        else:
+            self.metadata = {**(self.metadata or {}), **metadata}             # Qdrant merges
 
     async def delete_by_doc(self, doc_id: str, *, wait: bool = True, collection=None) -> None:
         self.deletes.append(doc_id)

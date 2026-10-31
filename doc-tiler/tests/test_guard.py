@@ -60,14 +60,16 @@ async def test_outdated_volume_is_fatal(tmp_path, caplog):
     assert any("docs.page_heights" in r.message for r in caplog.records)
 
 
-async def test_pixel_tier_change_only_warns(tmp_path, caplog):
+async def test_pixel_tier_change_on_empty_volume_serves(tmp_path, caplog):
+    """No stored docs → nothing to revise: the volume is re-stamped and serves at once."""
     env = base_env(tmp_path)
     async with running_app(env) as (client, _):
         pass
     with caplog.at_level("WARNING"):
         async with running_app(base_env(tmp_path, TILER_JPEG_QUALITY="60")) as (client, svc):
-            assert (await client.get("/healthz")).status_code == 200
-    assert any("Pixel params" in r.message for r in caplog.records)
+            assert (await client.get("/readyz")).status_code == 200
+            assert (await svc.store.get_service_meta()).render_version == svc.settings.render_version
+    assert any("render_version changed" in r.message for r in caplog.records)
 
 
 async def test_invalid_config_is_fatal(tmp_path):
@@ -101,3 +103,17 @@ async def test_render_version_covers_both_tiers():
     assert base.render_version != Settings(pdf_dpi=150).render_version
     assert base.render_version == Settings().render_version  # stable
     assert base.render_version == Settings(max_doc_bytes=1).render_version  # not a tier
+
+
+@pytest.mark.parametrize("overrides", [{}, {"pdf_slice": True}, {"jpeg_quality": 60}])
+async def test_render_version_is_serializer_independent(overrides):
+    """orjson must hash exactly the bytes stdlib json did, or every volume would revise."""
+    import hashlib
+    import json
+
+    from tiler.config import Settings
+
+    s = Settings(**overrides)
+    tiers = {"geometry": s.geometry, "pixel": s.pixel_tier, **({"pdf": s.pdf_tier} if s.pdf_slice else {})}
+    legacy = json.dumps(tiers, sort_keys=True, separators=(",", ":"))
+    assert s.render_version == hashlib.sha256(legacy.encode()).hexdigest()[:16]

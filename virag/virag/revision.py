@@ -8,13 +8,20 @@ the swap, and the job syncs exactly those docs after the swap:
   1. Drop any leftover target, create `<serving>__vN+1`, start the journal.
   2. Re-embed every complete tiler doc into it (flat tile stream, failed docs retried).
      Docs still failing abort the job without a swap — the old collection keeps serving.
-  3. Enforce `Qdrant ⊆ Tiler` on the new collection, then swap the alias. The replaced
-     collection is retained as the rollback target; from now on writers hit the new one.
+  3. Enforce `Qdrant ⊆ Tiler` on the new collection, stamp it with the tiler's
+     render_version, then swap the alias. The replaced collection is retained as the
+     rollback target; from now on writers hit the new one.
   4. Stop the journal and wait (up to the pending TTL) for writers of the old collection.
   5. Sync the journaled docs into the new collection, enforce the invariant once more.
 
+A collection is bound to the render_version its tiles were embedded from (see
+virag/gate.py): a revision starts only while the tiler is serving, and aborts without a
+swap if the tiler's render_version changed meanwhile. It is how virag follows a new
+tiler render (started by the gate) and how a new retriever model is rolled out.
+
 A rollback repoints the alias to the retained collection, drops the abandoned one and
-syncs the docs enrolled since that collection was retired.
+syncs the docs enrolled since that collection was retired; it is refused when that
+collection was embedded from another render_version than the tiler's.
 
 The journal, lock and state live in this process: correct for a single virag replica.
 """
@@ -29,7 +36,7 @@ from virag.clients.qdrant_store import QdrantStore
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerService
 from virag.errors import ApiError
-from virag.reconcile import enforce_subset, reembed_docs, sync_docs
+from virag.reconcile import embeddable, enforce_subset, reembed_docs, sync_docs
 from virag.settings import EnrollSettings, ReconcileSettings
 
 
@@ -64,17 +71,35 @@ class RevisionManager:
         return self._task is not None and not self._task.done()
 
 
-    def start(self) -> dict:
-        """Launch a revision in the background; 409 while a job is already running."""
-        self._launch("revision", self._revise())
+    async def start(self) -> dict:
+        """Launch a revision in the background; 409 while a job is already running or
+        while the tiler is not serving."""
+        self._refuse_if_running()
+        render_version = await self._tiler_render_version()
+
+        self._launch("revision", self._revise(render_version))
 
         return self.status
 
 
-    def start_rollback(self) -> dict:
-        """Launch a rollback to the retained collection; 409 while a job is running."""
+    async def start_rollback(self) -> dict:
+        """Launch a rollback to the retained collection; 409 while a job is running, or
+        when that collection was embedded from another render_version than the tiler's."""
+        self._refuse_if_running()
+
         if self.store.previous_name is None:
             raise ApiError(status_code=409, message="No previous collection to roll back to")
+
+        render_version = await self._tiler_render_version()
+        meta = await self.store.get_collection_metadata(collection=self.store.previous_name)
+
+        if meta.get("render_version") != render_version:
+            raise ApiError(
+                status_code=409,
+                message=f"Previous collection {self.store.previous_name} was embedded from "
+                        f"render_version {meta.get('render_version')} but the tiler renders "
+                        f"{render_version}; its tiles would fail the integrity check",
+            )
 
         self._launch("rollback", self._rollback())
 
@@ -95,15 +120,37 @@ class RevisionManager:
             pass
 
 
-    def _launch(self, kind: str, job) -> None:
+    def _refuse_if_running(self) -> None:
         if self.running:
-            job.close()
-
             raise ApiError(
                 status_code=409,
                 message=f"A {self.status['kind']} is already running",
                 details={"status": self.status},
             )
+
+
+    async def _tiler_render_version(self) -> str:
+        """The tiler's render_version. Refused (409) while the tiler is not serving: its
+        docs are being revised, so their tiles are not yet the ones it settles on."""
+        info = await self.tiler.get_info()
+        tiler_revision = info.get("revision") or {}
+
+        if not tiler_revision.get("serving", True):
+            raise ApiError(
+                status_code=409,
+                message=f"The tiler is not serving (its revision is {tiler_revision.get('state')}); "
+                        f"retry once it is",
+            )
+
+        return info.get("render_version")
+
+
+    def _launch(self, kind: str, job) -> None:
+        # Re-checked here: the checks before it awaited, so another job may have started.
+        if self.running:
+            job.close()
+
+        self._refuse_if_running()
 
         self.status = {"kind": kind, "state": "running", "started_at": int(time.time())}
         self._task = asyncio.create_task(self._guarded(job))
@@ -127,21 +174,21 @@ class RevisionManager:
         self.status.update(fields, state=state, finished_at=int(time.time()))
 
 
-    async def _revise(self) -> None:
+    async def _revise(self, render_version: str) -> None:
         store = self.store
 
         target = await store.create_revision_collection()
-        self.status["collection"] = target
-        log.info("revision: building %s", target)
+        self.status.update(collection=target, render_version=render_version)
+        log.info("revision: building %s from render_version %s", target, render_version)
 
         store.start_journal()
         swapped = False
 
         try:
             docs = await self.tiler.iter_docs()
-            complete = [doc for doc in docs if doc.get("complete")]
+            complete = [doc for doc in docs if embeddable(doc)]
 
-            # Incomplete docs aren't servable; leave them for a tiler revision / re-enroll.
+            # Incomplete or quarantined docs have no servable tiles; leave them for a re-enroll.
             self.status.update(total=len(docs), skipped=len(docs) - len(complete))
 
             failed = await reembed_docs(
@@ -166,6 +213,19 @@ class RevisionManager:
                 return
 
             await enforce_subset(store, self.tiler, collection=target)
+
+            # The vectors must match what the tiler renders now, not when the job began.
+            current = await self._tiler_render_version()
+            if current != render_version:
+                self._finish(
+                    "failed",
+                    error=f"the tiler's render_version changed during the build "
+                          f"({render_version} → {current}); alias not swapped",
+                )
+
+                return
+
+            await store.set_collection_metadata({"render_version": render_version}, collection=target)
 
             old = store.physical_name
             await store.swap_alias(target)

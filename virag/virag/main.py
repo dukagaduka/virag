@@ -4,15 +4,17 @@ import os
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from virag.settings import Settings, SettingsError
 from virag.errors import ApiError, install_error_handlers
+from virag.responses import OrjsonResponse
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerService
 from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding, enforce_metadata_schema, secret_hash
+from virag.gate import ServingGate, require_serving
 from virag.reconcile import reconcile, run_periodic
 from virag.revision import RevisionManager
 from virag.api import enroll as enroll_api
@@ -108,22 +110,6 @@ async def lifespan(app: FastAPI):
         # Reconcile depends on these indexed metadata fields being declared in the tiler.
         await enforce_metadata_schema(tiler)
 
-        # Repair any partial/orphaned enrolls left by an earlier crash before serving.
-        await reconcile(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
-
-        # Registered last, so it is cancelled first — before the clients it uses close.
-        reconcile_task = asyncio.create_task(
-            run_periodic(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
-        )
-        stack.push_async_callback(_cancel, reconcile_task)
-
-        app.state.settings = settings
-        app.state.store = store
-        app.state.retriever = retriever
-        app.state.tiler = tiler
-        app.state.vlm = vlm
-        app.state.qdrant_http = qdrant_http
-
         revision = RevisionManager(
             store,
             tiler,
@@ -132,10 +118,38 @@ async def lifespan(app: FastAPI):
             settings.reconcile_settings,
         )
         stack.push_async_callback(revision.close)
+
+        # Closed while the tiler revises or the collection lags its render_version; it
+        # may start the rebuild right here.
+        gate = ServingGate(store, tiler, revision, settings.revision_settings, secret_hash(settings.db_secret))
+        await gate.check()
+
+        # Repair any partial/orphaned enrolls left by an earlier crash before serving.
+        # Behind a closed gate the periodic pass does it once the gate opens.
+        if gate.serving:
+            await reconcile(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
+
+        # Registered last, so they are cancelled first — before the clients they use close.
+        reconcile_task = asyncio.create_task(
+            run_periodic(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings, gate)
+        )
+        stack.push_async_callback(_cancel, reconcile_task)
+
+        gate_task = asyncio.create_task(gate.run())
+        stack.push_async_callback(_cancel, gate_task)
+
+        app.state.settings = settings
+        app.state.store = store
+        app.state.retriever = retriever
+        app.state.tiler = tiler
+        app.state.vlm = vlm
+        app.state.qdrant_http = qdrant_http
         app.state.revision = revision
+        app.state.gate = gate
 
         log.info(
-            "ready: qdrant=%s vector_size=%d collection=%s distance=%s retriever=%s tiler=%s vlm=%s model=%s render_version=%s",
+            "%s: qdrant=%s vector_size=%d collection=%s distance=%s retriever=%s tiler=%s vlm=%s model=%s render_version=%s",
+            "ready" if gate.serving else f"started, not serving ({gate.reason})",
             settings.qdrant_settings.base_url,
             settings.qdrant_settings.vector_size,
             settings.qdrant_settings.collection_name,
@@ -158,13 +172,17 @@ def create_app() -> FastAPI:
         version="0.1.0",
         description=DESCRIPTION,
         lifespan=lifespan,
+        default_response_class=OrjsonResponse,
     )
     install_error_handlers(app)
 
+    # Chat and enroll wait behind the serving gate; ops, revision and the proxies don't.
+    serving = [Depends(require_serving)]
+
     app.include_router(ops_api.router, tags=["ops"])
-    app.include_router(enroll_api.router, tags=["enroll"])
+    app.include_router(enroll_api.router, tags=["enroll"], dependencies=serving)
     app.include_router(revision_api.router, tags=["revision"])
-    app.include_router(chat_completions_api.router, tags=["v1"])
+    app.include_router(chat_completions_api.router, tags=["v1"], dependencies=serving)
     app.include_router(proxy_api.router, tags=["proxy"])
 
     return app

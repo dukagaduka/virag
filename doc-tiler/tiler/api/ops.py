@@ -5,11 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import JSONResponse
 
 from .. import __version__
 from .. import metrics as m
 from ..models import MetadataSchemaModel
+from ..responses import OrjsonResponse
 from .deps import service
 
 router = APIRouter()
@@ -33,12 +33,14 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/readyz", summary="Readiness (DB, blob dir, Chromium pool).", operation_id="readyz")
+@router.get(
+    "/readyz", summary="Readiness (DB, blob dir, Chromium pool, revision gate).", operation_id="readyz"
+)
 async def readyz(request: Request) -> Response:
-    """Readiness probe checking the DB, blob dir and Chromium pool."""
+    """Readiness probe checking the DB, blob dir, Chromium pool and revision gate."""
     ok, checks = await service(request).ready()
 
-    return JSONResponse(
+    return OrjsonResponse(
         status_code=200 if ok else 503,
         content={"status": "ready" if ok else "not ready", "checks": checks},
     )
@@ -54,7 +56,7 @@ async def metrics_endpoint() -> Response:
 
 @router.get("/info", summary="Effective geometry, render_version and cache stats.")
 async def info(request: Request) -> dict[str, Any]:
-    """Report effective geometry, render_version, policy, pools and cache stats."""
+    """Report effective geometry, render_version, revision gate, policy, pools and cache stats."""
     svc = service(request)
 
     return {
@@ -63,8 +65,9 @@ async def info(request: Request) -> dict[str, Any]:
         "render_version": svc.settings.render_version,
         "secret_hash": svc.settings.secret_hash,
         "pixel_tier": svc.settings.pixel_tier,
+        "revision": svc.revision.status,
         "policy": {
-            "render_mismatch": svc.settings.render_mismatch_policy,
+            "revision_on_render_mismatch": svc.settings.revision_on_render_mismatch,
             "url_fetch_enabled": svc.settings.url_fetch_enabled,
             "url_allow_private": svc.settings.url_allow_private,
             "allow_delete": svc.settings.allow_delete,
@@ -73,6 +76,8 @@ async def info(request: Request) -> dict[str, Any]:
         "pools": {
             "browsers": svc.settings.browsers,
             "render_workers": svc.settings.render_workers,
+            "bulk_browsers": svc.settings.bulk_browsers,
+            "bulk_render_workers": svc.settings.bulk_render_workers,
             "browser_available": svc.browser.available,
         },
         "cache": {"tile": svc.tile_cache.stats(), "page": svc.page_cache.stats()},

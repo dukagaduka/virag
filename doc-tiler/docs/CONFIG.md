@@ -26,10 +26,11 @@ them, deploy against a fresh volume and re-ingest.
 | `TILER_PDF_TILE_HEIGHT` | `1024` | Strip height (px) for PDF slicing; used only when slicing is on. `0 < HEIGHT`. |
 | `TILER_PDF_TILE_OVERLAP` | `0` | Overlap between PDF strips; `0 ≤ OVERLAP < TILER_PDF_TILE_HEIGHT`. |
 
-## Pixel tier — folded into `render_version` (soft check)
+## Pixel tier — folded into `render_version`
 
-Changing these does not stop startup, but regenerated tiles may no longer match the
-`image_hash` recorded at ingest — governed by `TILER_RENDER_MISMATCH_POLICY`.
+`render_version` is bound to the volume like geometry, but a change is not fatal: the
+stored docs are re-rendered by a revision before the service serves again (see
+[Revision](#revision) below and [API.md](API.md)).
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -55,6 +56,8 @@ Pillow and PyMuPDF versions are also folded into `render_version`.)
 |---|---|---|
 | `TILER_N_BROWSERS` | `min(cpu, 4)` | Max concurrent Chromium renders (semaphore). |
 | `TILER_N_RENDER_WORKERS` | `cpu_count` | Process-pool size (PDF raster / PIL / hashing). |
+| `TILER_N_BULK_RENDER_WORKERS` | `render_workers // 2` | Process-pool tasks ingest may hold at once, so interactive `get_tile` always finds a free worker (min 1). |
+| `TILER_N_BULK_BROWSERS` | `browsers // 2` | Chromium renders ingest (URL capture, MHTML) may hold at once (min 1). |
 | `TILER_RECYCLE_AFTER` | `500` | Recycle a Chromium process after N renders. |
 | `TILER_RENDER_CACHE_SIZE` | `64` | LRU capacity for `get_tile`. |
 
@@ -63,10 +66,24 @@ Pillow and PyMuPDF versions are also folded into `render_version`.)
 | Variable | Default | Meaning |
 |---|---|---|
 | `TILER_MAX_DOC_BYTES` | `67108864` | Reject larger uploads (`413`). |
-| `TILER_RENDER_MISMATCH_POLICY` | `strict` | `strict` → `409` on `image_hash` mismatch; `lenient` → serve + warn. |
 | `TILER_ALLOW_DELETE` | `false` | If `false`, `DELETE /doc/{id}` → `405`. |
 | `TILER_URL_FETCH_ENABLED` | `true` | Allow `URL` input type. |
 | `TILER_URL_ALLOW_PRIVATE` | `false` | If `false`, SSRF-block private targets (see [SECURITY.md](SECURITY.md)). |
+
+An `image_hash` mismatch on `get_tile?verify=true` always answers `409`: every served doc
+was rendered by the current `render_version`, so a mismatch is non-determinism, not
+drift. (`TILER_RENDER_MISMATCH_POLICY` is gone; a leftover value is ignored.)
+
+## Revision
+
+At startup, complete docs rendered by another `render_version` are re-rendered before
+the service serves; meanwhile data routes answer `503 NOT_READY`. See
+[ARCHITECTURE.md](ARCHITECTURE.md) ("Revision") and [API.md](API.md).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TILER_REVISION_ON_RENDER_MISMATCH` | `true` | Start the revision on its own at startup. `false` → stay not-ready (`state=required`) until `POST /revision`, e.g. to pick the moment. |
+| `TILER_REVISION_CONCURRENCY` | `4` | Docs re-rendered at once. Each holds its blob and rendered tiles in memory; a doc's pages already fan out over the whole render pool. |
 
 ## Incomplete-ingest sweeper
 

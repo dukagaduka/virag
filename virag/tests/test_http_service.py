@@ -59,6 +59,17 @@ def test_retries_transient_status_then_succeeds():
     assert len(seen) == 3
 
 
+def test_json_body_is_encoded_once_by_orjson_and_replayed():
+    svc = _Service("http://up", max_retries=1, **_HTTP)
+    seen = _mock(svc, lambda req, n: httpx2.Response(503 if n < 2 else 200))
+
+    _run(svc.send("POST", "http://up/x", json={"k": "é", "n": 1}, headers={"X-Trace": "t"}))
+
+    assert [r.content for r in seen] == ['{"k":"é","n":1}'.encode()] * 2   # compact UTF-8
+    assert seen[1].headers["content-type"] == "application/json"
+    assert seen[1].headers["x-trace"] == "t"                                  # caller headers kept
+
+
 def test_exhausted_retries_return_last_response():
     svc = _Service("http://up", max_retries=2, **_HTTP)
     seen = _mock(svc, lambda req, n: httpx2.Response(502, json={"n": n}))

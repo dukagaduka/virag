@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import multiprocessing
 import os
 from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
-from typing import Literal
-
-from pydantic import Field, ValidationError, field_validator, model_validator
+import orjson
+from pydantic import Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Pixel-tier constants that are not env-tunable but do change output bytes.
@@ -61,6 +59,9 @@ class Settings(BaseSettings):
     safe_fullpage_px: int = 30000
     n_browsers: int = 0  # 0 => min(cpu, 4)
     n_render_workers: int = 0  # 0 => cpu count
+    # Slots bulk work (ingest) may hold, so interactive get_tile always finds a free one.
+    n_bulk_render_workers: int = 0  # 0 => render_workers // 2 (at least 1)
+    n_bulk_browsers: int = 0  # 0 => browsers // 2 (at least 1)
     recycle_after: int = 500
     render_cache_size: int = 64
     max_doc_bytes: int = 67_108_864
@@ -79,9 +80,13 @@ class Settings(BaseSettings):
 
     url_fetch_enabled: bool = True
     url_allow_private: bool = False
-    render_mismatch_policy: Literal["strict", "lenient"] = "strict"
     allow_delete: bool = False
     browser_enabled: bool = True
+
+    # Startup revision: docs rendered by another render_version are re-rendered before
+    # the service turns ready; off → it stays not-ready until POST /revision.
+    revision_on_render_mismatch: bool = True
+    revision_concurrency: int = 4  # docs re-rendered at once
 
     # Overrides the Chromium build stamp folded into render_version (normally the
     # pinned Playwright bundle's revision).
@@ -89,12 +94,6 @@ class Settings(BaseSettings):
 
     # --- binding secret (optional; empty = an explicit, unbindable slot) ---
     db_secret: str = Field("", repr=False)
-
-
-    @field_validator("render_mismatch_policy", mode="before")
-    @classmethod
-    def _lowercase_policy(cls, value: object) -> object:
-        return value.strip().lower() if isinstance(value, str) else value
 
 
     @model_validator(mode="after")
@@ -141,6 +140,12 @@ class Settings(BaseSettings):
         if self.safe_fullpage_px < self.tile_height:
             raise ValueError("TILER_SAFE_FULLPAGE_PX must be >= TILER_TILE_HEIGHT")
 
+        if self.n_bulk_render_workers < 0 or self.n_bulk_browsers < 0:
+            raise ValueError("TILER_N_BULK_RENDER_WORKERS and TILER_N_BULK_BROWSERS must be >= 0")
+
+        if self.revision_concurrency <= 0:
+            raise ValueError("TILER_REVISION_CONCURRENCY must be positive")
+
         return self
 
 
@@ -161,6 +166,18 @@ class Settings(BaseSettings):
     def render_workers(self) -> int:
         """Process-pool size; defaults to the CPU count."""
         return self.n_render_workers or self._cpu_count()
+
+
+    @property
+    def bulk_render_workers(self) -> int:
+        """Render-pool slots bulk work may hold at once; defaults to half the pool."""
+        return self.n_bulk_render_workers or max(1, self.render_workers // 2)
+
+
+    @property
+    def bulk_browsers(self) -> int:
+        """Chromium renders bulk work may hold at once; defaults to half the pool."""
+        return self.n_bulk_browsers or max(1, self.browsers // 2)
 
 
     @property
@@ -220,9 +237,11 @@ class Settings(BaseSettings):
         if self.pdf_slice:
             tiers["pdf"] = self.pdf_tier
 
-        payload = json.dumps(tiers, sort_keys=True, separators=(",", ":"))
+        # Byte-identical to json.dumps(sort_keys=True, separators=(",", ":")): changing
+        # the serializer must never shift render_version (see test_guard).
+        payload = orjson.dumps(tiers, option=orjson.OPT_SORT_KEYS)
 
-        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+        return hashlib.sha256(payload).hexdigest()[:16]
 
 
     @property
@@ -261,7 +280,7 @@ class Settings(BaseSettings):
                 root / "driver" / "browsers.json",
             ):
                 if candidate.exists():
-                    data = json.loads(candidate.read_text())
+                    data = orjson.loads(candidate.read_bytes())
 
                     for browser in data.get("browsers", []):
                         if browser.get("name") == "chromium":

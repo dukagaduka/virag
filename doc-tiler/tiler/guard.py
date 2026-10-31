@@ -50,8 +50,8 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
     """Initialise service_meta on a fresh volume, or fail on geometry drift.
 
     A volume older than the current schema raises OutdatedVolume and a geometry-tier
-    mismatch raises GeometryMismatch (both fatal); a pixel-tier-only change is logged
-    as a warning and allowed.
+    mismatch raises GeometryMismatch (both fatal); a render_version change is the
+    revision's to resolve (see tiler/revision.py) and only logged here.
     """
     missing = await store.missing_columns()
 
@@ -112,14 +112,13 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
         raise SecretMismatch(message)
 
     if row.render_version != render_version:
-        # Pixel tier only — soft. Stored image_hash values may no longer reproduce.
+        # Pixel tier: no serving until the stored docs are revised to the new version.
         log.warning(
-            "Pixel params (TILER_JPEG_QUALITY/TILER_PDF_DPI/Chromium/Pillow) changed since "
-            "init (%s -> %s); regenerated tiles may not match stored image_hash — governed "
-            "by TILER_RENDER_MISMATCH_POLICY=%s.",
+            "render_version changed since the last revision (%s -> %s): pixel params "
+            "(TILER_JPEG_QUALITY/TILER_PDF_DPI/Chromium/Pillow/PyMuPDF) differ; stored docs "
+            "are revised before the service turns ready.",
             row.render_version,
             render_version,
-            settings.render_mismatch_policy,
         )
 
     return row

@@ -23,6 +23,7 @@ def summarize(rows: Sequence[DocRow]) -> list[dict[str, Any]]:
             "doc_type": r.doc_type,
             "tile_count": r.tile_count,
             "complete": r.complete,
+            "quarantined": r.quarantined,
             "render_version": r.render_version,
             "created_at": r.created_at,
             "source_url": r.source_url,

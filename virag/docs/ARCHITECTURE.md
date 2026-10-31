@@ -145,19 +145,23 @@ Four typed async clients, each built from its settings block and given a
   `QDRANT_VECTOR_SIZE`.
 - **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): virag, the tiler,
   and the Qdrant collection must share one secret hash, or startup fails. A fresh
-  collection is bound on first run; tiler `render_version` drift is a warning.
+  collection is bound on first run (secret + the tiler's `render_version`).
 - **Metadata-schema guard** (`enforce_metadata_schema`) — reconcile searches the tiler's
   indexed metadata, so the tiler must declare the three fields virag depends on:
   `name` (text), `virag_started_at` (number), `virag_enrolled_at` (number). A missing or
   wrong-typed field is **fatal** (`BindingError`) — the tiler is misconfigured. See
   §9.
-- **Reconcile** — one `reconcile()` pass runs before serving (repairing any partial or
-  orphaned enrolls left by an earlier crash), then a background task repeats it on
-  `VIRAG_RECONCILE_INTERVAL_SEC`. This replaces the old best-effort `doc_id` overlap
-  warning. See §9.
+- **Serving gate** (`gate.py`) — checked once (it may start a revision right away),
+  then re-checked every `VIRAG_TILER_WATCH_INTERVAL_SEC`. See §9.
+- **Reconcile** — with the gate open, one `reconcile()` pass runs before serving
+  (repairing any partial or orphaned enrolls left by an earlier crash); a background
+  task repeats it on `VIRAG_RECONCILE_INTERVAL_SEC`, skipping passes while the gate is
+  closed. See §9.
 
-`/ready` reports `503` until all four clients are attached to `app.state`; `/health`
-is a bare liveness probe.
+The tiler's `check_connection` hits `/info`, not `/readyz`: a tiler revising its corpus
+is up but not ready, and virag waits for it behind the gate instead of refusing to
+start. `/ready` reports `503` until all four clients are attached to `app.state` and
+while the gate is closed; `/health` is a bare liveness probe (the `HEALTHCHECK`).
 
 ## 8. Enrollment & the Qdrant ⊆ Tiler invariant
 
@@ -203,8 +207,8 @@ passes:
 2. *Clear stale pending.* Find docs with `virag_enrolled_at == 0` **and**
    `virag_started_at < now − VIRAG_PENDING_TTL_SEC` (the TTL gate skips in-flight
    enrolls), delete their partial points, and — if `VIRAG_SELF_HEAL` is on and the tiler
-   doc is complete — re-embed the doc from the tiler to restore it. An incomplete tiler
-   doc is left for a tiler `/revision`.
+   doc is complete and not quarantined — re-embed the doc from the tiler to restore it.
+   Otherwise it is left for a re-enroll.
 
 **Re-embed stream.** Self-heal, revision and rollback sync share one re-embed
 (`reembed_docs`): every `(doc_id, tile_num)` of the docs is cut into batches of
@@ -214,32 +218,50 @@ call and upserts once; a window of batches derived from the tiler cap stays in f
 failed batch fails the docs it touched; they are retried once in per-document batches.
 
 **Revision** (`virag/revision.py`, `POST /revision`) is a background full re-embed with a
-blue-green swap: drop any leftover `__vN+1` and create it; start the store's writer
-journal; re-embed every complete tiler doc into it; abort without a swap (dropping the
-build) if docs still fail; enforce `Qdrant ⊆ Tiler` on it; swap the alias, keeping the
-replaced collection (stamped `retired_at`) as the rollback target; stop the journal; wait
+blue-green swap: refuse while the tiler is not serving, and note its `render_version`;
+drop any leftover `__vN+1` and create it; start the store's writer journal; re-embed
+every complete, non-quarantined tiler doc into it; abort without a swap (dropping the
+build) if docs still fail; enforce `Qdrant ⊆ Tiler` on it; abort likewise if the tiler's
+`render_version` changed meanwhile, else stamp it on the build; swap the alias, keeping
+the replaced collection (stamped `retired_at`) as the rollback target; stop the journal; wait
 up to `VIRAG_PENDING_TTL_SEC` for writers of the old collection to finish; sync the
 journaled docs into the new collection (drop, then re-embed if the tiler holds them
 complete and enrolled); enforce the invariant again. New writes are never mirrored into
 the build — the journal of writers (enroll, self-heal; including those already in flight
 at the start) plus the post-swap sync closes the gap. Use it after a retriever-model
-change (or the tiler's `/revision` re-render). The lock, journal and status are
+change; after a tiler render change the gate starts it. The lock, journal and status are
 in-process: correct for a single virag replica.
 
 **Rollback** (`POST /revision/rollback`) repoints the alias to the retained collection,
 drops the abandoned one and syncs the docs enrolled since `retired_at`, under the same
-journal + drain.
+journal + drain. It is refused when the retained collection was embedded from another
+`render_version` than the tiler's.
+
+**Serving gate** (`gate.py`). The tiler binds `render_version` to its volume like geometry
+and never serves a doc rendered by another one; virag binds each collection to the
+`render_version` its tiles were embedded from (collection metadata, set at first bind and
+by every revision). Serving across a mismatch would fail the integrity check on every
+tile, so chat and enroll answer `503` (a router dependency, `require_serving`) unless the
+tiler serves (`/info` → `revision.serving`) **and** its `render_version` equals the
+collection's. A mismatch starts the revision by itself (`VIRAG_REVISION_ON_RENDER_MISMATCH`),
+once per tiler `render_version` — a failed rebuild waits for `POST /revision` rather than
+looping. A tiler bound to another secret closes the gate; an unreachable one leaves it as
+it was (chat then degrades per tile, as before). The full upgrade path:
+the tiler revises its docs (virag waits) → virag rebuilds its collection (still closed) →
+both serve. The gate is in-process, like the journal.
 
 ## 10. Module layout
 
 ```
 virag/
-  main.py            # app, lifespan (clients, dependency checks, binding, reconcile), router order
+  main.py            # app, lifespan (clients, dependency checks, binding, gate, reconcile), router order
   settings.py        # pydantic-settings sections: every env var, its default and bounds
   binding.py         # the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
+  gate.py            # ServingGate: serve only while the collection matches the tiler's render_version
   reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and the shared re-embed stream
   revision.py        # RevisionManager: background revision / rollback job, journal sync
   errors.py          # ApiError + the uniform {"error": {...}} envelope
+  responses.py       # OrjsonResponse, the app-wide default response class
   utils.py           # non-domain helpers (error_body, gather)
   api/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources

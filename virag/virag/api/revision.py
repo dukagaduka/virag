@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+
+from virag.responses import OrjsonResponse
 
 
 log = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ router = APIRouter()
 async def revision(request: Request):
     log.info("revision requested")
 
-    return JSONResponse(status_code=202, content=request.app.state.revision.start())
+    return OrjsonResponse(status_code=202, content=await request.app.state.revision.start())
 
 
 @router.get(
@@ -41,4 +42,4 @@ async def revision_status(request: Request):
 async def revision_rollback(request: Request):
     log.warning("revision rollback requested")
 
-    return JSONResponse(status_code=202, content=request.app.state.revision.start_rollback())
+    return OrjsonResponse(status_code=202, content=await request.app.state.revision.start_rollback())

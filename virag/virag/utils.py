@@ -5,6 +5,7 @@ from collections.abc import Coroutine, Iterable
 from typing import Any, TypeVar
 
 import httpx2
+import orjson
 
 
 T = TypeVar("T")
@@ -13,7 +14,7 @@ T = TypeVar("T")
 def error_body(response: httpx2.Response):
     """Return an httpx response body as parsed JSON if possible, else the raw text."""
     try:
-        return response.json()
+        return orjson.loads(response.content)
 
     except ValueError:
         return response.text

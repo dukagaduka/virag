@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import Annotated
 
+import orjson
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
@@ -112,27 +112,6 @@ async def ingest_document_stream(
         async for event in svc.ingest_stream(
             doc_type=doc_type, data=data, url=url, metadata=meta_obj, force=force
         ):
-            yield json.dumps(event).encode() + b"\n"
+            yield orjson.dumps(event) + b"\n"
 
     return StreamingResponse(ndjson(), media_type="application/x-ndjson")
-
-
-@router.post(
-    "/revision",
-    responses=ERROR_RESPONSES,
-    summary="Re-render stored docs whose render_version is stale (or all, with force).",
-    operation_id="reviseDocuments",
-)
-async def revise_documents(
-    request: Request,
-    force: Annotated[bool, Query()] = False,
-) -> dict:
-    """Re-render stored documents in place so tiles reproduce at the current render_version.
-
-    Refreshes docs whose `render_version` differs from the tiler's current one (or every
-    doc when `force`), plus any left incomplete. Returns `{revised, skipped, failed, ...}`.
-    Qdrant is untouched — run virag's `/revision` afterwards to re-embed.
-    """
-    svc = service(request)
-
-    return await svc.revise(force=force)

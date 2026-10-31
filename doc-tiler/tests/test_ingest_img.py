@@ -77,8 +77,8 @@ async def test_verify_false_skips_hash_check(client):
     assert got.status_code == 200
 
 
-async def test_strict_policy_rejects_drifted_tile(client):
-    """A poisoned image_hash simulates render drift → 409 under strict policy."""
+async def test_drifted_tile_is_refused(client):
+    """A poisoned image_hash simulates render non-determinism → 409, never served."""
     manifest = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()
     doc_id = manifest["doc_id"]
     store = client.service.store
@@ -96,16 +96,3 @@ async def test_strict_policy_rejects_drifted_tile(client):
 
     ok = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0, "verify": "false"})
     assert ok.status_code == 200
-
-
-async def test_lenient_policy_serves_drifted_tile(tmp_path):
-    async with running_app(base_env(tmp_path, TILER_RENDER_MISMATCH_POLICY="lenient")) as (client, svc):
-        manifest = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()
-        async with svc.store._lock:
-            await svc.store.db.execute(
-                "UPDATE tiles SET image_hash = ? WHERE doc_id = ?", ("0" * 64, manifest["doc_id"])
-            )
-            await svc.store.db.commit()
-        await svc.tile_cache.clear()
-        r = await client.get("/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": 0})
-        assert r.status_code == 200

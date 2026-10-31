@@ -36,7 +36,8 @@ async def enforce_binding(
     """Refuse to run unless virag, the Tiler and the Qdrant collection share one secret.
 
     Fatal (BindingError) on any secret mismatch. A fresh (unbound) collection is
-    bound to the secret + tiler render_version on first run. Returns the tiler
+    bound to the secret + tiler render_version on first run; a render_version that
+    differs later is the serving gate's to resolve (virag/gate.py). Returns the tiler
     render_version.
     """
     info = await tiler.get_info()
@@ -71,14 +72,6 @@ async def enforce_binding(
         log.critical("FATAL: %s", message)
 
         raise BindingError(message)
-
-    if meta.get("render_version") != tiler_rv:
-        log.warning(
-            "render_version drift: collection bound to %s but tiler now reports %s; "
-            "stored image_hash values may not reproduce",
-            meta.get("render_version"),
-            tiler_rv,
-        )
 
     return tiler_rv
 

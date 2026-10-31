@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
 from contextlib import AsyncExitStack
 
+import orjson
 from fastapi import APIRouter, File, Form, Request, UploadFile
 
 from virag.errors import ApiError
@@ -166,7 +166,7 @@ def _parse_metadata(raw: str | None) -> dict | None:
         return None
 
     try:
-        obj = json.loads(raw)
+        obj = orjson.loads(raw)
 
     except (ValueError, TypeError) as e:
         raise ApiError(

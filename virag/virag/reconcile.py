@@ -25,6 +25,7 @@ import time
 from collections.abc import Iterable, Iterator
 from contextlib import AsyncExitStack
 from itertools import islice
+from typing import TYPE_CHECKING
 
 from virag.api.enroll import point_id
 from virag.clients.retriever_client import RetrieverClient
@@ -32,6 +33,9 @@ from virag.clients.qdrant_store import QdrantStore
 from virag.clients.tiler_client import TilerService
 from virag.settings import EnrollSettings, ReconcileSettings
 from virag.utils import gather
+
+if TYPE_CHECKING:
+    from virag.gate import ServingGate
 
 
 log = logging.getLogger("virag.reconcile")
@@ -50,6 +54,12 @@ async def reconcile(
     """Run one reconcile pass: enforce the invariant, then clear stale pending enrolls."""
     await enforce_subset(store, tiler)
     await _clear_stale_pending(store, tiler, retriever, settings, enroll_settings)
+
+
+def embeddable(doc: dict) -> bool:
+    """A tiler doc whose tiles can be fetched: complete and not quarantined by a tiler
+    revision (its tiles answer 410 until it is re-enrolled)."""
+    return bool(doc.get("complete")) and not doc.get("quarantined")
 
 
 async def enforce_subset(
@@ -102,13 +112,13 @@ async def _clear_stale_pending(
 
         await store.delete_by_docs([doc["doc_id"] for doc in stale])      # always clear the partial first
 
-        # An incomplete tiler doc can't be re-embedded (no tiles yet); leave it for a
-        # tiler revision / re-enroll to restore.
-        healable = [doc for doc in stale if settings.self_heal and doc.get("complete")]
+        # An incomplete or quarantined tiler doc can't be re-embedded (no servable tiles);
+        # leave it for a re-enroll to restore.
+        healable = [doc for doc in stale if settings.self_heal and embeddable(doc)]
 
         for doc in stale:
             if doc not in healable:
-                log.info("reconcile: doc_id=%s left for re-enroll (self-heal off or tiler incomplete)", doc["doc_id"])
+                log.info("reconcile: doc_id=%s left for re-enroll (self-heal off, or tiler doc incomplete or quarantined)", doc["doc_id"])
 
         if not healable:
             return
@@ -153,7 +163,7 @@ async def sync_docs(
         doc
         for doc in await tiler.iter_docs()
         if doc["doc_id"] in wanted
-        and doc.get("complete")
+        and embeddable(doc)
         and (doc.get("metadata") or {}).get("virag_enrolled_at", 0) > 0
     ]
 
@@ -329,13 +339,20 @@ async def run_periodic(
     retriever: RetrieverClient,
     settings: ReconcileSettings,
     enroll_settings: EnrollSettings,
+    gate: ServingGate,
 ) -> None:
-    """Loop reconcile on the configured interval until cancelled (interval 0 = disabled)."""
+    """Loop reconcile on the configured interval until cancelled (interval 0 = disabled).
+    A pass is skipped while the serving gate is closed: the tiler is revising, or the
+    collection is being rebuilt for its render_version."""
     if settings.interval_sec <= 0:
         return
 
     while True:
         await asyncio.sleep(settings.interval_sec)
+
+        if not gate.serving:
+            log.info("periodic reconcile skipped: not serving (%s)", gate.reason)
+            continue
 
         try:
             await reconcile(store, tiler, retriever, settings, enroll_settings)

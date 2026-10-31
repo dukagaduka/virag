@@ -6,8 +6,9 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from .responses import OrjsonResponse
 
 
 class ApiError(Exception):
@@ -20,6 +21,7 @@ class ApiError(Exception):
         404: "NOT_FOUND",
         405: "METHOD_NOT_ALLOWED",
         409: "CONFLICT",
+        410: "GONE",
         413: "PAYLOAD_TOO_LARGE",
         415: "UNSUPPORTED_MEDIA",
         416: "RANGE_NOT_SATISFIABLE",
@@ -37,6 +39,7 @@ class ApiError(Exception):
         code: str,
         message: str,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
 
         super().__init__(message)
@@ -44,6 +47,7 @@ class ApiError(Exception):
         self.code = code
         self.message = message
         self.details = details
+        self.headers = headers
 
 
     def body(self) -> dict[str, Any]:
@@ -76,6 +80,11 @@ def conflict(msg: str, code: str = "RENDER_MISMATCH", **details: Any) -> ApiErro
     return ApiError(409, code, msg, details or None)
 
 
+def gone(msg: str, code: str = "QUARANTINED", **details: Any) -> ApiError:
+    """Build a 410 error."""
+    return ApiError(410, code, msg, details or None)
+
+
 def too_large(msg: str, code: str = "PAYLOAD_TOO_LARGE", **details: Any) -> ApiError:
     """Build a 413 error."""
     return ApiError(413, code, msg, details or None)
@@ -96,6 +105,11 @@ def bad_gateway(msg: str, code: str = "UPSTREAM_FAILURE", **details: Any) -> Api
     return ApiError(502, code, msg, details or None)
 
 
+def not_ready(msg: str, code: str = "NOT_READY", retry_after: int = 30, **details: Any) -> ApiError:
+    """Build a 503 error with a Retry-After hint."""
+    return ApiError(503, code, msg, details or None, headers={"Retry-After": str(retry_after)})
+
+
 def gateway_timeout(msg: str, code: str = "RENDER_TIMEOUT", **details: Any) -> ApiError:
     """Build a 504 error."""
     return ApiError(504, code, msg, details or None)
@@ -106,25 +120,25 @@ def install_error_handlers(app: Any) -> None:
     """Register exception handlers that shape all errors into the envelope."""
 
     @app.exception_handler(ApiError)
-    async def _api_error(_: Request, exc: ApiError) -> JSONResponse:
+    async def _api_error(_: Request, exc: ApiError) -> OrjsonResponse:
         """Serialise a domain ApiError."""
-        return JSONResponse(status_code=exc.status_code, content=exc.body())
+        return OrjsonResponse(status_code=exc.status_code, content=exc.body(), headers=exc.headers)
 
     @app.exception_handler(StarletteHTTPException)
-    async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def _http_error(_: Request, exc: StarletteHTTPException) -> OrjsonResponse:
         """Wrap a raw Starlette HTTP exception in the error envelope."""
         code = ApiError.STATUS_CODES.get(exc.status_code, "ERROR")
 
-        return JSONResponse(
+        return OrjsonResponse(
             status_code=exc.status_code,
             content={"error": {"code": code, "message": str(exc.detail)}},
             headers=getattr(exc, "headers", None),
         )
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def _validation_error(_: Request, exc: RequestValidationError) -> OrjsonResponse:
         """Reshape FastAPI's 422 validation error into the Error envelope."""
-        return JSONResponse(
+        return OrjsonResponse(
             status_code=422,
             content={
                 "error": {
@@ -136,10 +150,10 @@ def install_error_handlers(app: Any) -> None:
         )
 
     @app.exception_handler(Exception)
-    async def _unhandled(_: Request, exc: Exception) -> JSONResponse:
+    async def _unhandled(_: Request, exc: Exception) -> OrjsonResponse:
         """Turn any uncaught exception into a 500 instead of crashing the worker."""
         # Catch-all so no render failure can take down the worker.
-        return JSONResponse(
+        return OrjsonResponse(
             status_code=500,
             content={
                 "error": {

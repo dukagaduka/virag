@@ -77,13 +77,28 @@ Every pinned layer above affects rendered pixels — the Chromium revision throu
 `render_version`, the fonts and libraries silently. Upgrading is a deliberate act:
 
 1. Bump the `playwright` pin in `pyproject.toml` and/or the `BASE_IMAGE` digest.
-2. Rebuild and redeploy.
-3. Run the tiler's `POST /revision` (re-renders docs whose `render_version` changed; use
-   `force=true` after a base-only bump, which `render_version` does not see), then the
-   consumer's re-embed (virag's `POST /revision`).
+2. Rebuild and redeploy (restart the container on the same volume).
+3. The tiler finds docs rendered by the previous `render_version` and comes up **not
+   serving**: data routes answer `503 NOT_READY`, `/healthz` stays `200`. It copies the DB
+   to `<TILER_DB_PATH>.bak-<previous render_version>` and re-renders those docs from
+   their blobs (with `TILER_REVISION_ON_RENDER_MISMATCH=false`, only once you
+   `POST /revision`). Follow it with `GET /revision` (`total`, `revised`, `eta_sec`) or the
+   log's `done/total, rate, ETA` line; a restart mid-way resumes. When it is done the
+   tiler serves again.
+4. The consumer follows: virag sees the new `render_version`, stops serving and rebuilds
+   its collection on its own (its `POST /revision`; see virag's DEPLOYMENT.md).
 
-Until step 3 finishes, regenerated web/MHTML tiles may not match their stored
-`image_hash` (see `TILER_RENDER_MISMATCH_POLICY` in [CONFIG.md](CONFIG.md)).
+A base-only bump changes pixels without changing `render_version` (fonts and libraries
+are not part of it): run `POST /revision?force=true` yourself, then virag's
+`POST /revision`.
+
+Docs that cannot be re-rendered are **quarantined** (`GET /revision` lists them;
+`/get_tile` answers `410`); re-ingest their bytes to restore them.
+
+**Rollback:** stop the tiler, put the previous image back, restore the DB from the
+backup (`cp meta.sqlite.bak-<rv> meta.sqlite`, removing `meta.sqlite-wal` / `-shm`), start
+it. Blobs are never touched by a revision. Docs ingested after the upgrade are not in the
+backup; re-ingest them.
 
 ## State & the named volume
 
@@ -128,9 +143,11 @@ mkdir -p ./data && sudo chown -R 10001:10001 ./data
 
 ## Health & scaling
 
-- **Liveness:** `GET /healthz` (touches nothing, stays fast under load).
-- **Readiness:** `GET /readyz` — checks DB, blob dir, Chromium pool; `503` when not
-  ready. The Compose healthcheck uses it.
+- **Liveness:** `GET /healthz` (touches nothing, stays fast under load). The image
+  `HEALTHCHECK` and the Compose healthcheck use it, so an hours-long revision never marks
+  the container unhealthy (and an orchestrator never kills it mid-way).
+- **Readiness:** `GET /readyz` — checks DB, blob dir, Chromium pool and the revision
+  gate; `503` when not ready. Route traffic on it (load balancer / Kubernetes readiness).
 - Run **one** uvicorn worker per container (`--workers 1`). Concurrency comes from the
   event loop plus the browser/render pools, not from workers — multiple workers would each
   spawn their own Chromium pool and SQLite writer and fight over the volume. **Scale

@@ -262,6 +262,15 @@ async def test_patch_validates(client):
     assert r.status_code == 422
 
 
+async def test_unstorable_metadata_is_422(client):
+    """JSON columns are written by orjson, which refuses integers beyond 64 bits."""
+    doc_id = await ingest(client, 1, {"project": "p"})
+    r = await client.patch(f"/doc/{doc_id}/metadata", json={"huge": 2**70})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_METADATA_JSON"
+    assert (await client.get(f"/doc/{doc_id}/metadata")).json() == {"project": "p"}
+
+
 async def test_metadata_endpoints_404(client):
     missing = "0" * 64
     assert (await client.get(f"/doc/{missing}/metadata")).status_code == 404

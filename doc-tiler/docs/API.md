@@ -72,28 +72,48 @@ failure is reported as an in-stream `error` event (the HTTP status is already `2
 **absence of a `committed` event** is the client's signal that the ingest did not complete.
 A stream that dies mid-way leaves a swept-able partial doc, never a servable half-doc.
 Idempotent like `/tile`: identical bytes of an already-**complete** doc replay the stored
-tiles as the same event stream without re-rendering (unless `force`).
+tiles as the same event stream without re-rendering (unless `force`); a quarantined doc
+is re-rendered instead, which lifts its quarantine.
 
 `POST /tile` (the single-manifest form above) is unchanged and remains available.
 
-### `POST /revision` — re-render stored docs in place
+### Revision — `GET /revision`, `POST /revision`
 
-Re-renders, from their stored original blobs, every stored doc whose `render_version`
-differs from the tiler's current one (or **all** docs when `force=true`), plus any doc
-left incomplete. Tiles are **atomically replaced in place** (`doc_id` is stable); after
-it, `/get_tile` reproduces at the current `render_version`. It does **not** touch any
-downstream (e.g. Qdrant) — it is only the tiler half of a revision.
+`render_version` is bound to the volume like geometry: the tiler **never serves a doc
+rendered by another `render_version`**. When the service starts with stored docs from
+another one (a pixel-tier change — Chromium, Pillow, PyMuPDF, DPI, JPEG quality, PDF
+slicing), it comes up **not serving**: every data route (`/tile*`, `/get_tile`, `/doc*`,
+`/docs/search`) answers `503 NOT_READY` with `Retry-After`, while ops routes and
+`/revision` stay up. The revision then re-renders those docs from their blobs —
+right away with `TILER_REVISION_ON_RENDER_MISMATCH=true` (default), otherwise on
+`POST /revision` — and the service turns ready when it is done.
 
-- Query flag: `force` (default `false`).
-- Response JSON: `{"revised":int,"skipped":int,"failed":[doc_id...],"render_version":string}`.
+- `GET /revision` → status: `state` (`idle` | `required` | `running` | `succeeded` |
+  `failed`), `serving`, `render_version`, `force`, `started_at` / `finished_at`,
+  `total`, `revised`, `quarantined`, `quarantined_doc_ids` (first 100),
+  `quarantined_total`, `eta_sec`, `backup`, `error`.
+- `POST /revision?force=false` → `202` + status; starts the job in the background (the
+  service turns not-ready until it finishes). `force=true` re-renders **every** complete
+  doc, quarantined ones included. `409 REVISION_RUNNING` while a job runs.
+
+Per doc, tiles and layout (`tile_count`, `page_heights`) are swapped in one transaction
+at the new `render_version`; `doc_id` and **metadata are never touched**. A doc that
+fails twice is **quarantined** (its tiles answer `410 QUARANTINED`) instead of holding
+the service back; re-ingesting its bytes, or the next revision at another
+`render_version`, retries it. A render-worker crash or an unavailable Chromium aborts
+the job (`state=failed`, still not serving). Before the first write the DB is copied to
+`<TILER_DB_PATH>.bak-<previous render_version>` — the rollback point. Incomplete
+(streaming) docs are not revised; the sweeper owns them. The job is resumable: a restart
+picks up the docs still at another `render_version` (a forced job is not resumed).
 
 ### `GET /get_tile?doc_id=&tile_num=&verify=` — regenerate one tile
 
 Deterministically regenerates a single tile from the stored original and returns
 `image/jpeg` with `X-Doc-Id` / `X-Tile-Num` / `X-Image-Hash` / `X-Tile-Height` /
 `X-Tile-Width` headers. `verify=true` recomputes the hash and compares against the value
-recorded at ingest; on mismatch the response follows `TILER_RENDER_MISMATCH_POLICY`
-(`strict` → `409`, `lenient` → serve fresh + warn).
+recorded at ingest. Every served doc was rendered by the current `render_version`, so a
+mismatch is non-determinism — a bug — and answers `409 RENDER_MISMATCH`. A quarantined
+doc answers `410 QUARANTINED`.
 
 ```bash
 curl -s 'localhost:8080/get_tile?doc_id=<sha256>&tile_num=3' -o tile3.jpg
@@ -135,7 +155,8 @@ Body: `{filters?, limit, cursor}`.
 - **No filters / omitted** → list all documents, newest first.
 - Cursor pagination on `(created_at, doc_id)`; response `{items: DocSummary[],
   next_cursor}`. Each `DocSummary` carries `complete` (bool — `false` while a streaming
-  ingest is still in flight or crashed) and `render_version` alongside the usual fields.
+  ingest is still in flight or crashed), `quarantined` (bool — a revision could not
+  re-render it) and `render_version` alongside the usual fields.
 
 ```bash
 curl -s -X POST localhost:8080/docs/search -H 'content-type: application/json' \
@@ -149,9 +170,10 @@ curl -s -X POST localhost:8080/docs/search -H 'content-type: application/json' \
 | Endpoint | Purpose |
 |---|---|
 | `GET /schema/metadata` | The operator-declared metadata schema (which keys are searchable). |
-| `GET /info` | Effective geometry, `render_version`, pixel tier, policies, pool + cache stats, doc count. |
-| `GET /healthz` | Liveness — touches nothing, stays fast under load. |
-| `GET /readyz` | Readiness — checks DB, blob dir, Chromium pool; `503` when not ready. |
+| `GET /info` | Effective geometry, `render_version`, pixel tier, revision status (`revision.serving`), policies, pool + cache stats, doc count. |
+| `GET /healthz` | Liveness — touches nothing, stays fast under load; the container `HEALTHCHECK`. |
+| `GET /readyz` | Readiness — checks DB, blob dir, Chromium pool and the revision gate; `503` when not ready (`checks.revision`, `checks.quarantined`). |
+| `GET /revision` | Revision status (see above). |
 | `GET /metrics` | Prometheus metrics (see [METRICS.md](METRICS.md)). |
 
 ---
@@ -166,15 +188,18 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 | `403` | SSRF policy block. |
 | `404` | Unknown `doc_id` (including `store=false` docs); `GET /get_tile` on an incomplete doc (`DOC_INCOMPLETE`). |
 | `405` | `DELETE` with `TILER_ALLOW_DELETE=false`. |
-| `409` | `image_hash` mismatch under `strict` policy. |
+| `409` | `image_hash` mismatch on regeneration (`RENDER_MISMATCH`); `POST /revision` while one runs (`REVISION_RUNNING`). |
+| `410` | `GET /get_tile` on a quarantined doc (`QUARANTINED`). |
 | `413` | Upload exceeds `TILER_MAX_DOC_BYTES`. |
 | `415` | Content-type mismatch. |
 | `416` | `Range` not satisfiable (`GET /doc`). |
-| `422` | Corrupt document, invalid metadata JSON, schema violation, request validation. |
+| `422` | Corrupt document, invalid metadata JSON (including integers beyond 64 bits), schema violation, request validation. |
 | `502` | Upstream fetch/render failure. |
+| `503` | Data routes while a revision is pending or running (`NOT_READY`, with `Retry-After`). |
 | `504` | Render timeout. |
 
 **Startup** is separate: a geometry- or binding-secret mismatch makes the process exit
 non-zero before serving anything (see [ARCHITECTURE.md](ARCHITECTURE.md) and
-[SECURITY.md](SECURITY.md)). All 5xx from rendering are caught so one bad document never
+[SECURITY.md](SECURITY.md)); a `render_version` change keeps it up but not serving until
+the revision is done. All 5xx from rendering are caught so one bad document never
 crashes a worker or the event loop.

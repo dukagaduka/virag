@@ -40,15 +40,17 @@ async def _run() -> int:
         await enforce(store, settings)
         await store.create_metadata_indexes(index_statements(schema))
         docs = await store.count_docs()
+        revisable = await store.count_revisable(settings.render_version)
 
     finally:
         await store.close()
 
     log.info(
-        "preflight ok: geometry=%s render_version=%s docs=%d searchable=%s",
+        "preflight ok: geometry=%s render_version=%s docs=%d to_revise=%d searchable=%s",
         settings.geometry,
         settings.render_version,
         docs,
+        revisable,
         [f.key for f in schema.fields],
     )
 

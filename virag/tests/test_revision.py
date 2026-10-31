@@ -38,7 +38,7 @@ def _manager(store, tiler):
 
 def _run_job(manager, start) -> dict:
     async def go():
-        start()
+        await start()
         await manager._task
 
         return manager.status
@@ -48,20 +48,53 @@ def _run_job(manager, start) -> dict:
 
 def test_revision_builds_swaps_and_syncs_journal():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 2), _doc("b", 1, complete=False), _doc("fresh", 1)]
+    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    tiler.docs = [_doc("a", 2), _doc("b", 1, complete=False), _doc("q", 1) | {"quarantined": True}, _doc("fresh", 1)]
     store.journal_seen = {"fresh"}                                      # enrolled while building
     manager = _manager(store, tiler)
 
     status = _run_job(manager, manager.start)
 
     assert status["state"] == "succeeded"
-    assert status["total"] == 3 and status["skipped"] == 1 and status["reembedded"] == 2
+    assert status["total"] == 4 and status["skipped"] == 2 and status["reembedded"] == 2
     assert status["synced"] == 1
     assert store.swapped_to == "c__v2"
     assert store.previous_name == "c__v1"                               # retained for rollback
+    assert store.metadata == {"secret_hash": "", "render_version": "rv-test"}   # bound to the tiler's
     assert all(u["collection"] == "c__v2" for u in store.upserts)
     assert ("fresh", "c__v2") in zip(store.deletes, store.delete_collections)   # re-synced after swap
     assert tiler.metadata_patches == []                                 # revision never touches markers
+
+
+def test_revision_is_refused_while_the_tiler_is_not_serving():
+    tiler = FakeTiler(info={"secret_hash": "", "render_version": "rv-test",
+                            "revision": {"state": "running", "serving": False}})
+    manager = _manager(FakeStore(), tiler)
+
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(manager.start())
+
+    assert exc.value.status_code == 409
+    assert manager._task is None
+
+
+def test_revision_aborts_when_the_tiler_render_version_changes_mid_build():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    manager = _manager(store, tiler)
+
+    async def go():
+        await manager.start()
+        tiler._info = {**tiler._info, "render_version": "rv-newer"}    # tiler redeployed meanwhile
+        await manager._task
+
+        return manager.status
+
+    status = asyncio.run(go())
+
+    assert status["state"] == "failed" and "changed during the build" in status["error"]
+    assert not hasattr(store, "swapped_to")
+    assert store.dropped == ["c__v2"]
 
 
 def test_revision_with_failed_docs_does_not_swap():
@@ -85,10 +118,10 @@ def test_second_job_is_rejected_while_running():
     manager = _manager(store, tiler)
 
     async def go():
-        manager.start()
+        await manager.start()
 
         with pytest.raises(ApiError) as exc:
-            manager.start()
+            await manager.start()
 
         await manager._task
 
@@ -101,14 +134,28 @@ def test_rollback_requires_a_previous_collection():
     manager = _manager(FakeStore(), FakeTiler())
 
     with pytest.raises(ApiError) as exc:
-        manager.start_rollback()
+        asyncio.run(manager.start_rollback())
 
     assert exc.value.status_code == 409
+
+
+def test_rollback_is_refused_across_render_versions():
+    store, tiler = FakeStore(), FakeTiler()
+    store.physical_name, store.previous_name = "c__v2", "c__v1"
+    store.collection_metadata = {"c__v1": {"render_version": "rv-before-the-tiler-upgrade"}}
+    manager = _manager(store, tiler)
+
+    with pytest.raises(ApiError) as exc:
+        asyncio.run(manager.start_rollback())
+
+    assert exc.value.status_code == 409 and "render_version" in exc.value.message
+    assert manager._task is None
 
 
 def test_rollback_resyncs_docs_enrolled_since_retirement():
     store, tiler = FakeStore(), FakeTiler()
     store.physical_name, store.previous_name = "c__v2", "c__v1"
+    store.collection_metadata = {"c__v1": {"render_version": "rv-test"}}
     store.rollback_retired_at = 100
     tiler.docs = [_doc("old", 1, enrolled_at=50), _doc("new", 1, enrolled_at=150)]
     manager = _manager(store, tiler)

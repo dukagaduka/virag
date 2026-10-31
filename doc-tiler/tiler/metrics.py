@@ -24,6 +24,9 @@ SSRF_BLOCKS = Counter("tiler_ssrf_blocked_total", "Requests blocked by the SSRF 
 BROWSER_RECYCLES = Counter("tiler_browser_recycles_total", "Chromium process recycles")
 DOCS = Gauge("tiler_docs", "Documents currently stored")
 INFLIGHT = Gauge("tiler_inflight_renders", "Renders currently in flight", ["layer"])
+SERVING = Gauge("tiler_serving", "1 while serving; 0 while a revision holds the service not-ready")
+REVISION_DOCS = Counter("tiler_revision_docs_total", "Docs processed by a revision", ["result"])
+QUARANTINED = Gauge("tiler_quarantined_docs", "Documents quarantined by a revision")
 
 
 def render_latest() -> tuple[bytes, str]:

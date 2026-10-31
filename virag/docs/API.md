@@ -134,10 +134,11 @@ curl -s -X POST localhost:8080/enroll \
 
 ## `POST /revision`
 
-Re-embed the **whole corpus** into a fresh vector collection and swap it in with no
-downtime. Use it after a retriever-model change (or after the tiler's own `/revision`
-re-render) so the vectors are rebuilt against the new model. It is not periodic
-maintenance — with nothing changed it would recompute the same vectors.
+Re-embed the **whole corpus** into a fresh vector collection and swap it in. Use it
+after a retriever-model change, with no downtime. After a tiler render change virag
+starts it on its own (see [Serving gate](#serving-gate)); call it yourself only with
+`VIRAG_REVISION_ON_RENDER_MISMATCH=false`, or after a failed automatic attempt. It is not
+periodic maintenance — with nothing changed it would recompute the same vectors.
 
 virag serves through a stable Qdrant **alias**; `/revision` builds a new physical
 collection alongside the live one, re-embeds every *complete* tiler doc into it, then
@@ -148,8 +149,11 @@ and the old collection keeps serving. The replaced collection is kept for
 [`/revision/rollback`](#post-revisionrollback) until the next revision.
 
 It runs in the **background**: the call returns `202` with the job status at once; a
-second call while a job runs is `409 CONFLICT`. Incomplete tiler docs are skipped (they
-aren't servable; leave them for a tiler `/revision`).
+second call while a job runs is `409 CONFLICT`, and so is a call while the tiler is not
+serving (its own revision is pending or running). Incomplete and quarantined tiler docs
+are skipped (they have no servable tiles; re-enroll them). The new collection is stamped
+with the tiler's `render_version`; if the tiler's changes before the swap, the job fails
+without swapping.
 
 ```bash
 curl -s -X POST localhost:8080/revision | jq
@@ -166,6 +170,7 @@ Status of the current or last revision / rollback job (in-process; reset on rest
   "started_at": 1761130000,
   "finished_at": 1761130950,
   "collection": "store-collection__v2",
+  "render_version": "f04061fd38ea887a",
   "total": 130, "skipped": 2, "reembedded": 128, "synced": 3
 }
 ```
@@ -180,7 +185,26 @@ Repoint the alias back to the collection the last revision replaced, drop the ab
 one, and re-sync the documents enrolled since the swap. Background, like `/revision`
 (`202`; `409` while a job runs or when there is no previous collection). Revert the
 retriever configuration first — the old collection holds the old model's vectors (a
-vector-size mismatch is refused).
+vector-size mismatch is refused). A collection embedded from another `render_version`
+than the tiler renders now is refused too: its tiles would fail the integrity check.
+
+## Serving gate
+
+virag serves only while its collection was embedded from the `render_version` the tiler
+renders now — otherwise every retrieved tile would fail the integrity check. The gate is
+evaluated at startup and every `VIRAG_TILER_WATCH_INTERVAL_SEC`:
+
+- the tiler is not serving (its own revision is pending or running) → wait;
+- the tiler serves another `render_version` than the collection's → with
+  `VIRAG_REVISION_ON_RENDER_MISMATCH=true` (default) virag starts `/revision` itself,
+  once per tiler `render_version`; otherwise it waits for `POST /revision`;
+- the tiler is bound to another `TILER_DB_SECRET` → closed;
+- both agree → serving.
+
+While closed, `/v1/chat/completions` and `/enroll` answer `503 NOT_READY` (the message
+names the reason; `details.revision` carries the job status) and `/ready` answers `503`
+with a `reason`. `/health`, `/revision` and the proxies stay up. An unreachable tiler
+leaves the gate as it was.
 
 ---
 
@@ -204,8 +228,8 @@ An unreachable upstream returns `502`.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Liveness — always `{"status":"ok"}`, touches nothing. |
-| `GET /ready` | Readiness — `200 {"status":"ready"}` once all backends are wired; `503 {"status":"not ready","missing":[…]}` otherwise. |
+| `GET /health` | Liveness — always `{"status":"ok"}`, touches nothing; the container `HEALTHCHECK`. |
+| `GET /ready` | Readiness — `200 {"status":"ready"}` once all backends are wired and the serving gate is open; `503 {"status":"not ready","missing":[…]}` or `503 {"status":"not ready","reason":"…"}` otherwise. |
 
 ---
 

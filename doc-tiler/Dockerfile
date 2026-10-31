@@ -13,7 +13,8 @@
 # Everything that affects rendered pixels sits in the first three and is pinned:
 # the base by digest, the system packages (fonts, freetype, …) by the snapshot the
 # base was built from, Chromium by the `playwright` pin in pyproject.toml. Bumping
-# any of them is a deliberate act followed by a tiler `/revision` (docs/DEPLOYMENT.md).
+# any of them is a deliberate act: the next start revises the stored docs before it
+# serves (a base-only bump needs `POST /revision?force=true`; docs/DEPLOYMENT.md).
 
 # python:3.11-slim (Debian 13). Bump the digest deliberately: it moves the OS and,
 # through the snapshot below, the fonts and system libraries too.
@@ -164,7 +165,7 @@ USER 10001:10001
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://localhost:8080/readyz || exit 1
+  CMD curl -fsS http://localhost:8080/healthz || exit 1
 
 # tini reaps the zombie Chromium/renderer processes a PID-1 Python would leak.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/tiler-entrypoint"]

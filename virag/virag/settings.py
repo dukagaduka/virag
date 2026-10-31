@@ -151,6 +151,16 @@ class ReconcileSettings(_Section):
     pending_ttl_sec: int = Field(3600, ge=1)    # must exceed the longest enroll
 
 
+class RevisionSettings(_Section):
+    """The render_version gate: virag serves only while the collection was embedded from
+    the tiler's current render_version, and rebuilds it when they differ."""
+
+    model_config = SettingsConfigDict(env_prefix="VIRAG_")
+
+    revision_on_render_mismatch: bool = True    # off → stay not-ready until POST /revision
+    tiler_watch_interval_sec: int = Field(10, ge=1)
+
+
 class Settings(_Section):
     model_config = SettingsConfigDict(env_prefix="VIRAG_")
 
@@ -168,6 +178,7 @@ class Settings(_Section):
     vlm_settings: VLMSettings = Field(default_factory=VLMSettings)  # type: ignore[arg-type]
     enroll_settings: EnrollSettings = Field(default_factory=EnrollSettings)
     reconcile_settings: ReconcileSettings = Field(default_factory=ReconcileSettings)
+    revision_settings: RevisionSettings = Field(default_factory=RevisionSettings)
 
 
     @classmethod
@@ -221,5 +232,6 @@ _SECTIONS: dict[str, type[BaseSettings]] = {
         VLMSettings,
         EnrollSettings,
         ReconcileSettings,
+        RevisionSettings,
     )
 }
