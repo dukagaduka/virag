@@ -56,8 +56,10 @@ When RAG is on, `_run_rag` runs before the upstream call:
 2. **Embed.** One text embedding via the retriever client (`embed_texts`).
 3. **Search.** Qdrant top-`N`; if `score_threshold` is set, drop hits below it.
 4. **Fetch tiles.** For each hit, call doc-tiler `GET /get_tile?doc_id&tile_num`
-   (concurrently) and base64-encode the JPEG. A tile that fails to render is logged
-   and **skipped**, not fatal.
+   (concurrently) and base64-encode the JPEG. A tile the tiler refuses (`404`, `410`,
+   its own hash `409`, …) is logged and **skipped**, not fatal. A tiler that is
+   unreachable or not serving (`503`) fails the request with `503 NOT_READY` — virag
+   does not answer without its context.
 5. **Integrity check.** Each hit's Qdrant payload carries the `render_version` and the
    `image_hash` recorded at enroll time. A tile whose `X-Render-Version` differs from
    the payload's fails the whole request with `409 RENDER_VERSION_MISMATCH` (the first
@@ -207,7 +209,10 @@ passes:
 1. *Enforce `Qdrant ⊆ Tiler`.* List every tiler `doc_id` (`POST /docs/search`) and every
    Qdrant `doc_id` (scroll), and delete from Qdrant any `doc_id` the tiler no longer has.
    This is also how a document deleted from the tiler gets its stale points removed
-   (delete-propagation) — on the next reconcile pass.
+   (delete-propagation) — on the next reconcile pass. Points of a doc the tiler
+   quarantined go too: its tiles answer `410`, so they would only crowd live hits out
+   of `top_n`. A doc with a write in flight (a re-enroll lifting the quarantine) is
+   left alone; a re-enroll brings the points back.
 2. *Clear stale pending.* Find docs with `virag_enrolled_at == 0` **and**
    `virag_started_at < now − VIRAG_PENDING_TTL_SEC` (the TTL gate skips in-flight
    enrolls), delete their partial points, and — if `VIRAG_SELF_HEAL` is on and the tiler

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from virag.errors import ApiError
+
 from conftest import FakeHit, FakeRetriever, FakeStore, FakeTiler, FakeVLM, hit_for
 
 
@@ -93,6 +95,44 @@ def test_rag_render_version_mismatch_fails_the_request(make_client):
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "RENDER_VERSION_MISMATCH"
     assert vlm.complete_bodies == []                                    # never answered without tiles
+
+
+class _RefusingTiler(FakeTiler):
+    """get_tile fails as HttpService would map the tiler's `status` (None = unreachable)."""
+
+    def __init__(self, status):
+        super().__init__()
+        self.status = status
+
+    async def get_tile(self, doc_id, tile_num, *, render_version=None, bulk=False) -> bytes:
+        details = {"error": "ConnectError()"} if self.status is None else {"upstream_status": self.status}
+        raise ApiError(status_code=503, message="Upstream failed", details=details)
+
+
+def _ask(make_client, tiler, vlm):
+    client = make_client(vlm=vlm, store=_rag_store(), retriever=FakeRetriever(), tiler=tiler)
+
+    return client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "q"}], "rag": {},
+    })
+
+
+def test_rag_tiler_not_ready_fails_the_request(make_client):
+    for status in (503, None):                                          # revising, unreachable
+        vlm = FakeVLM()
+        r = _ask(make_client, _RefusingTiler(status), vlm)
+
+        assert r.status_code == 503, status
+        assert r.json()["error"]["code"] == "NOT_READY"
+        assert vlm.complete_bodies == []
+
+
+def test_rag_tile_refused_by_the_tiler_is_skipped(make_client):
+    vlm = FakeVLM()
+    r = _ask(make_client, _RefusingTiler(410), vlm)                     # e.g. quarantined
+
+    assert r.status_code == 200
+    assert vlm.complete_bodies[0]["messages"][-1]["content"] == "q"
 
 
 def test_rag_without_query_text_is_422(make_client):

@@ -494,9 +494,14 @@ class QdrantStore:
                 self._writers_changed.notify_all()
 
 
+    def writing(self) -> set[str]:
+        """doc_ids with a write in flight in this process."""
+        return {doc_id for doc_id, _ in self._writers.values()}
+
+
     def start_journal(self) -> None:
         """Begin recording written doc_ids — including writers already in flight."""
-        self._journal = {doc_id for doc_id, _ in self._writers.values()}
+        self._journal = self.writing()
 
 
     def stop_journal(self) -> set[str]:

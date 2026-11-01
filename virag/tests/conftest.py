@@ -85,6 +85,7 @@ class FakeStore:
         self.previous_name: str | None = None
         self.dropped: list[str] = []
         self.writers: list[str] = []
+        self.in_flight: set[str] = set()                     # writers still writing
         self._journal: set[str] | None = None
         self.journal_seen: set[str] | None = None
         self.rollback_retired_at = 0
@@ -126,9 +127,16 @@ class FakeStore:
     @asynccontextmanager
     async def writer(self, doc_id: str):
         self.writers.append(doc_id)
+        self.in_flight.add(doc_id)
         if self._journal is not None:
             self._journal.add(doc_id)
-        yield
+        try:
+            yield
+        finally:
+            self.in_flight.discard(doc_id)
+
+    def writing(self) -> set[str]:
+        return set(self.in_flight)
 
     def start_journal(self) -> None:
         self._journal = set(self.journal_seen or ())
@@ -170,6 +178,7 @@ class FakeStore:
 class FakeTiler:
 
     RENDER_VERSION_MISMATCH = TilerService.RENDER_VERSION_MISMATCH
+    unavailable = staticmethod(TilerService.unavailable)
 
     def __init__(self, result: TileResult | None = None, info: dict | None = None):
         self._result = result

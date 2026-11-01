@@ -44,10 +44,12 @@ Put it at the top level of the request body. With an OpenAI SDK, pass it via
 A wrong type on any of these is a `422`. RAG on but no user text to build a query from
 is also a `422`.
 
-A retrieved tile that fails to regenerate (or hashes differently than enrolled) is
-skipped. A tile the tiler now renders by another `render_version` than the one it was
-embedded from fails the whole request with `409 RENDER_VERSION_MISMATCH`: the collection
-is stale and must be rebuilt with [`POST /revision`](#post-revision).
+A retrieved tile the tiler refuses (gone, quarantined, or hashing differently than
+enrolled) is skipped. Two failures fail the whole request instead of answering without
+context: a tiler that is unreachable or not serving (`503 NOT_READY`), and a tile the
+tiler now renders by another `render_version` than the one it was embedded from
+(`409 RENDER_VERSION_MISMATCH` — the collection is stale and must be rebuilt with
+[`POST /revision`](#post-revision)).
 
 ```bash
 # RAG on with defaults
@@ -234,7 +236,7 @@ Every error uses one shape:
 | `409` | `RENDER_VERSION_MISMATCH` | A retrieved tile is rendered by another `render_version` than it was embedded from — rebuild with `POST /revision`. |
 | `422` | `UNPROCESSABLE` | Bad request body/JSON, invalid `rag` field, RAG on with no query text, bad `metadata`. |
 | `502` | `UPSTREAM_FAILURE` | A backend (VLM, tiler, retriever, Qdrant) could not be reached. |
-| `503` | `NOT_READY` | Queried before startup finished wiring backends. |
+| `503` | `NOT_READY` | Queried before startup finished wiring backends, or the tiler is unreachable / not serving during a RAG chat. |
 | `500` | `INTERNAL_ERROR` | Unexpected server error. |
 
 Backend services can surface their own statuses (e.g. the tiler's `409`/`413`) through

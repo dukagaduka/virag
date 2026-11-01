@@ -41,8 +41,8 @@ agree across all three:
 
 virag also enforces the **`Qdrant ⊆ Tiler` invariant**: every Qdrant point is backed by
 a tiler tile. Reconcile (at startup and on an interval) deletes any Qdrant `doc_id` the
-tiler no longer has, so a query never returns a hit whose tile the tiler can't
-regenerate — and the integrity check below guarantees the bytes still match. (This
+tiler no longer has or has quarantined, so a query never returns a hit whose tile the
+tiler can't regenerate — and the integrity check below guarantees the bytes still match. (This
 replaces the older best-effort `doc_id` overlap warning.) See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the reconcile passes.
 

@@ -89,11 +89,12 @@ async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | N
 
 
 async def _fetch_tiles(tiler, hits) -> list[tuple]:
-    """Regenerate each hit's tile as base64 JPEG, skipping any that fail to render.
+    """Regenerate each hit's tile as base64 JPEG, skipping any the tiler refuses.
 
-    A tile the tiler now renders by another render_version than the one it was
-    embedded from fails the whole request (409 RENDER_VERSION_MISMATCH): the
-    collection is stale and must be rebuilt, not quietly answered without tiles.
+    Two failures are the whole request's, never quietly answered without tiles: a tile
+    the tiler now renders by another render_version than the one it was embedded from
+    (409 RENDER_VERSION_MISMATCH — the collection is stale and must be rebuilt), and a
+    tiler that is unreachable or not serving (503 NOT_READY).
     """
     async def fetch(hit):
         doc_id = hit.payload.get("doc_id")
@@ -106,6 +107,9 @@ async def _fetch_tiles(tiler, hits) -> list[tuple]:
         except ApiError as e:
             if e.code == tiler.RENDER_VERSION_MISMATCH:
                 raise
+
+            if tiler.unavailable(e):
+                raise ApiError(status_code=503, message=f"The tiler is not ready: {e.message}", details=e.details) from e
 
             log.warning("skipping tile (doc_id=%s tile_num=%s): %s", doc_id, tile_num, e.message)
 
@@ -123,7 +127,7 @@ async def _fetch_tiles(tiler, hits) -> list[tuple]:
 
         return hit, base64.b64encode(data).decode()
 
-    # The first mismatch cancels the other fetches.
+    # The first such failure cancels the other fetches.
     results = await gather(fetch(hit) for hit in hits)
 
     return [result for result in results if result is not None]

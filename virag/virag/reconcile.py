@@ -64,20 +64,32 @@ async def enforce_subset(
     *,
     collection: str | None = None,
 ) -> int:
-    """Delete points whose doc_id is absent from the tiler (invariant repair) in the
-    serving collection, or in `collection` (a revision build). Returns how many docs."""
+    """Delete points whose doc_id is absent from the tiler (invariant repair) or
+    quarantined by it, in the serving collection or in `collection` (a revision build).
+    Returns how many docs."""
     qdrant_ids = await store.iter_doc_ids(collection=collection)
-    tiler_ids = {doc["doc_id"] for doc in await tiler.iter_docs()}
+    docs = await tiler.iter_docs()
 
-    dangling = qdrant_ids - tiler_ids
-    if not dangling:
+    dangling = qdrant_ids - {doc["doc_id"] for doc in docs}
+
+    # A quarantined doc's tiles answer 410, so its points only crowd live hits out of
+    # top_n. One being written right now is a re-enroll lifting the quarantine.
+    quarantined = {doc["doc_id"] for doc in docs if doc.get("quarantined")} & qdrant_ids
+    quarantined -= store.writing()
+
+    if dangling:
+        log.warning("reconcile: %d dangling doc_id(s) in qdrant not in tiler; deleting", len(dangling))
+
+    if quarantined:
+        log.warning("reconcile: %d doc_id(s) quarantined by the tiler; deleting their points", len(quarantined))
+
+    stale = dangling | quarantined
+    if not stale:
         return 0
 
-    log.warning("reconcile: %d dangling doc_id(s) in qdrant not in tiler; deleting", len(dangling))
+    await store.delete_by_docs(sorted(stale), collection=collection)
 
-    await store.delete_by_docs(sorted(dangling), collection=collection)
-
-    return len(dangling)
+    return len(stale)
 
 
 async def _clear_stale_pending(

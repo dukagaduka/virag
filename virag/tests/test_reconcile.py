@@ -37,6 +37,21 @@ def test_reconcile_deletes_dangling_points():
     assert "kept" not in store.deletes
 
 
+def test_reconcile_deletes_points_of_quarantined_docs():
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    store._doc_ids = {"kept", "quarantined", "reenrolling"}
+    tiler.docs = [
+        {"doc_id": "kept"},
+        {"doc_id": "quarantined", "quarantined": True},
+        {"doc_id": "reenrolling", "quarantined": True},
+    ]
+    store.in_flight = {"reenrolling"}                          # a re-enroll is lifting it
+
+    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
+
+    assert store.deletes == ["quarantined"]
+
+
 def test_reconcile_self_heals_complete_pending():
     store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
     tiler.pending_docs = [{

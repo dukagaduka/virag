@@ -120,7 +120,8 @@ backends), so scale horizontally with more containers behind a load balancer if 
   `ready: …` summary at startup (all backends + `render_version`), per-request `rag
   query` / `rag retrieved` / `rag injected` counts, `integrity:` warnings when a tile's
   hash doesn't match its Qdrant payload, and `reconcile:` lines when a pass deletes
-  dangling Qdrant points, clears stale-pending enrolls, or self-heals a doc.
+  dangling or quarantined docs' Qdrant points, clears stale-pending enrolls, or self-heals
+  a doc.
 
 ## Startup ordering & the retriever model
 
