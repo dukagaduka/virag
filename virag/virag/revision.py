@@ -14,10 +14,12 @@ the swap, and the job syncs exactly those docs after the swap:
   4. Stop the journal and wait (up to the pending TTL) for writers of the old collection.
   5. Sync the journaled docs into the new collection, enforce the invariant once more.
 
-A collection is bound to the render_version its tiles were embedded from (see
-virag/gate.py): a revision starts only while the tiler is serving, and aborts without a
+A collection is bound to the render_version its tiles were embedded from (collection
+metadata; every point carries it too, and chat refuses a tile the tiler now renders by
+another one): a revision starts only while the tiler is serving, and aborts without a
 swap if the tiler's render_version changed meanwhile. It is how virag follows a new
-tiler render (started by the gate) and how a new retriever model is rolled out.
+tiler render (by POST /revision, or at startup with VIRAG_REVISION_ON_RENDER_MISMATCH)
+and how a new retriever model is rolled out.
 
 A rollback repoints the alias to the retained collection, drops the abandoned one and
 syncs the docs enrolled since that collection was retired; it is refused when that
@@ -98,12 +100,35 @@ class RevisionManager:
                 status_code=409,
                 message=f"Previous collection {self.store.previous_name} was embedded from "
                         f"render_version {meta.get('render_version')} but the tiler renders "
-                        f"{render_version}; its tiles would fail the integrity check",
+                        f"{render_version}; chat would answer RENDER_VERSION_MISMATCH",
             )
 
         self._launch("rollback", self._rollback())
 
         return self.status
+
+
+    async def revise_if_stale(self, *, auto: bool) -> None:
+        """Startup check: a collection embedded from another render_version than the
+        tiler's answers chat with 409 RENDER_VERSION_MISMATCH until it is rebuilt. With
+        `auto` (VIRAG_REVISION_ON_RENDER_MISMATCH) the rebuild starts right here;
+        otherwise the mismatch is logged and left to POST /revision."""
+        render_version = await self._tiler_render_version()
+        embedded = (await self.store.get_collection_metadata()).get("render_version")
+
+        if embedded == render_version:
+            return
+
+        log.warning(
+            "render_version mismatch: the collection was embedded from %s but the tiler "
+            "renders %s; chat answers RENDER_VERSION_MISMATCH until it is rebuilt (%s)",
+            embedded,
+            render_version,
+            "starting the revision" if auto else "POST /revision",
+        )
+
+        if auto:
+            await self.start()
 
 
     async def close(self) -> None:

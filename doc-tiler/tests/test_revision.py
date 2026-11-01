@@ -117,6 +117,7 @@ async def test_unrenderable_doc_is_quarantined(tmp_path):
         assert again.status_code == 200
         assert (await client.get("/get_tile", params={"doc_id": bad_id, "tile_num": 0})).status_code == 200
         assert await svc.store.count_quarantined() == 0
+        assert (await client.get("/readyz")).json()["checks"]["quarantined"] == 0   # counted live
 
 
 async def test_quarantined_doc_is_not_retried_at_the_same_render_version(tmp_path):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import logging
@@ -13,6 +12,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from virag.errors import ApiError
 from virag.responses import OrjsonResponse
+from virag.utils import gather
 
 
 log = logging.getLogger(__name__)
@@ -89,15 +89,24 @@ async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | N
 
 
 async def _fetch_tiles(tiler, hits) -> list[tuple]:
-    """Regenerate each hit's tile as base64 JPEG, skipping any that fail to render."""
+    """Regenerate each hit's tile as base64 JPEG, skipping any that fail to render.
+
+    A tile the tiler now renders by another render_version than the one it was
+    embedded from fails the whole request (409 RENDER_VERSION_MISMATCH): the
+    collection is stale and must be rebuilt, not quietly answered without tiles.
+    """
     async def fetch(hit):
         doc_id = hit.payload.get("doc_id")
         tile_num = hit.payload.get("tile_num")
+        render_version = hit.payload.get("render_version") or None
 
         try:
-            data = await tiler.get_tile(doc_id, tile_num)
+            data = await tiler.get_tile(doc_id, tile_num, render_version=render_version)
 
         except ApiError as e:
+            if e.code == tiler.RENDER_VERSION_MISMATCH:
+                raise
+
             log.warning("skipping tile (doc_id=%s tile_num=%s): %s", doc_id, tile_num, e.message)
 
             return None
@@ -114,7 +123,8 @@ async def _fetch_tiles(tiler, hits) -> list[tuple]:
 
         return hit, base64.b64encode(data).decode()
 
-    results = await asyncio.gather(*(fetch(hit) for hit in hits))
+    # The first mismatch cancels the other fetches.
+    results = await gather(fetch(hit) for hit in hits)
 
     return [result for result in results if result is not None]
 

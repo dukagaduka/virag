@@ -109,9 +109,11 @@ picks up the docs still at another `render_version` (a forced job is not resumed
 ### `GET /get_tile?doc_id=&tile_num=&verify=` — regenerate one tile
 
 Deterministically regenerates a single tile from the stored original and returns
-`image/jpeg` with `X-Doc-Id` / `X-Tile-Num` / `X-Image-Hash` / `X-Tile-Height` /
-`X-Tile-Width` headers. `verify=true` recomputes the hash and compares against the value
-recorded at ingest. Every served doc was rendered by the current `render_version`, so a
+`image/jpeg` with `X-Doc-Id` / `X-Tile-Num` / `X-Image-Hash` / `X-Render-Version` /
+`X-Tile-Height` / `X-Tile-Width` headers; `X-Render-Version` names the `render_version`
+that rendered the tile, so a consumer can tell it apart from the one it embedded.
+`verify=true` recomputes the hash and compares against the value recorded at ingest.
+Every served doc was rendered by the current `render_version`, so a
 mismatch is non-determinism — a bug — and answers `409 RENDER_MISMATCH`. A quarantined
 doc answers `410 QUARANTINED`.
 

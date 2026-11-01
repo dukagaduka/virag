@@ -152,13 +152,12 @@ class ReconcileSettings(_Section):
 
 
 class RevisionSettings(_Section):
-    """The render_version gate: virag serves only while the collection was embedded from
-    the tiler's current render_version, and rebuilds it when they differ."""
+    """What virag does when it starts against a collection embedded from another
+    render_version than the tiler's."""
 
     model_config = SettingsConfigDict(env_prefix="VIRAG_")
 
-    revision_on_render_mismatch: bool = True    # off → stay not-ready until POST /revision
-    tiler_watch_interval_sec: int = Field(10, ge=1)
+    revision_on_render_mismatch: bool = False   # on → revise at startup; off → log, wait for POST /revision
 
 
 class Settings(_Section):

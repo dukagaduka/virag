@@ -59,14 +59,14 @@ def test_collection_secret_mismatch_is_fatal():
         asyncio.run(enforce_binding(store, tiler, expected))
 
 
-def test_render_version_drift_is_left_to_the_gate():
+def test_render_version_drift_is_not_fatal():
     expected = secret_hash("shared")
     store = FakeStore()
     store.metadata = {"secret_hash": expected, "render_version": "rv-OLD"}
     tiler = FakeTiler(info={"secret_hash": expected, "render_version": "rv-NEW"})
 
     rv = asyncio.run(enforce_binding(store, tiler, expected))
-    assert rv == "rv-NEW"        # not fatal: the serving gate rebuilds the collection
+    assert rv == "rv-NEW"        # not fatal: chat answers RENDER_VERSION_MISMATCH until a revision
     assert store.metadata["render_version"] == "rv-OLD"     # binding never rewrites it
 
 

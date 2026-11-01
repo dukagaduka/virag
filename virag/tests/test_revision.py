@@ -78,6 +78,39 @@ def test_revision_is_refused_while_the_tiler_is_not_serving():
     assert manager._task is None
 
 
+def test_startup_mismatch_is_only_logged_by_default(caplog):
+    store = FakeStore()
+    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    manager = _manager(store, FakeTiler())
+
+    asyncio.run(manager.revise_if_stale(auto=False))
+
+    assert manager._task is None
+    assert "render_version mismatch" in caplog.text
+
+
+def test_startup_mismatch_starts_the_revision_when_enabled():
+    store, tiler = FakeStore(), FakeTiler()
+    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    tiler.docs = [_doc("a", 1)]
+    manager = _manager(store, tiler)
+
+    status = _run_job(manager, lambda: manager.revise_if_stale(auto=True))
+
+    assert status["state"] == "succeeded"
+    assert store.metadata["render_version"] == "rv-test"
+
+
+def test_startup_without_mismatch_starts_nothing():
+    store = FakeStore()
+    store.metadata = {"secret_hash": "", "render_version": "rv-test"}
+    manager = _manager(store, FakeTiler())
+
+    asyncio.run(manager.revise_if_stale(auto=True))
+
+    assert manager._task is None
+
+
 def test_revision_aborts_when_the_tiler_render_version_changes_mid_build():
     store, tiler = FakeStore(), FakeTiler()
     tiler.docs = [_doc("a", 1)]

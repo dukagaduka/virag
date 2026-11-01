@@ -44,6 +44,11 @@ Put it at the top level of the request body. With an OpenAI SDK, pass it via
 A wrong type on any of these is a `422`. RAG on but no user text to build a query from
 is also a `422`.
 
+A retrieved tile that fails to regenerate (or hashes differently than enrolled) is
+skipped. A tile the tiler now renders by another `render_version` than the one it was
+embedded from fails the whole request with `409 RENDER_VERSION_MISMATCH`: the collection
+is stale and must be rebuilt with [`POST /revision`](#post-revision).
+
 ```bash
 # RAG on with defaults
 curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -135,10 +140,11 @@ curl -s -X POST localhost:8080/enroll \
 ## `POST /revision`
 
 Re-embed the **whole corpus** into a fresh vector collection and swap it in. Use it
-after a retriever-model change, with no downtime. After a tiler render change virag
-starts it on its own (see [Serving gate](#serving-gate)); call it yourself only with
-`VIRAG_REVISION_ON_RENDER_MISMATCH=false`, or after a failed automatic attempt. It is not
-periodic maintenance — with nothing changed it would recompute the same vectors.
+after a retriever-model change, with no downtime, and after a tiler render change: until
+then chat answers `409 RENDER_VERSION_MISMATCH`. With `VIRAG_REVISION_ON_RENDER_MISMATCH=true`
+virag starts it by itself when it starts against a collection embedded from another
+`render_version` than the tiler's (default `false`: the mismatch is only logged). It is
+not periodic maintenance — with nothing changed it would recompute the same vectors.
 
 virag serves through a stable Qdrant **alias**; `/revision` builds a new physical
 collection alongside the live one, re-embeds every *complete* tiler doc into it, then
@@ -186,25 +192,7 @@ one, and re-sync the documents enrolled since the swap. Background, like `/revis
 (`202`; `409` while a job runs or when there is no previous collection). Revert the
 retriever configuration first — the old collection holds the old model's vectors (a
 vector-size mismatch is refused). A collection embedded from another `render_version`
-than the tiler renders now is refused too: its tiles would fail the integrity check.
-
-## Serving gate
-
-virag serves only while its collection was embedded from the `render_version` the tiler
-renders now — otherwise every retrieved tile would fail the integrity check. The gate is
-evaluated at startup and every `VIRAG_TILER_WATCH_INTERVAL_SEC`:
-
-- the tiler is not serving (its own revision is pending or running) → wait;
-- the tiler serves another `render_version` than the collection's → with
-  `VIRAG_REVISION_ON_RENDER_MISMATCH=true` (default) virag starts `/revision` itself,
-  once per tiler `render_version`; otherwise it waits for `POST /revision`;
-- the tiler is bound to another `TILER_DB_SECRET` → closed;
-- both agree → serving.
-
-While closed, `/v1/chat/completions` and `/enroll` answer `503 NOT_READY` (the message
-names the reason; `details.revision` carries the job status) and `/ready` answers `503`
-with a `reason`. `/health`, `/revision` and the proxies stay up. An unreachable tiler
-leaves the gate as it was.
+than the tiler renders now is refused too: chat would answer `RENDER_VERSION_MISMATCH`.
 
 ---
 
@@ -229,7 +217,7 @@ An unreachable upstream returns `502`.
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Liveness — always `{"status":"ok"}`, touches nothing; the container `HEALTHCHECK`. |
-| `GET /ready` | Readiness — `200 {"status":"ready"}` once all backends are wired and the serving gate is open; `503 {"status":"not ready","missing":[…]}` or `503 {"status":"not ready","reason":"…"}` otherwise. |
+| `GET /ready` | Readiness — `200 {"status":"ready"}` once all backends are wired; `503 {"status":"not ready","missing":[…]}` otherwise. |
 
 ---
 
@@ -243,6 +231,7 @@ Every error uses one shape:
 
 | Status | `code` | Typical cause |
 |---|---|---|
+| `409` | `RENDER_VERSION_MISMATCH` | A retrieved tile is rendered by another `render_version` than it was embedded from — rebuild with `POST /revision`. |
 | `422` | `UNPROCESSABLE` | Bad request body/JSON, invalid `rag` field, RAG on with no query text, bad `metadata`. |
 | `502` | `UPSTREAM_FAILURE` | A backend (VLM, tiler, retriever, Qdrant) could not be reached. |
 | `503` | `NOT_READY` | Queried before startup finished wiring backends. |

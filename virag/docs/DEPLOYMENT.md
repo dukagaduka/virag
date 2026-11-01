@@ -114,8 +114,7 @@ backends), so scale horizontally with more containers behind a load balancer if 
 - **`GET /health`** — liveness; always `200`, touches nothing. The container
   `HEALTHCHECK` and the right liveness probe.
 - **`GET /ready`** — readiness; `503` with a `missing` list until every backend client
-  is wired, and `503` with a `reason` while the serving gate is closed; then `200`. The
-  right signal for a readiness probe / load-balancer gate.
+  is wired, then `200`. The right signal for a readiness probe / load-balancer gate.
 - **Logs** — structured lines to stdout at `LOG_LEVEL` (default `INFO`). virag has no
   metrics endpoint; operational visibility is the log stream. Notable lines: the
   `ready: …` summary at startup (all backends + `render_version`), per-request `rag
@@ -135,20 +134,20 @@ own build (pinned Chromium layer, geometry/secret guard) see
 ## Upgrading the tiler's renderer
 
 A new Chromium / Pillow / PyMuPDF pin, DPI, JPEG quality or PDF slicing changes the
-tiler's `render_version`. Redeploy the tiler; nothing needs to be done in virag:
+tiler's `render_version`. Stop virag, redeploy the tiler, then start virag:
 
-1. The tiler restarts not serving and re-renders its docs. virag's gate closes ("the
-   tiler is not serving"): chat and enroll answer `503`, `/ready` names the reason.
-2. The tiler serves again with the new `render_version`. The gate sees the collection
-   was embedded from the old one and starts `/revision` (with
-   `VIRAG_REVISION_ON_RENDER_MISMATCH=false`, call `POST /revision` yourself). Follow it
-   with `GET /revision`.
-3. The swap stamps the new `render_version` on the collection; on its next check the
-   gate opens and chat serves again.
+1. The tiler restarts not serving and re-renders its docs. virag cannot start against
+   it meanwhile — the tiler is as essential as the VLM; with `restart: unless-stopped`
+   it keeps retrying until the tiler is ready.
+2. virag starts, sees the collection was embedded from the old `render_version` and logs
+   it. Chat answers `409 RENDER_VERSION_MISMATCH` until the collection is rebuilt:
+   `POST /revision` (or set `VIRAG_REVISION_ON_RENDER_MISMATCH=true` to start it at
+   startup). Follow it with `GET /revision`.
+3. The swap stamps the new `render_version` on the collection; chat serves again.
 
-The downtime is the tiler's re-render plus virag's re-embed. If virag's rebuild fails,
-the gate stays closed (no automatic retry for that `render_version`): fix the cause and
-`POST /revision`. A rollback to the pre-upgrade collection is only accepted once the
-tiler is rolled back too (`render_version` must match). Changing the retriever model is
-a different case: there `POST /revision` runs with no downtime, the old collection
-serving until the swap.
+A virag left running across the tiler's redeploy behaves the same: chat answers
+`RENDER_VERSION_MISMATCH` once the tiler serves the new render, until `POST /revision`.
+The downtime is the tiler's re-render plus virag's re-embed. A rollback to the
+pre-upgrade collection is only accepted once the tiler is rolled back too
+(`render_version` must match). Changing the retriever model is a different case: there
+`POST /revision` runs with no downtime, the old collection serving until the swap.

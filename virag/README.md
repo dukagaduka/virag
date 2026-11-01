@@ -74,10 +74,9 @@ are spliced into a streaming response.
 
 ```
 virag/
-  main.py            app, lifespan (clients, fatal dependency checks, binding, gate, reconcile), router order
+  main.py            app, lifespan (clients, fatal dependency checks, binding, reconcile, render_version check), router order
   settings.py        Settings.from_env() — every env var and its validation
   binding.py         the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
-  gate.py            serving gate: serve only while the collection matches the tiler's render_version
   reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic) and /revision re-embed
   errors.py          ApiError + the uniform {"error": {...}} envelope
   api/               chat_completions, enroll, revision, proxy, ops

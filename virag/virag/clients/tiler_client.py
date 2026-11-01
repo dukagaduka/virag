@@ -56,6 +56,11 @@ class TileResult:
 
 
 class TilerService(HttpService):
+
+    # A tile rendered by another render_version than the one it was embedded from.
+    RENDER_VERSION_MISMATCH = "RENDER_VERSION_MISMATCH"
+
+
     def __init__(
         self,
         base_url: str,
@@ -78,6 +83,11 @@ class TilerService(HttpService):
     @property
     def get_tile_route(self):
         return f"{self.base_url}/get_tile"
+
+
+    @property
+    def readyz_route(self):
+        return f"{self.base_url}/readyz"
 
 
     @property
@@ -118,9 +128,8 @@ class TilerService(HttpService):
 
 
     async def check_connection(self) -> None:
-        # /info, not /readyz: a tiler revising its corpus is up but not ready, and virag
-        # waits for it behind its serving gate instead of refusing to start.
-        await self._request("GET", self.info_route, action="the check")
+        # /readyz: a tiler still revising its corpus is no tiler yet — virag refuses to start.
+        await self._request("GET", self.readyz_route, action="the check")
 
 
     async def tile(
@@ -197,12 +206,17 @@ class TilerService(HttpService):
         doc_id: str,
         tile_num: int,
         *,
+        render_version: str | None = None,
         verify: bool = True,
         bulk: bool = False,
     ) -> bytes:
         """Regenerate one tile. `bulk` calls (self-heal, revision) are capped by
         `max_concurrency`; interactive ones (chat RAG) bypass it, so a corpus rebuild
-        never starves a user's query of tiles."""
+        never starves a user's query of tiles.
+
+        `render_version` is the one the caller embedded the tile from: a tile the tiler
+        rendered by another one is refused with 409 RENDER_VERSION_MISMATCH.
+        """
         params = {
             "doc_id": doc_id,
             "tile_num": tile_num,
@@ -215,6 +229,24 @@ class TilerService(HttpService):
                 self.get_tile_route,
                 action=f"tile regeneration ({doc_id}, {tile_num})",
                 params=params,
+            )
+
+        rendered_by = response.headers.get("X-Render-Version")
+        if render_version is not None and rendered_by != render_version:
+            raise ApiError(
+                status_code=409,
+                code=self.RENDER_VERSION_MISMATCH,
+                message=(
+                    f"tile ({doc_id}, {tile_num}) was embedded from render_version "
+                    f"{render_version} but the tiler renders {rendered_by}; rebuild the "
+                    f"collection with POST /revision"
+                ),
+                details={
+                    "doc_id": doc_id,
+                    "tile_num": tile_num,
+                    "embedded_render_version": render_version,
+                    "tiler_render_version": rendered_by,
+                },
             )
 
         return response.content

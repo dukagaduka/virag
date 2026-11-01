@@ -37,7 +37,7 @@ async def enforce_binding(
 
     Fatal (BindingError) on any secret mismatch. A fresh (unbound) collection is
     bound to the secret + tiler render_version on first run; a render_version that
-    differs later is the serving gate's to resolve (virag/gate.py). Returns the tiler
+    differs later is not fatal (RevisionManager.revise_if_stale). Returns the tiler
     render_version.
     """
     info = await tiler.get_info()

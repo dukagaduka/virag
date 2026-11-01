@@ -280,6 +280,20 @@ def test_tiler_doc_exists_statuses():
     assert _run(tiler.doc_exists("b")) is False
 
 
+def test_tiler_tile_is_checked_against_its_embedded_render_version():
+    tiler = TilerService("http://tiler", max_retries=0, **_HTTP)
+    _mock(tiler, lambda req, n: httpx2.Response(200, content=b"jpeg", headers={"X-Render-Version": "rv-new"}))
+
+    assert _run(tiler.get_tile("a", 0, render_version="rv-new")) == b"jpeg"
+    assert _run(tiler.get_tile("a", 0)) == b"jpeg"                     # nothing to check against
+
+    with pytest.raises(ApiError) as exc:
+        _run(tiler.get_tile("a", 0, render_version="rv-old"))
+
+    assert (exc.value.status_code, exc.value.code) == (409, "RENDER_VERSION_MISMATCH")
+    assert exc.value.details["tiler_render_version"] == "rv-new"
+
+
 def test_tiler_stream_is_never_replayed():
     tiler = TilerService("http://tiler", max_retries=3, **_HTTP)
     seen = _mock(tiler, lambda req, n: httpx2.Response(503, text="busy"))

@@ -180,12 +180,13 @@ paths:
         '200':
           description: The tile as JPEG.
           headers:
-            X-Doc-Id:      { schema: { type: string } }
-            X-Tile-Num:    { schema: { type: integer } }
-            X-Image-Hash:  { schema: { type: string } }
-            X-Tile-Height: { schema: { type: integer }, description: Actual tile height in px. }
-            X-Tile-Width:  { schema: { type: integer }, description: Always TILE_WIDTH (875). }
-            Cache-Control: { schema: { type: string }, description: Immutable; tiles are content-addressed. }
+            X-Doc-Id:         { schema: { type: string } }
+            X-Tile-Num:       { schema: { type: integer } }
+            X-Image-Hash:     { schema: { type: string } }
+            X-Render-Version: { schema: { type: string }, description: The render_version that rendered the tile. }
+            X-Tile-Height:    { schema: { type: integer }, description: Actual tile height in px. }
+            X-Tile-Width:     { schema: { type: integer }, description: Always TILE_WIDTH (875). }
+            Cache-Control:    { schema: { type: string }, description: Immutable; tiles are content-addressed. }
           content:
             image/jpeg:
               schema: { type: string, format: binary }

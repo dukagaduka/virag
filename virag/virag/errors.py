@@ -31,12 +31,13 @@ class ApiError(Exception):
         status_code: int,
         message: str,
         details: dict[str, Any] | None = None,
+        code: str | None = None,
     ) -> None:
 
         super().__init__(message)
 
         self.status_code = status_code
-        self.code = self.STATUS_CODES[status_code]
+        self.code = code or self.STATUS_CODES[status_code]
         self.message = message
         self.details = details
 

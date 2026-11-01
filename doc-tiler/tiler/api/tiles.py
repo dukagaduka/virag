@@ -26,7 +26,7 @@ async def get_tile(
 ) -> Response:
     """Regenerate a single tile from the stored original and return it as JPEG."""
     svc = service(request)
-    jpeg, tile_row = await svc.get_tile(doc_id, tile_num, verify)
+    jpeg, tile_row, row = await svc.get_tile(doc_id, tile_num, verify)
 
     return Response(
         content=jpeg,
@@ -35,6 +35,7 @@ async def get_tile(
             "X-Doc-Id": doc_id,
             "X-Tile-Num": str(tile_num),
             "X-Image-Hash": tile_row.image_hash,
+            "X-Render-Version": row.render_version,
             "X-Tile-Height": str(tile_row.height),
             "X-Tile-Width": str(svc.settings.tile_width),
             "Cache-Control": "public, max-age=31536000, immutable",

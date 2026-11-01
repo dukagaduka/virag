@@ -644,7 +644,7 @@ class TilerService:
         }
 
         for tile in await self.store.get_tiles(row.doc_id):
-            jpeg, _ = await self.get_tile(row.doc_id, tile.tile_num, verify=True)
+            jpeg, _, _ = await self.get_tile(row.doc_id, tile.tile_num, verify=True)
             yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, jpeg)}
 
         yield {
@@ -770,7 +770,7 @@ class TilerService:
             jpeg = None
 
             if include_bytes:
-                jpeg, _ = await self.get_tile(row.doc_id, t.tile_num, verify=True)
+                jpeg, _, _ = await self.get_tile(row.doc_id, t.tile_num, verify=True)
 
             out.append(self._tile_meta(t.tile_num, t.height, t.image_hash, jpeg))
 
@@ -789,7 +789,7 @@ class TilerService:
     # ------------------------------------------------------------------ #
     # regeneration
     # ------------------------------------------------------------------ #
-    async def get_tile(self, doc_id: str, tile_num: int, verify: bool) -> tuple[bytes, TileRow]:
+    async def get_tile(self, doc_id: str, tile_num: int, verify: bool) -> tuple[bytes, TileRow, DocRow]:
         """Return a single tile's bytes, regenerating and caching it on demand."""
         row = await self.store.get_doc(doc_id)
 
@@ -844,7 +844,7 @@ class TilerService:
 
                 raise conflict(message, "RENDER_MISMATCH", doc_id=doc_id, tile_num=tile_num)
 
-        return jpeg, tile_row
+        return jpeg, tile_row, row
 
 
     async def _regenerate(self, row: DocRow, tile_num: int) -> bytes:
@@ -1000,7 +1000,10 @@ class TilerService:
         if not self.revision.serving:
             ok = False
 
-        checks["quarantined"] = self.revision.status.get("quarantined_total", 0)
+        # Counted live: a re-ingest lifts a quarantine without any revision running.
+        quarantined = await self.store.count_quarantined()
+        metrics.QUARANTINED.set(quarantined)
+        checks["quarantined"] = quarantined
 
         return ok, checks
 

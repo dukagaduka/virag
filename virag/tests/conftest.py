@@ -21,8 +21,8 @@ from virag.api import chat_completions as chat_api
 from virag.api import enroll as enroll_api
 from virag.api import ops as ops_api
 from virag.api import proxy as proxy_api
-from virag.clients.tiler_client import Tile, TileResult
-from virag.errors import install_error_handlers
+from virag.clients.tiler_client import Tile, TileResult, TilerService
+from virag.errors import ApiError, install_error_handlers
 from virag.settings import (
     RetrieverSettings,
     EnrollSettings,
@@ -169,6 +169,8 @@ class FakeStore:
 
 class FakeTiler:
 
+    RENDER_VERSION_MISMATCH = TilerService.RENDER_VERSION_MISMATCH
+
     def __init__(self, result: TileResult | None = None, info: dict | None = None):
         self._result = result
         self._info = info or {"secret_hash": "", "render_version": "rv-test"}
@@ -203,10 +205,12 @@ class FakeTiler:
                "source_url": res.source_url, "render_version": res.render_version,
                "page_height": 0, "tile_count": res.tile_count}
 
-    async def get_tile(self, doc_id, tile_num, *, bulk=False) -> bytes:
+    async def get_tile(self, doc_id, tile_num, *, render_version=None, bulk=False) -> bytes:
         self.get_tile_calls.append((doc_id, tile_num))
         if (doc_id, tile_num) in self.fail_tiles:
             raise RuntimeError(f"tile {doc_id}:{tile_num} unavailable")
+        if render_version is not None and render_version != self._info["render_version"]:
+            raise ApiError(status_code=409, message="render_version mismatch", code=self.RENDER_VERSION_MISMATCH)
         return tile_bytes(doc_id, tile_num)
 
     async def get_info(self) -> dict:

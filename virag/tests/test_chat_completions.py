@@ -78,6 +78,23 @@ def test_rag_integrity_mismatch_skips_tile(make_client):
     assert r.json()["sources"] == []
 
 
+def test_rag_render_version_mismatch_fails_the_request(make_client):
+    # embedded from rv-old, while the tiler now renders rv-test
+    stale = hit_for("doc-a", 0)
+    stale.payload["render_version"] = "rv-old"
+    vlm = FakeVLM()
+    client = make_client(vlm=vlm, store=FakeStore(hits=[hit_for("doc-a", 1), stale]),
+                         retriever=FakeRetriever(), tiler=FakeTiler())
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "q"}], "rag": {},
+    })
+
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "RENDER_VERSION_MISMATCH"
+    assert vlm.complete_bodies == []                                    # never answered without tiles
+
+
 def test_rag_without_query_text_is_422(make_client):
     client = make_client(vlm=FakeVLM(), store=_rag_store(), retriever=FakeRetriever(), tiler=FakeTiler())
 

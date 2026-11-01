@@ -25,7 +25,6 @@ import time
 from collections.abc import Iterable, Iterator
 from contextlib import AsyncExitStack
 from itertools import islice
-from typing import TYPE_CHECKING
 
 from virag.api.enroll import point_id
 from virag.clients.retriever_client import RetrieverClient
@@ -33,9 +32,6 @@ from virag.clients.qdrant_store import QdrantStore
 from virag.clients.tiler_client import TilerService
 from virag.settings import EnrollSettings, ReconcileSettings
 from virag.utils import gather
-
-if TYPE_CHECKING:
-    from virag.gate import ServingGate
 
 
 log = logging.getLogger("virag.reconcile")
@@ -339,20 +335,13 @@ async def run_periodic(
     retriever: RetrieverClient,
     settings: ReconcileSettings,
     enroll_settings: EnrollSettings,
-    gate: ServingGate,
 ) -> None:
-    """Loop reconcile on the configured interval until cancelled (interval 0 = disabled).
-    A pass is skipped while the serving gate is closed: the tiler is revising, or the
-    collection is being rebuilt for its render_version."""
+    """Loop reconcile on the configured interval until cancelled (interval 0 = disabled)."""
     if settings.interval_sec <= 0:
         return
 
     while True:
         await asyncio.sleep(settings.interval_sec)
-
-        if not gate.serving:
-            log.info("periodic reconcile skipped: not serving (%s)", gate.reason)
-            continue
 
         try:
             await reconcile(store, tiler, retriever, settings, enroll_settings)
