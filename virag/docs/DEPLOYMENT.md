@@ -1,9 +1,9 @@
 # Deployment
 
 virag is a small stateless gateway; the interesting part of deploying it is the
-**backends it needs**: doc-tiler, Qdrant, a retriever server, and an upstream VLM.
+**backends it needs**: doc-tiler, Qdrant, Valkey, a retriever server, and an upstream VLM.
 Deployment is split into two independent Compose stacks under [`deploy/`](../deploy/):
-[`service/`](../deploy/service/) (virag, doc-tiler, Qdrant) and
+[`service/`](../deploy/service/) (virag, doc-tiler, Qdrant, Valkey) and
 [`retriever/`](../deploy/retriever/) (the vLLM retriever server). The VLM is external
 (you point `VLM_BASE_URL` at it).
 
@@ -18,7 +18,7 @@ cp .env.example .env                                   # image, port, model/adap
 cp serve_retriever.example.sh serve_retriever.sh     # tune for your hardware
 docker compose up -d
 
-# 2. virag + tiler + Qdrant
+# 2. virag + tiler + Qdrant + Valkey
 cd ../service
 cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE,
                          # RETRIEVER_BASE_URL, paths
@@ -26,7 +26,7 @@ docker compose up --build
 curl -s localhost:${VIRAG_DEPLOY_PORT:-48000}/ready | jq
 ```
 
-The `service/` stack (`deploy/service/docker-compose.yaml`) is three services on one bridge
+The `service/` stack (`deploy/service/docker-compose.yaml`) is four services on one bridge
 network. The retriever server (`retriever-vllm-virag`, GPU, runs `serve_retriever.sh`) is a
 separate stack in `deploy/retriever/` that virag reaches over `RETRIEVER_BASE_URL`:
 
@@ -35,6 +35,7 @@ separate stack in `deploy/retriever/` that virag reaches over `RETRIEVER_BASE_UR
 | `virag` | the gateway | built from this repo; waits for its backends to be healthy. |
 | `tiler-virag` | doc-tiler | built from `../../doc-tiler`; mounts `tiler_metadata_schema.yaml` (see below). |
 | `qdrant-virag` | Qdrant | vector store. |
+| `valkey-virag` | Valkey 9 | coordination of virag processes (leases, writers, the revision job, the reconcile lead); AOF on, no port published. |
 
 ### Connecting virag to the retriever stack
 
@@ -49,7 +50,7 @@ In `deploy/service/.env` also set `RETRIEVER_MODEL_NAME` and `RETRIEVER_API_KEY`
 of `SERVED_MODEL_NAME` and `API_KEY` in `serve_retriever.sh`; virag checks at startup that
 the server advertises that model and refuses to boot otherwise.
 
-`virag` `depends_on` the tiler and Qdrant only; the retriever server is outside the stack,
+`virag` `depends_on` the tiler, Qdrant and Valkey only; the retriever server is outside the stack,
 so virag has `restart: unless-stopped` and retries until its dependency checks (including
 the retriever endpoint) pass — this also covers the long vLLM model load.
 
@@ -60,9 +61,9 @@ Variables live in three places:
 - **Application settings** read by virag at startup — `VIRAG_*` (including the reconcile
   knobs `VIRAG_SELF_HEAL` / `VIRAG_RECONCILE_INTERVAL_SEC` / `VIRAG_PENDING_TTL_SEC`),
   `QDRANT_*` (including the upsert-batching `QDRANT_CHUNK_SIZE` / `QDRANT_MAX_BATCH_CHUNKS`),
-  `RETRIEVER_*`, `TILER_*`, `VLM_*`, `TILER_DB_SECRET`. See
+  `VALKEY_*`, `RETRIEVER_*`, `TILER_*`, `VLM_*`, `TILER_DB_SECRET`. See
   [CONFIG.md](CONFIG.md). Required: `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`,
-  `VLM_MODEL_NAME`.
+  `VLM_MODEL_NAME`, `VALKEY_URL`.
 - **Compose/orchestration variables** — the `*_DEPLOY_*` image tags, host bind
   addresses/ports, and volume paths. Read by Compose, not by `Settings.from_env()`.
   `deploy/service/.env` (from [`.env.example`](../deploy/service/.env.example)) holds the
@@ -97,8 +98,12 @@ Single-stage `Dockerfile` on `python:3.11-slim`:
 - Dependencies extracted from `pyproject.toml` with stdlib `tomllib`, so the pip layer
   caches on `pyproject.toml` alone.
 - Runs as an unprivileged user (uid/gid **10001**); nothing runs as root.
-- Listens on `:8080` (`uvicorn --host 0.0.0.0 --port 8080 --workers 1`); the Compose
-  port mapping exposes it on `VIRAG_DEPLOY_PORT`.
+- Listens on `:8080` (`uvicorn --host 0.0.0.0 --port 8080 --workers 1
+  --timeout-graceful-shutdown 20`); the Compose port mapping exposes it on
+  `VIRAG_DEPLOY_PORT`. The graceful timeout stays under the service's
+  `stop_grace_period: 30s`, so `docker stop` always reaches the shutdown that hands back
+  the lease, the revision job and the reconcile lead — instead of a SIGKILL leaving them
+  to expire.
 - `HEALTHCHECK` curls `/health` — not `/ready`, which stays `503` for as long as a
   rebuild after a tiler render change takes.
 
@@ -106,8 +111,21 @@ Single-stage `Dockerfile` on `python:3.11-slim`:
 docker build -t virag:0.1.0 .
 ```
 
-Run **one** uvicorn worker per container. virag is stateless (all state is in the
-backends), so scale horizontally with more containers behind a load balancer if needed.
+## Scaling
+
+virag is stateless — everything it shares lives in the backends: the collections in
+Qdrant, the coordination in Valkey (ARCHITECTURE.md §10). Processes are interchangeable,
+so scale either way, or both:
+
+- **uvicorn workers** (`--workers N`) — N processes on one port, the kernel spreading
+  connections among them; the uvicorn parent replaces a worker that dies.
+- **replicas** — more containers behind one endpoint. Compose cannot publish one host
+  port for several replicas, so put a balancer (nginx, traefik) in front; in Kubernetes a
+  `Service` does it.
+
+Any process takes any request: a `POST /revision` runs where it lands, `GET /revision`
+answers the same everywhere, one process at a time leads reconcile. The per-process
+caps (`*_MAX_CONCURRENCY`) multiply with the process count — size them accordingly.
 
 ## Health & observability
 
@@ -117,7 +135,10 @@ backends), so scale horizontally with more containers behind a load balancer if 
   is wired, then `200`. The right signal for a readiness probe / load-balancer gate.
 - **Logs** — structured lines to stdout at `LOG_LEVEL` (default `INFO`). virag has no
   metrics endpoint; operational visibility is the log stream. Notable lines: the
-  `ready: …` summary at startup (all backends + `render_version`), per-request `rag
+  `ready: …` summary at startup (all backends + `render_version`), `lease: <token>
+  (<host>/<pid>)` naming the process in Valkey, `taking over from dead process` when a
+  revision job or the reconcile lead moves, `lease: … expired` (critical) when a process
+  stops itself, per-request `rag
   query` / `rag retrieved` / `rag injected` counts, `integrity:` warnings when a tile's
   hash doesn't match its Qdrant payload, and `reconcile:` lines when a pass deletes
   dangling or quarantined docs' Qdrant points, clears stale-pending enrolls, or self-heals
@@ -128,7 +149,7 @@ backends), so scale horizontally with more containers behind a load balancer if 
 The vLLM retriever server can take minutes to load a model; the tiler build (Chromium)
 can be slow too. Because `virag` retries until its fatal dependency checks pass, bring
 the stack up together and let it settle — `/ready` flips to `200` once the retriever, the
-tiler and the VLM all answer and the tiler↔Qdrant binding is satisfied. For the tiler's
+tiler, the VLM and Valkey all answer and the tiler↔Qdrant binding is satisfied. For the tiler's
 own build (pinned Chromium layer, geometry/secret guard) see
 [`../../doc-tiler/docs/DEPLOYMENT.md`](../../doc-tiler/docs/DEPLOYMENT.md).
 

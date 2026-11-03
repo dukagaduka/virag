@@ -78,7 +78,7 @@ Notes:
 
 - Runs as uid/gid **10001**; nothing runs as root (`Dockerfile`).
 - Stateless — no volumes to get ownership wrong; all persistent state is in the
-  backends.
+  backends (Qdrant, and the coordination state in Valkey).
 - All unexpected exceptions are caught and rendered as a generic `500` envelope, so an
   internal error never leaks a stack trace to the caller.
 
@@ -93,3 +93,7 @@ Notes:
       client authentication.
 - [ ] Backends (tiler, Qdrant, retriever) not separately exposed if the proxy routes
       are meant to be the only path to them.
+- [ ] Valkey reachable by virag only (the Compose service publishes no port). Whoever
+      writes to it can take the revision job or stop a process by deleting its lease. A
+      password in `VALKEY_URL` (`redis://:<password>@host:6379/0`) is a secret like the
+      API keys.

@@ -1,9 +1,9 @@
 # Configuration
 
 All application configuration is read from environment variables at startup by
-`Settings.from_env()` (`virag/settings.py`). Three variables are **required** and abort
-startup if unset — `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME`; everything
-else has a default. A ready-to-edit template — including the Compose/deployment
+`Settings.from_env()` (`virag/settings.py`). Four variables are **required** and abort
+startup if unset — `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME`, `VALKEY_URL`;
+everything else has a default. A ready-to-edit template — including the Compose/deployment
 variables — lives at [`deploy/service/.env.example`](../deploy/service/.env.example) and
 [`deploy/retriever/.env.example`](../deploy/retriever/.env.example).
 
@@ -17,7 +17,8 @@ runtime error.
 
 The Qdrant image is pinned (`QDRANT_DEPLOY_IMAGE=qdrant/qdrant:v1.20.0`) together with
 `qdrant-client` in `pyproject.toml`: the client refuses a server more than one minor
-version apart, so bump both at once.
+version apart, so bump both at once. Valkey must be 9.0+ (`SET IFEQ`, `DELIFEQ`); virag
+checks the version at startup.
 
 ---
 
@@ -67,6 +68,23 @@ Chat answers `409 RENDER_VERSION_MISMATCH` for a tile the tiler renders by anoth
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `VIRAG_REVISION_ON_RENDER_MISMATCH` | no | `false` | At startup, when the collection was embedded from another `render_version` than the tiler's, start `/revision` right away. `false` → log a warning and wait for `POST /revision`. |
+
+## Coordination (Valkey)
+
+Any number of virag processes — replicas, uvicorn workers — share one Valkey for their
+leases, the writers registry, the revision job and the reconcile lead. See
+[ARCHITECTURE.md](ARCHITECTURE.md) §10.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `VALKEY_URL` | **yes** | — | `redis://[:password@]host:port/db`. A password here is a secret. |
+| `VALKEY_PREFIX` | no | `virag` | Prefix of every key. Deployments sharing one Valkey need distinct prefixes (or databases). |
+| `VALKEY_TIMEOUT_SEC` | no | `2` | Connect and per-command deadline (> 0); past it the call is a `503`. |
+| `VALKEY_MAX_CONNECTIONS` | no | `64` | Connection pool size (≥ 1). |
+| `VIRAG_PROCESS_TTL_SEC` | no | `30` | Lease TTL (≥ 3), renewed every third of it. A process silent this long counts as dead: its revision job, reconcile lead and writers are taken over or ignored. Lower = faster takeover, less tolerance for a stalled event loop or a Valkey blip. |
+
+The bulk concurrency caps (`RETRIEVER_MAX_CONCURRENCY`, `TILER_MAX_CONCURRENCY`) and
+`VLM_MAX_CONCURRENCY` are per process: N processes allow N times as much.
 
 ## Qdrant
 

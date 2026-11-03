@@ -9,12 +9,13 @@ from virag.settings import Settings, SettingsError, _DEFAULT_FRAMING_TEXT
 
 
 def _base_env(monkeypatch):
-    """The minimum env for a valid Settings: the two required vars."""
+    """The minimum env for a valid Settings: the required vars."""
     for key in list(_ALL_KEYS):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("QDRANT_VECTOR_SIZE", "768")
     monkeypatch.setenv("VLM_BASE_URL", "http://vlm/v1")
     monkeypatch.setenv("VLM_MODEL_NAME", "my-vlm")
+    monkeypatch.setenv("VALKEY_URL", "redis://valkey:6379/0")
 
 
 _ALL_KEYS = {
@@ -30,6 +31,7 @@ _ALL_KEYS = {
     "RETRIEVER_CONNECT_TIMEOUT_SEC", "RETRIEVER_MAX_CONNECTIONS", "RETRIEVER_MAX_RETRIES",
     "TILER_CONNECT_TIMEOUT_SEC", "TILER_MAX_CONNECTIONS", "TILER_MAX_RETRIES", "TILER_MAX_CONCURRENCY",
     "HTTP_RETRY_BACKOFF_BASE_SEC", "HTTP_RETRY_BACKOFF_CAP_SEC",
+    "VALKEY_URL", "VALKEY_PREFIX", "VALKEY_TIMEOUT_SEC", "VALKEY_MAX_CONNECTIONS", "VIRAG_PROCESS_TTL_SEC",
 }
 
 
@@ -49,7 +51,7 @@ def test_defaults(monkeypatch):
     assert s.vlm_settings.model_name == "my-vlm"
 
 
-@pytest.mark.parametrize("missing", ["QDRANT_VECTOR_SIZE", "VLM_BASE_URL", "VLM_MODEL_NAME"])
+@pytest.mark.parametrize("missing", ["QDRANT_VECTOR_SIZE", "VLM_BASE_URL", "VLM_MODEL_NAME", "VALKEY_URL"])
 def test_required_vars(monkeypatch, missing):
     _base_env(monkeypatch)
     monkeypatch.delenv(missing, raising=False)
@@ -206,4 +208,21 @@ def test_aliased_var_is_named_in_errors(monkeypatch):
     monkeypatch.setenv("VIRAG_RECONCILE_INTERVAL_SEC", "-1")
 
     with pytest.raises(SettingsError, match=r"^`VIRAG_RECONCILE_INTERVAL_SEC`"):
+        Settings.from_env()
+
+
+def test_valkey_and_coordination_defaults(monkeypatch):
+    _base_env(monkeypatch)
+    s = Settings.from_env()
+
+    assert s.valkey_settings.url == "redis://valkey:6379/0"
+    assert s.valkey_settings.prefix == "virag"
+    assert s.coordination_settings.process_ttl_sec == 30
+
+
+def test_process_ttl_has_a_floor(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("VIRAG_PROCESS_TTL_SEC", "1")
+
+    with pytest.raises(SettingsError, match="VIRAG_PROCESS_TTL_SEC"):
         Settings.from_env()

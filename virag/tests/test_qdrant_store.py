@@ -1,9 +1,11 @@
-"""QdrantStore gRPC transport: retry policy shape and unavailable → 503 mapping."""
+"""QdrantStore: gRPC transport (retry policy shape, unavailable → 503) and the alias
+resolved from Qdrant rather than cached."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -82,3 +84,49 @@ def test_other_grpc_errors_pass_through(monkeypatch):
 
     with pytest.raises(grpc.RpcError):
         asyncio.run(store.delete_by_doc("doc"))
+
+
+def _aliases(store, mapping: dict):
+    """Stub get_aliases with the alias → collection `mapping` (mutable, read per call)."""
+    async def get_aliases():
+        return SimpleNamespace(aliases=[
+            SimpleNamespace(alias_name=alias, collection_name=collection) for alias, collection in mapping.items()
+        ])
+
+    store.qdrant.get_aliases = get_aliases
+
+
+def test_resolve_reads_the_alias_each_time():
+    store = _store()
+    mapping = {"c": "c__v1"}
+    _aliases(store, mapping)
+
+    async def get_collections():
+        return SimpleNamespace(collections=[SimpleNamespace(name=n) for n in ("c__v1", "c__v2", "other")])
+
+    store.qdrant.get_collections = get_collections
+
+    async def go():
+        before = await store.resolve()
+        mapping["c"] = "c__v2"                                          # another process swapped it
+        return before, await store.resolve()
+
+    assert asyncio.run(go()) == (("c__v1", None), ("c__v2", "c__v1"))
+
+
+def test_first_start_race_adopts_the_collection_another_process_created():
+    store = _store()
+    mapping: dict = {}
+    _aliases(store, mapping)
+
+    async def collection_exists(name):
+        return False
+
+    async def create_collection(**kwargs):
+        mapping["c"] = "c__v1"                                          # the other process won
+        raise _RpcError(grpc.StatusCode.ALREADY_EXISTS)
+
+    store.qdrant.collection_exists = collection_exists
+    store.qdrant.create_collection = create_collection
+
+    assert asyncio.run(store._resolve_or_create()) == "c__v1"

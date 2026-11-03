@@ -1,13 +1,15 @@
-"""Shared fixtures: in-memory fakes for the four backends and a lifespan-free app.
+"""Shared fixtures: in-memory fakes for the backends and a lifespan-free app.
 
 The real `lifespan` builds network clients and runs dependency + binding checks, so
 the tests build the app directly and populate `app.state` with fakes instead. Each
 handler only ever reaches its backends through `request.app.state`, so this exercises
-the real routing, RAG pipeline and error handling with no network."""
+the real routing, RAG pipeline and error handling with no network. The Coordinator is
+the real one, over an in-memory Valkey."""
 
 from __future__ import annotations
 
 import hashlib
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +24,7 @@ from virag.api import enroll as enroll_api
 from virag.api import ops as ops_api
 from virag.api import proxy as proxy_api
 from virag.clients.tiler_client import Tile, TileResult, TilerService
+from virag.coordination import Coordinator
 from virag.errors import ApiError, install_error_handlers
 from virag.settings import (
     RetrieverSettings,
@@ -32,6 +35,7 @@ from virag.settings import (
     ReconcileSettings,
     Settings,
     TilerSettings,
+    ValkeySettings,
     VLMSettings,
 )
 
@@ -81,14 +85,11 @@ class FakeStore:
         self._doc_ids: set[str] = set()
         self.deletes: list[str] = []
         self.delete_collections: list[str | None] = []
-        self.physical_name = "c__v1"
+        self.physical_name = "c__v1"                          # where the fake alias points
         self.previous_name: str | None = None
         self.dropped: list[str] = []
-        self.writers: list[str] = []
-        self.in_flight: set[str] = set()                     # writers still writing
-        self._journal: set[str] | None = None
-        self.journal_seen: set[str] | None = None
         self.rollback_retired_at = 0
+        self.on_build = None                                  # async hook, runs as a revision builds
 
     async def query(self, vector, top_n):
         return self._hits[:top_n]
@@ -99,9 +100,17 @@ class FakeStore:
     async def create_collection(self):
         pass
 
-    async def create_revision_collection(self) -> str:
-        self.revision_collection = "c__v2"
-        self.collection_metadata["c__v2"] = dict(self.metadata or {})     # binding carried
+    async def serving_physical(self) -> str:
+        return self.physical_name
+
+    async def resolve(self):
+        return self.physical_name, self.previous_name
+
+    async def create_revision_collection(self, physical: str) -> str:
+        self.revision_collection = f"c__v{int(physical.rsplit('__v', 1)[1]) + 1}"
+        self.collection_metadata[self.revision_collection] = dict(self.metadata or {})  # binding carried
+        if self.on_build is not None:
+            await self.on_build()
         return self.revision_collection
 
     async def drop_collection(self, name: str) -> None:
@@ -113,40 +122,16 @@ class FakeStore:
         self.metadata = self.collection_metadata.pop(physical, {})
         self.physical_name = physical
 
-    async def swap_alias(self, new_physical: str) -> None:
+    async def swap_alias(self, new_physical: str, old_physical: str, stale_previous) -> None:
+        assert old_physical == self.physical_name
         self.swapped_to = new_physical
         self.previous_name = self.physical_name
         self._serve(new_physical)
 
-    async def rollback(self):
-        restored, abandoned = self.previous_name, self.physical_name
+    async def rollback_alias(self, restored: str) -> int:
         self._serve(restored)
         self.previous_name = None
-        return restored, abandoned, self.rollback_retired_at
-
-    @asynccontextmanager
-    async def writer(self, doc_id: str):
-        self.writers.append(doc_id)
-        self.in_flight.add(doc_id)
-        if self._journal is not None:
-            self._journal.add(doc_id)
-        try:
-            yield
-        finally:
-            self.in_flight.discard(doc_id)
-
-    def writing(self) -> set[str]:
-        return set(self.in_flight)
-
-    def start_journal(self) -> None:
-        self._journal = set(self.journal_seen or ())
-
-    def stop_journal(self) -> set[str]:
-        journal, self._journal = self._journal or set(), None
-        return journal
-
-    async def drain(self, physical: str, timeout: float) -> bool:
-        return True
+        return self.rollback_retired_at
 
     async def get_collection_metadata(self, *, collection=None) -> dict:
         if collection not in (None, self.physical_name):
@@ -173,6 +158,129 @@ class FakeStore:
 
     async def close(self):
         pass
+
+
+class FakeValkey:
+    """In-memory ValkeyStore: the same primitives with the same semantics (TTL by the
+    clock, NX / XX / IFEQ, DELIFEQ), so the real Coordinator runs on it. `down` makes
+    every call fail as an unreachable Valkey does."""
+
+    def __init__(self):
+        self.values: dict[str, tuple[Any, float | None]] = {}  # name -> (value, expires_at)
+        self.hashes: dict[str, dict[str, Any]] = {}
+        self.sets: dict[str, set[str]] = {}
+        self.down = False
+
+    def _check(self) -> None:
+        if self.down:
+            raise ApiError(status_code=503, message="Valkey is unavailable")
+
+    def _value(self, name: str):
+        value, expires_at = self.values.get(name, (None, None))
+        if expires_at is not None and time.monotonic() >= expires_at:
+            del self.values[name]
+            return None
+        return value
+
+    def expire(self, name: str) -> None:
+        """Test helper: the key runs out now (a lease nobody renewed)."""
+        self.values.pop(name, None)
+
+    async def check_connection(self) -> None:
+        self._check()
+
+    async def get(self, name):
+        self._check()
+        return self._value(name)
+
+    async def get_json(self, name):
+        self._check()
+        return self._value(name)
+
+    async def set_json(self, name, value) -> None:
+        self._check()
+        self.values[name] = (value, None)
+
+    async def set_nx(self, name, value) -> bool:
+        self._check()
+        if self._value(name) is not None:
+            return False
+        self.values[name] = (value, None)
+        return True
+
+    async def set_ifeq(self, name, value, expected) -> bool:
+        self._check()
+        if self._value(name) != expected:
+            return False
+        self.values[name] = (value, None)
+        return True
+
+    async def set_ttl(self, name, value, ttl_sec, *, nx=False, xx=False) -> bool:
+        self._check()
+        exists = self._value(name) is not None
+        if (nx and exists) or (xx and not exists):
+            return False
+        self.values[name] = (value, time.monotonic() + ttl_sec)
+        return True
+
+    async def exists(self, name) -> bool:
+        self._check()
+        return self._value(name) is not None or bool(self.hashes.get(name)) or bool(self.sets.get(name))
+
+    async def exists_each(self, names) -> list[bool]:
+        return [await self.exists(name) for name in names]
+
+    async def delete(self, *names) -> None:
+        self._check()
+        for name in names:
+            self.values.pop(name, None)
+            self.hashes.pop(name, None)
+            self.sets.pop(name, None)
+
+    async def delete_ifeq(self, name, expected) -> bool:
+        self._check()
+        if self._value(name) != expected:
+            return False
+        del self.values[name]
+        return True
+
+    async def hset_json(self, name, fields) -> None:
+        self._check()
+        self.hashes.setdefault(name, {}).update({k: dict(v) for k, v in fields.items()})
+
+    async def hgetall_json(self, name) -> dict:
+        self._check()
+        return {k: dict(v) for k, v in self.hashes.get(name, {}).items()}
+
+    async def hdel(self, name, *fields) -> None:
+        self._check()
+        for field_ in fields:
+            self.hashes.get(name, {}).pop(field_, None)
+
+    async def sadd(self, name, *members) -> None:
+        self._check()
+        if members:
+            self.sets.setdefault(name, set()).update(members)
+
+    async def smembers(self, name) -> set[str]:
+        self._check()
+        return set(self.sets.get(name, ()))
+
+    async def close(self) -> None:
+        pass
+
+
+def make_coordinator(store=None, valkey=None, ttl: int = 30) -> Coordinator:
+    """A real Coordinator over FakeValkey, its lease already taken. The lease never
+    runs out by itself: a test ends it with `valkey.expire(lease_key(coordinator))`."""
+    valkey = valkey if valkey is not None else FakeValkey()
+    coordinator = Coordinator(valkey, store if store is not None else FakeStore(), process_ttl_sec=ttl)
+    valkey.values[lease_key(coordinator)] = (coordinator.identity, None)
+    return coordinator
+
+
+def lease_key(coordinator: Coordinator) -> str:
+    return f"procs:{coordinator.token}"
 
 
 class FakeTiler:
@@ -309,6 +417,7 @@ def make_settings(**overrides) -> Settings:
             collection_name="c", vector_size=4, distance_type=Distance.COSINE,
             chunk_size=24, max_batch_chunks=1024,
         ),
+        valkey_settings=ValkeySettings(url="redis://valkey:6379/0"),
         retriever_settings=RetrieverSettings(
             base_url="http://retriever/v1", model_name="retriever", api_key="k-retriever", batch_size=16,
             max_concurrency=0, bulk_priority=0, image_batching="auto", timeout_sec=60,
@@ -335,8 +444,9 @@ def make_store(settings: Settings | None = None):
     return QdrantStore.from_settings(settings.qdrant_settings, settings.http_settings)
 
 
-def build_app(*, settings=None, store=None, retriever=None, tiler=None, vlm=None) -> FastAPI:
-    """The same routers as create_app(), but no lifespan — state is injected."""
+def build_app(*, settings=None, store=None, coordinator=None, retriever=None, tiler=None, vlm=None) -> FastAPI:
+    """The same routers as create_app(), but no lifespan — state is injected. A store
+    without a coordinator gets one of its own."""
     app = FastAPI()
     install_error_handlers(app)
     app.include_router(ops_api.router)
@@ -347,6 +457,7 @@ def build_app(*, settings=None, store=None, retriever=None, tiler=None, vlm=None
     app.state.settings = settings if settings is not None else make_settings()
     if store is not None:
         app.state.store = store
+        app.state.coordinator = coordinator if coordinator is not None else make_coordinator(store)
     if retriever is not None:
         app.state.retriever = retriever
     if tiler is not None:

@@ -30,7 +30,7 @@ async def revision(request: Request):
     operation_id="revisionStatus",
 )
 async def revision_status(request: Request):
-    return request.app.state.revision.status
+    return await request.app.state.revision.get_status()
 
 
 @router.post(

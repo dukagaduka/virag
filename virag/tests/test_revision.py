@@ -1,5 +1,5 @@
 """Revision job: background build, journal sync after the swap, abort without swap,
-rollback; plus the QdrantStore writers journal it relies on."""
+rollback, and the job's lock and status shared across processes."""
 
 from __future__ import annotations
 
@@ -8,14 +8,14 @@ import asyncio
 import pytest
 
 from virag.api import revision as revision_api
-from virag.clients.qdrant_store import QdrantStore
+from virag.coordination import REVISION_ON, REVISION_STATUS
 from virag.errors import ApiError
 from virag.revision import RevisionManager
 from virag.settings import EnrollSettings, ReconcileSettings
 
 from fastapi.testclient import TestClient
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, build_app, make_store
+from conftest import FakeRetriever, FakeStore, FakeTiler, build_app, lease_key, make_coordinator
 
 
 def _doc(doc_id, tile_count, *, complete=True, enrolled_at=1):
@@ -26,9 +26,10 @@ def _doc(doc_id, tile_count, *, complete=True, enrolled_at=1):
     }
 
 
-def _manager(store, tiler):
+def _manager(store, tiler, coordinator=None):
     return RevisionManager(
         store,
+        coordinator if coordinator is not None else make_coordinator(store),
         tiler,
         FakeRetriever(),
         EnrollSettings(batch_size=4),
@@ -50,8 +51,18 @@ def test_revision_builds_swaps_and_syncs_journal():
     store, tiler = FakeStore(), FakeTiler()
     store.metadata = {"secret_hash": "", "render_version": "rv-old"}
     tiler.docs = [_doc("a", 2), _doc("b", 1, complete=False), _doc("q", 1) | {"quarantined": True}, _doc("fresh", 1)]
-    store.journal_seen = {"fresh"}                                      # enrolled while building
     manager = _manager(store, tiler)
+
+    listing = tiler.iter_docs
+
+    async def iter_docs(*, filters=None):
+        if not getattr(tiler, "enrolled_fresh", False):
+            tiler.enrolled_fresh = True
+            async with manager.coordinator.writer(["fresh"]):         # enrolled while building
+                pass
+        return await listing(filters=filters)
+
+    tiler.iter_docs = iter_docs
 
     status = _run_job(manager, manager.start)
 
@@ -66,6 +77,18 @@ def test_revision_builds_swaps_and_syncs_journal():
     assert tiler.metadata_patches == []                                 # revision never touches markers
 
 
+def test_revision_releases_the_job_and_publishes_its_outcome():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    manager = _manager(store, tiler)
+    valkey = manager.coordinator.valkey
+
+    _run_job(manager, manager.start)
+
+    assert REVISION_ON not in valkey.values
+    assert valkey.values[REVISION_STATUS][0]["state"] == "succeeded"
+
+
 def test_revision_is_refused_while_the_tiler_is_not_serving():
     tiler = FakeTiler(info={"secret_hash": "", "render_version": "rv-test",
                             "revision": {"state": "running", "serving": False}})
@@ -76,6 +99,7 @@ def test_revision_is_refused_while_the_tiler_is_not_serving():
 
     assert exc.value.status_code == 409
     assert manager._task is None
+    assert REVISION_ON not in manager.coordinator.valkey.values             # the job handed back
 
 
 def test_startup_mismatch_is_only_logged_by_default(caplog):
@@ -99,6 +123,21 @@ def test_startup_mismatch_starts_the_revision_when_enabled():
 
     assert status["state"] == "succeeded"
     assert store.metadata["render_version"] == "rv-test"
+
+
+def test_startup_mismatch_leaves_a_revision_running_elsewhere_alone():
+    store, tiler = FakeStore(), FakeTiler()
+    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    other = make_coordinator(store)
+    manager = _manager(store, tiler, make_coordinator(store, valkey=other.valkey))
+
+    async def go():
+        await other.acquire_revision()
+        await manager.revise_if_stale(auto=True)                        # no raise: it runs there
+
+    asyncio.run(go())
+
+    assert manager._task is None
 
 
 def test_startup_without_mismatch_starts_nothing():
@@ -142,7 +181,23 @@ def test_revision_with_failed_docs_does_not_swap():
     assert status["failed_doc_ids"] == ["bad"]
     assert not hasattr(store, "swapped_to")
     assert store.dropped == ["c__v2"]                                   # aborted build removed
-    assert store._journal is None                                       # journal closed
+
+
+def test_revision_that_lost_its_lease_does_not_swap():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    manager = _manager(store, tiler)
+
+    async def lease_runs_out():
+        manager.coordinator.valkey.expire(lease_key(manager.coordinator))
+
+    store.on_build = lease_runs_out
+
+    status = _run_job(manager, manager.start)
+
+    assert status["state"] == "failed" and "lost" in status["error"]
+    assert not hasattr(store, "swapped_to")
+    assert store.dropped == ["c__v2"]
 
 
 def test_second_job_is_rejected_while_running():
@@ -163,6 +218,55 @@ def test_second_job_is_rejected_while_running():
     assert asyncio.run(go()) == 409
 
 
+def test_job_of_another_live_process_is_reported_not_repeated():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    first = _manager(store, tiler)
+    second = _manager(store, tiler, make_coordinator(store, valkey=first.coordinator.valkey))
+
+    async def go():
+        await first.start()
+
+        with pytest.raises(ApiError) as exc:
+            await second.start()
+
+        status = await second.get_status()                              # any process answers
+        await first._task
+
+        return exc.value, status
+
+    error, status = asyncio.run(go())
+
+    assert error.status_code == 409
+    assert error.details["status"]["owner"]["token"] == first.coordinator.token
+    assert status["kind"] == "revision" and status["owner"]["token"] == first.coordinator.token
+
+
+def test_job_of_a_dead_process_is_reported_lost_and_taken_over():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    dead = make_coordinator(store)
+    manager = _manager(store, tiler, make_coordinator(store, valkey=dead.valkey))
+
+    async def go():
+        await dead.acquire_revision()
+        await dead.set_status({"kind": "revision", "state": "running", "owner": dead.identity})
+        dead.valkey.expire(lease_key(dead))                             # its process was killed
+
+        lost = await manager.get_status()
+
+        await manager.start()
+        await manager._task
+
+        return lost, manager.status
+
+    lost, status = asyncio.run(go())
+
+    assert lost["state"] == "failed" and "owner lost" in lost["error"]
+    assert status["state"] == "succeeded"
+    assert status["owner"]["token"] == manager.coordinator.token
+
+
 def test_rollback_requires_a_previous_collection():
     manager = _manager(FakeStore(), FakeTiler())
 
@@ -170,6 +274,7 @@ def test_rollback_requires_a_previous_collection():
         asyncio.run(manager.start_rollback())
 
     assert exc.value.status_code == 409
+    assert REVISION_ON not in manager.coordinator.valkey.values
 
 
 def test_rollback_is_refused_across_render_versions():
@@ -197,7 +302,9 @@ def test_rollback_resyncs_docs_enrolled_since_retirement():
 
     assert status["state"] == "succeeded"
     assert status["collection"] == "c__v1" and status["abandoned"] == "c__v2"
+    assert store.dropped == ["c__v2"]                                   # once its writers drained
     assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["new"]
+    assert {u["collection"] for u in store.upserts} == {"c__v1"}
 
 
 def test_revision_api_starts_in_background_and_reports_status():
@@ -206,7 +313,7 @@ def test_revision_api_starts_in_background_and_reports_status():
 
     app = build_app(store=store, tiler=tiler, retriever=FakeRetriever())
     app.include_router(revision_api.router)
-    app.state.revision = _manager(store, tiler)
+    app.state.revision = _manager(store, tiler, app.state.coordinator)
 
     with TestClient(app) as client:
         started = client.post("/revision")
@@ -215,73 +322,3 @@ def test_revision_api_starts_in_background_and_reports_status():
 
         status = client.get("/revision").json()
         assert status["kind"] == "revision"
-
-
-# ---------------------------------------------------------------------------
-# QdrantStore writers journal (no network: the client is never called)
-# ---------------------------------------------------------------------------
-
-def _store() -> QdrantStore:
-    store = make_store()
-    store.physical_name = "c__v1"
-
-    return store
-
-
-def test_journal_includes_writers_in_flight_and_new_ones():
-    store = _store()
-
-    async def go():
-        async with store.writer("early"):
-            store.start_journal()
-
-            async with store.writer("during"):
-                pass
-
-        async with store.writer("during-2"):
-            pass
-
-        return store.stop_journal()
-
-    assert asyncio.run(go()) == {"early", "during", "during-2"}
-
-
-def test_writers_after_stop_are_not_journaled():
-    store = _store()
-
-    async def go():
-        store.start_journal()
-        journal = store.stop_journal()
-
-        async with store.writer("late"):
-            pass
-
-        return journal
-
-    assert asyncio.run(go()) == set()
-
-
-def test_drain_waits_for_writers_of_the_old_collection():
-    store = _store()
-
-    async def go():
-        release = asyncio.Event()
-
-        async def slow_writer():
-            async with store.writer("long"):
-                await release.wait()
-
-        task = asyncio.create_task(slow_writer())
-        await asyncio.sleep(0)
-
-        store.physical_name = "c__v2"                                   # swapped meanwhile
-
-        async with store.writer("new-collection"):
-            assert await store.drain("c__v1", timeout=0.01) is False   # still writing
-
-            release.set()
-            assert await store.drain("c__v1", timeout=1) is True       # ignores c__v2 writers
-
-        await task
-
-    asyncio.run(go())

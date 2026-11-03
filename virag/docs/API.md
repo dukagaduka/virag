@@ -156,9 +156,11 @@ after the swap. If any document still fails after a retry, the alias is **not** 
 and the old collection keeps serving. The replaced collection is kept for
 [`/revision/rollback`](#post-revisionrollback) until the next revision.
 
-It runs in the **background**: the call returns `202` with the job status at once; a
-second call while a job runs is `409 CONFLICT`, and so is a call while the tiler is not
-serving (its own revision is pending or running). Incomplete and quarantined tiler docs
+It runs in the **background**, in whichever virag process the request lands on: the
+call returns `202` with the job status at once. One job runs at a time across every
+process — a second call while one runs is `409 CONFLICT` (with that job's status), and
+so is a call while the tiler is not serving (its own revision is pending or running). A
+job whose process died is taken over by the next call, from scratch. Incomplete and quarantined tiler docs
 are skipped (they have no servable tiles; re-enroll them). The new collection is stamped
 with the tiler's `render_version`; if the tiler's changes before the swap, the job fails
 without swapping.
@@ -169,12 +171,15 @@ curl -s -X POST localhost:8080/revision | jq
 
 ## `GET /revision`
 
-Status of the current or last revision / rollback job (in-process; reset on restart):
+Status of the current or last revision / rollback job, the same from every virag
+process (it is kept in Valkey):
 
 ```json
 {
   "kind": "revision",
   "state": "succeeded",
+  "phase": "syncing",
+  "owner": {"token": "…", "host": "virag-1", "pid": 1, "started_at": 1761129000},
   "started_at": 1761130000,
   "finished_at": 1761130950,
   "collection": "store-collection__v2",
@@ -183,14 +188,17 @@ Status of the current or last revision / rollback job (in-process; reset on rest
 }
 ```
 
-`state` is `running`, `succeeded`, `degraded` (swapped, but some journaled docs failed to
-sync — listed in `sync_failed_doc_ids`; re-enroll them), or `failed` (`error`, and
-`failed_doc_ids` when the alias was not swapped).
+`state` is `idle` (no job yet), `running` (`phase`: `building`, then `syncing` after the
+swap), `succeeded`, `degraded` (swapped, but some journaled docs failed to sync — listed
+in `sync_failed_doc_ids`; re-enroll them), or `failed` (`error`, and `failed_doc_ids`
+when the alias was not swapped). A job whose process died reads as `failed` with
+`error: "owner lost (<host>/<pid>)"`; `POST /revision` again.
 
 ## `POST /revision/rollback`
 
 Repoint the alias back to the collection the last revision replaced, drop the abandoned
-one, and re-sync the documents enrolled since the swap. Background, like `/revision`
+one once the enrolls still writing into it are done, and re-sync the documents enrolled
+since the swap. Background, like `/revision`
 (`202`; `409` while a job runs or when there is no previous collection). Revert the
 retriever configuration first — the old collection holds the old model's vectors (a
 vector-size mismatch is refused). A collection embedded from another `render_version`
@@ -236,7 +244,7 @@ Every error uses one shape:
 | `409` | `RENDER_VERSION_MISMATCH` | A retrieved tile is rendered by another `render_version` than it was embedded from — rebuild with `POST /revision`. |
 | `422` | `UNPROCESSABLE` | Bad request body/JSON, invalid `rag` field, RAG on with no query text, bad `metadata`. |
 | `502` | `UPSTREAM_FAILURE` | A backend (VLM, tiler, retriever, Qdrant) could not be reached. |
-| `503` | `NOT_READY` | Queried before startup finished wiring backends, or the tiler is unreachable / not serving during a RAG chat. |
+| `503` | `NOT_READY` | Queried before startup finished wiring backends; the tiler is unreachable / not serving during a RAG chat; Valkey is unreachable during an enroll or a revision call. |
 | `500` | `INTERNAL_ERROR` | Unexpected server error. |
 
 Backend services can surface their own statuses (e.g. the tiler's `409`/`413`) through

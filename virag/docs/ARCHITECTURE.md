@@ -9,9 +9,12 @@ opts into retrieval per request.
 
 - **Stack:** Python 3.11+, FastAPI, pydantic-settings (configuration), async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async, over gRPC).
 - **Backends (all external):** a retriever server (vLLM, OpenAI-compatible), the
-  doc-tiler service, a Qdrant instance, and the upstream VLM.
+  doc-tiler service, a Qdrant instance, the upstream VLM, and a Valkey the virag
+  processes coordinate through.
 - **Scope:** the gateway only. Tiling/rendering lives in doc-tiler; embedding lives in
-  the vLLM server; vector storage lives in Qdrant; generation lives in the VLM.
+  the vLLM server; vector storage lives in Qdrant; generation lives in the VLM. virag
+  itself keeps no state: any number of processes (replicas, uvicorn workers) serve
+  side by side (§10).
 
 ---
 
@@ -109,8 +112,9 @@ tiler, inspect the Qdrant collection) without exposing each service separately.
 
 ## 6. Clients
 
-Four typed async clients, each built from its settings block and given a
-`check_connection()` used at startup:
+Five typed async clients, each built from its settings block and given a
+`check_connection()` used at startup. Each is an API to its backend and nothing more;
+the rules that span virag processes live in the Coordinator (§10).
 
 - **`RetrieverClient`** — the retrieval embedding model behind any OpenAI-compatible
   `/embeddings` API. Text goes through the standard `input` field, `RETRIEVER_BATCH_SIZE`
@@ -133,8 +137,14 @@ Four typed async clients, each built from its settings block and given a
   Qdrant surfaced as `503`. Collection lifecycle behind a serving alias over versioned physical
   collections, `upsert` (optional deterministic ids, byte-budget sub-batching), `query`,
   `delete_by_doc` / `iter_doc_ids` (reconcile), the revision blue-green swap
-  (`create_revision_collection` / `swap_alias`), and collection-level metadata (used by
-  the binding).
+  (`create_revision_collection` / `swap_alias` / `rollback_alias`), and collection-level
+  metadata (used by the binding). The alias is never cached: `resolve()` reads the
+  serving collection and the rollback target from Qdrant, since another process may
+  swap it at any time.
+- **`ValkeyStore`** — plain and JSON values, conditional writes (`SET NX`, `SET XX` with a
+  TTL, `SET IFEQ`, `DELIFEQ` — Valkey 9.0+, checked at startup), hashes and sets, every key
+  under `VALKEY_PREFIX`; an unreachable Valkey surfaced as `503`. It knows nothing of
+  what the keys mean.
 - **`VLMClient`** — the upstream generator: `complete()` (buffered passthrough,
   any status) and `stream()` (an async context manager yielding the live SSE
   response). `check_connection()` also probes vision support with a 1×1 PNG.
@@ -143,11 +153,12 @@ Four typed async clients, each built from its settings block and given a
 
 `lifespan` wires everything and refuses to serve a half-working system:
 
-- Build all four clients from `Settings.from_env()`.
-- `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler and
-  VLM. **Every dependency is fatal** — the service is useless without any one of them,
-  so a failed check aborts startup. The retriever's vector size must also equal
-  `QDRANT_VECTOR_SIZE`.
+- Build all five clients from `Settings.from_env()`.
+- `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler, VLM
+  and Valkey. **Every dependency is fatal** — the service is useless without any one of
+  them, so a failed check aborts startup. The retriever's vector size must also equal
+  `QDRANT_VECTOR_SIZE`. Two processes starting on one empty Qdrant both try to create
+  `<name>__v1`; the one that loses adopts the other's.
 - **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): virag, the tiler,
   and the Qdrant collection must share one secret hash, or startup fails. A fresh
   collection is bound on first run (secret + the tiler's `render_version`).
@@ -156,18 +167,28 @@ Four typed async clients, each built from its settings block and given a
   `name` (text), `virag_started_at` (number), `virag_enrolled_at` (number). A missing or
   wrong-typed field is **fatal** (`BindingError`) — the tiler is misconfigured. See
   §9.
+- **Lease** — the process takes its lease in Valkey and starts the heartbeat that
+  renews it (§10).
 - **Reconcile** — one `reconcile()` pass runs before serving (repairing any partial or
-  orphaned enrolls left by an earlier crash); a background task repeats it on
-  `VIRAG_RECONCILE_INTERVAL_SEC`. See §9.
+  orphaned enrolls left by an earlier crash) in the process leading reconcile; a
+  background task in every process repeats it on `VIRAG_RECONCILE_INTERVAL_SEC`, and the
+  pass runs in the leader. See §9.
 - **render_version check** (`RevisionManager.revise_if_stale`) — a collection embedded
   from another `render_version` than the tiler's is logged; with
-  `VIRAG_REVISION_ON_RENDER_MISMATCH=true` the revision starts right away. See §9.
+  `VIRAG_REVISION_ON_RENDER_MISMATCH=true` the revision starts right away, unless
+  another process already runs it. See §9.
 
 The tiler is as essential as the VLM: its `check_connection` hits `/readyz`, so a tiler
 that is down — or still revising its own corpus — refuses virag's startup (the
-container restarts until the tiler is ready). `/ready` reports `503` until all four
-clients are attached to `app.state`; `/health` is a bare liveness probe (the
-`HEALTHCHECK`).
+container restarts until the tiler is ready). `/ready` reports `503` until every
+client and the Coordinator are attached to `app.state`; `/health` is a bare liveness
+probe (the `HEALTHCHECK`).
+
+Shutdown runs the same stack in reverse: the periodic reconcile and this process's
+revision job are cancelled (the job publishes `failed: cancelled (shutdown)` and
+releases the lock), the heartbeat stops, the reconcile lead and the lease are handed
+back, then the clients close. uvicorn's `--timeout-graceful-shutdown` keeps a long
+open stream from holding this past compose's `stop_grace_period`.
 
 ## 8. Enrollment & the Qdrant ⊆ Tiler invariant
 
@@ -193,6 +214,13 @@ documents enroll fully.
   pending); on success it sets `virag_enrolled_at` to the epoch. On any mid-enroll failure
   the partial points are rolled back out of Qdrant; the tiler doc stays in place and
   pending for reconcile to heal or sweep.
+- **One collection per write.** At `begin` the enroll registers as a writer and is pinned
+  to the physical collection the alias resolves to then (`Coordinator.writer`); every
+  upsert and the rollback delete go there. A revision swapping the alias meanwhile never
+  splits a document across two collections: the writer is in its journal, and the
+  revision syncs the document into the new collection once the writer is done. With
+  Valkey unreachable the writer cannot register, and the enroll answers `503 NOT_READY`
+  before touching anything.
 
 ## 9. Reconcile, the collection scheme & revision
 
@@ -203,16 +231,16 @@ collection already sitting under `QDRANT_COLLECTION_NAME` (the pre-alias layout)
 refused at startup — the alias cannot take a name a collection holds.
 
 **Reconcile** (`reconcile.py`) runs once at startup and then on
-`VIRAG_RECONCILE_INTERVAL_SEC` (0 disables the loop; the startup pass still runs). Two
-passes:
+`VIRAG_RECONCILE_INTERVAL_SEC` (0 disables the loop; the startup pass still runs), in
+the one process leading it (§10). Two passes:
 
 1. *Enforce `Qdrant ⊆ Tiler`.* List every tiler `doc_id` (`POST /docs/search`) and every
    Qdrant `doc_id` (scroll), and delete from Qdrant any `doc_id` the tiler no longer has.
    This is also how a document deleted from the tiler gets its stale points removed
    (delete-propagation) — on the next reconcile pass. Points of a doc the tiler
    quarantined go too: its tiles answer `410`, so they would only crowd live hits out
-   of `top_n`. A doc with a write in flight (a re-enroll lifting the quarantine) is
-   left alone; a re-enroll brings the points back.
+   of `top_n`. A doc with a write in flight anywhere in the cluster (a re-enroll lifting
+   the quarantine) is left alone; a re-enroll brings the points back.
 2. *Clear stale pending.* Find docs with `virag_enrolled_at == 0` **and**
    `virag_started_at < now − VIRAG_PENDING_TTL_SEC` (the TTL gate skips in-flight
    enrolls), delete their partial points, and — if `VIRAG_SELF_HEAL` is on and the tiler
@@ -227,24 +255,27 @@ call and upserts once; a window of batches derived from the tiler cap stays in f
 failed batch fails the docs it touched; they are retried once in per-document batches.
 
 **Revision** (`virag/revision.py`, `POST /revision`) is a background full re-embed with a
-blue-green swap: refuse while the tiler is not serving, and note its `render_version`;
-drop any leftover `__vN+1` and create it; start the store's writer journal; re-embed
-every complete, non-quarantined tiler doc into it; abort without a swap (dropping the
-build) if docs still fail; enforce `Qdrant ⊆ Tiler` on it; abort likewise if the tiler's
-`render_version` changed meanwhile, else stamp it on the build; swap the alias, keeping
-the replaced collection (stamped `retired_at`) as the rollback target; stop the journal; wait
-up to `VIRAG_PENDING_TTL_SEC` for writers of the old collection to finish; sync the
-journaled docs into the new collection (drop, then re-embed if the tiler holds them
-complete and enrolled); enforce the invariant again. New writes are never mirrored into
-the build — the journal of writers (enroll, self-heal; including those already in flight
-at the start) plus the post-swap sync closes the gap. Use it after a retriever-model
-change and after a tiler render change. The lock, journal and status are in-process:
-correct for a single virag replica.
+blue-green swap: take the job (`revision:on`, one across the cluster, §10); refuse while
+the tiler is not serving, and note its `render_version`; resolve the serving collection;
+drop any leftover `__vN+1` and create it; start the writer journal; re-embed every
+complete, non-quarantined tiler doc into it; abort without a swap (dropping the build)
+if docs still fail; enforce `Qdrant ⊆ Tiler` on it; abort likewise if the tiler's
+`render_version` changed meanwhile, else stamp it on the build; check the job is still
+this process's (fencing: a process whose lease expired may have been replaced); swap the
+alias, keeping the replaced collection (stamped `retired_at`) as the rollback target;
+read the journal; wait up to `VIRAG_PENDING_TTL_SEC` for writers pinned to the old
+collection; sync the journaled docs into the new collection (drop, then re-embed if the
+tiler holds them complete and enrolled); enforce the invariant again. New writes are
+never mirrored into the build — the journal of writers (enroll, self-heal, in any
+process; including those already in flight at the start) plus the post-swap sync closes
+the gap. Use it after a retriever-model change and after a tiler render change. The
+request may land on any process: that process runs the job, and every process answers
+`GET /revision`.
 
 **Rollback** (`POST /revision/rollback`) repoints the alias to the retained collection,
-drops the abandoned one and syncs the docs enrolled since `retired_at`, under the same
-journal + drain. It is refused when the retained collection was embedded from another
-`render_version` than the tiler's.
+waits for the writers still pinned to the abandoned one, drops it and syncs the docs
+enrolled since `retired_at`, under the same job lock and journal. It is refused when
+the retained collection was embedded from another `render_version` than the tiler's.
 
 **render_version.** The tiler binds `render_version` to its volume like geometry and
 never serves a doc rendered by another one; every tile it returns names its
@@ -257,18 +288,83 @@ right away. The upgrade path: the tiler revises its docs (virag cannot start mea
 → virag starts, rebuilds its collection (chat answers `RENDER_VERSION_MISMATCH` until the
 swap) → both serve.
 
-## 10. Module layout
+## 10. Coordination of virag processes
+
+Chat needs nothing shared: it reads through the Qdrant alias and the tiler. Four things
+do, and they live in Valkey, behind the **`Coordinator`** (`coordination.py`); Qdrant
+stays the source of truth for the collections — the alias is the one atomic pointer to
+the serving collection, resolved afresh wherever it matters:
+
+1. the revision / rollback job — one at a time, its status readable from any process;
+2. the journal of documents written while the job runs;
+3. the registry of in-flight writers — seeding the journal, the drain after a swap, and
+   reconcile sparing a doc being re-enrolled;
+4. the reconcile pass — one per interval across the cluster.
+
+**Leases.** Every process holds one key with a TTL, `procs:<token>`
+(`VIRAG_PROCESS_TTL_SEC`, 30 s), renewed every ttl/3 with `SET XX` — only while it still
+exists, so an expired lease never comes back: a dead token stays dead. Whatever a
+process owns records its token and has no TTL of its own. A resource whose owner's
+lease is gone is free and is taken over with `SET IFEQ <dead token>`, so of two
+processes racing for it exactly one wins. A process finding its own lease expired (its
+event loop stalled, or Valkey was gone, longer than the TTL) stops itself with SIGTERM:
+the others already count it dead. On a graceful shutdown it hands the lease back, so
+nobody waits out the TTL.
+
+| Key (under `VALKEY_PREFIX`) | Holds |
+|---|---|
+| `procs:<token>` | the lease: `{host, pid, started_at}`, with the TTL |
+| `writers` | hash `writer_id → {proc, doc_id, physical}`: in-flight document writes |
+| `revision:on` | the token of the process running the revision / rollback; while it exists, writers journal themselves |
+| `revision:status` | the job status, with its `owner` |
+| `revision:journal` | the doc_ids written while the job ran |
+| `reconcile:on` | the token of the reconcile leader |
+
+**Rules.**
+
+- *Job.* `SET revision:on <mine> NX`; if it is held, the holder's lease decides: alive
+  → `409` with its status; dead → `SET IFEQ` takes it over (the new job starts from
+  scratch; a leftover build is dropped). The status is published only while the job is
+  still this process's; a `running` status whose owner's lease is gone reads as
+  `failed: owner lost`. Before the swap (or the rollback's repoint) the job checks it
+  still holds `revision:on` and its lease — the fencing that keeps a replaced process
+  from swapping. On the way out it publishes the outcome and `DELIFEQ`s the lock.
+- *Writers and journal.* A writer registers (`HSET`), then journals itself if
+  `revision:on` exists, then resolves the alias and records its `physical`. The job sets
+  `revision:on` first, then snapshots the live writers into the journal. Each writer is
+  therefore in the snapshot or sees the flag — no transaction needed; one that finished
+  before the snapshot finished before the job read the tiler. The journal is read right
+  after the swap: a writer that resolved the old collection journaled itself before it
+  resolved.
+- *Drain* polls the registry until no live writer is pinned to the old collection — or
+  is still unpinned, since it may yet resolve to it. Writers of dead processes are
+  ignored and pruned; their documents stay pending in the tiler for reconcile.
+- *Reconcile lead.* Each tick, every process: lead already → run; `reconcile:on` free →
+  `SET NX`; leader dead → `SET IFEQ`; else skip. The lead stays while the leader lives
+  and moves within one TTL plus one interval after it dies.
+
+**Failure modes.** A process killed outright loses its in-flight requests (the client
+retries, on another process); `restart` brings it back under a new token. Its writers are ignored
+once its lease is gone; a job it ran reads as `owner lost`, the alias untouched (or
+swapped, with the sync left to the next revision), and the next `POST /revision` takes
+over. Valkey unreachable: chat keeps serving, enroll answers `503 NOT_READY`, a job
+fails at its next step without swapping, reconcile skips its pass; past the TTL the
+processes restart on their expired leases. Valkey runs with AOF, so a short restart
+keeps the leases and the journal.
+
+## 11. Module layout
 
 ```
 virag/
-  main.py            # app, lifespan (clients, dependency checks, binding, reconcile, render_version check), router order
+  main.py            # app, lifespan (clients, dependency checks, binding, lease, reconcile, render_version check), router order
   settings.py        # pydantic-settings sections: every env var, its default and bounds
   binding.py         # the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
+  coordination.py    # Coordinator: leases, writers + journal, drain, the revision job lock, the reconcile lead
   reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and the shared re-embed stream
   revision.py        # RevisionManager: background revision / rollback job, journal sync
   errors.py          # ApiError + the uniform {"error": {...}} envelope
   responses.py       # OrjsonResponse, the app-wide default response class
-  utils.py           # non-domain helpers (error_body, gather)
+  utils.py           # non-domain helpers (error_body, gather, cancel, chunked, unavailable_as_503)
   api/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
     enroll.py            # /enroll: streaming tile → embed → upsert
@@ -276,5 +372,5 @@ virag/
     proxy.py             # reverse proxy for /tiler, /retriever, /qdrant, /v1/*
     ops.py               # /health, /ready
   clients/
-    retriever_client.py  qdrant_store.py  tiler_client.py  vlm_client.py
+    retriever_client.py  qdrant_store.py  valkey_store.py  tiler_client.py  vlm_client.py
 ```

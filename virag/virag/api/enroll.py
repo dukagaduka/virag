@@ -39,6 +39,7 @@ async def enroll(
 ):
 
     store = request.app.state.store
+    coordinator = request.app.state.coordinator
     retriever = request.app.state.retriever
     tiler = request.app.state.tiler
     batch_size = request.app.state.settings.enroll_settings.batch_size
@@ -60,8 +61,10 @@ async def enroll(
     filename = document.filename if document is not None else None
     log.info("enroll request: doc_type=%s filename=%s force=%s", doc_type, filename, force)
 
-    # Streaming state, filled from the `begin` event and each `tile`.
+    # Streaming state, filled from the `begin` event and each `tile`. `physical` is the
+    # collection the doc is written into, pinned at `begin`.
     doc_id: str | None = None
+    physical: str | None = None
     doc_type_out = source_url = render_version = payload_meta = None
     batch: list[dict] = []
     enrolled = 0
@@ -88,7 +91,7 @@ async def enroll(
         ]
         ids = [point_id(doc_id, t["tile_num"]) for t in batch]
 
-        await store.upsert(vectors, payloads, ids=ids)
+        await store.upsert(vectors, payloads, ids=ids, collection=physical)
         enrolled += len(batch)
         batch.clear()
 
@@ -108,15 +111,16 @@ async def enroll(
                     if not has_name:
                         log.warning("no metadata.name; naming doc_id=%s by its content hash", doc_id)
 
-                    # Registered as a writer until commit/rollback, so a concurrent revision
-                    # journals this doc and syncs it into the collection it builds.
-                    await writing.enter_async_context(store.writer(doc_id))
+                    # Registered as a writer until commit/rollback and pinned to one
+                    # collection, so a concurrent revision journals this doc and syncs it
+                    # into the collection it builds.
+                    physical = await writing.enter_async_context(coordinator.writer([doc_id]))
 
                     # Mark pending (virag semantics on the tiler's indexed metadata) and clear
                     # any prior partial/stale points. A crash from here leaves a clean, detectable
                     # state that reconcile finishes or rolls back.
                     await tiler.patch_metadata(doc_id, {"virag_started_at": int(time.time()), "virag_enrolled_at": 0})
-                    await store.delete_by_doc(doc_id)
+                    await store.delete_by_doc(doc_id, collection=physical)
 
                 elif kind == "tile":
                     batch.append(event)
@@ -144,10 +148,11 @@ async def enroll(
 
         except Exception:
             # Roll the doc back out of Qdrant. It stays in the tiler (Tiler ⊇ Qdrant) and
-            # pending, so reconcile heals or sweeps it later.
-            if doc_id is not None:
+            # pending, so reconcile heals or sweeps it later. Not yet pinned, nothing was
+            # written — and the points of an earlier enroll must stay.
+            if physical is not None:
                 try:
-                    await store.delete_by_doc(doc_id)
+                    await store.delete_by_doc(doc_id, collection=physical)
                 except Exception as cleanup_err:  # noqa: BLE001 - never mask the original failure
                     log.error("rollback delete_by_doc failed for doc_id=%s: %r", doc_id, cleanup_err)
             raise

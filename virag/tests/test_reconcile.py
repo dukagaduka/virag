@@ -8,7 +8,7 @@ from virag.api.enroll import point_id
 from virag.reconcile import reconcile, reembed_docs, sync_docs
 from virag.settings import EnrollSettings, ReconcileSettings
 
-from conftest import FakeRetriever, FakeStore, FakeTiler
+from conftest import FakeRetriever, FakeStore, FakeTiler, make_coordinator
 
 
 _ENROLL = EnrollSettings(batch_size=16)
@@ -31,7 +31,7 @@ def test_reconcile_deletes_dangling_points():
     store._doc_ids = {"kept", "dangling"}                       # dangling has no tiler doc
     tiler.docs = [{"doc_id": "kept"}]
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
+    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
 
     assert "dangling" in store.deletes
     assert "kept" not in store.deletes
@@ -45,9 +45,13 @@ def test_reconcile_deletes_points_of_quarantined_docs():
         {"doc_id": "quarantined", "quarantined": True},
         {"doc_id": "reenrolling", "quarantined": True},
     ]
-    store.in_flight = {"reenrolling"}                          # a re-enroll is lifting it
+    coordinator = make_coordinator(store)
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
+    async def go():
+        async with coordinator.writer(["reenrolling"]):        # a re-enroll is lifting it
+            await reconcile(store, coordinator, tiler, retriever, _settings(), _ENROLL)
+
+    asyncio.run(go())
 
     assert store.deletes == ["quarantined"]
 
@@ -60,7 +64,7 @@ def test_reconcile_self_heals_complete_pending():
         "metadata": {"name": "A", "virag_started_at": 1, "virag_enrolled_at": 0},
     }]
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
+    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
 
     assert len(store.upserts) == 1
     up = store.upserts[0]
@@ -68,7 +72,37 @@ def test_reconcile_self_heals_complete_pending():
     assert up["payloads"][0]["metadata"] == {"name": "A"}               # virag_* markers stripped
     assert tiler.metadata_patches[-1][0] == "doc-a"                     # pending promoted
     assert tiler.metadata_patches[-1][1]["virag_enrolled_at"] > 0
-    assert store.writers == ["doc-a"]                                   # journaled for a revision
+    assert up["collection"] == "c__v1"                                  # pinned to the serving one
+
+
+def test_self_heal_is_journaled_by_a_running_revision():
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    tiler.pending_docs = [_doc("doc-a", 1, enrolled_at=0)]
+    coordinator = make_coordinator(store)
+
+    async def go():
+        await coordinator.acquire_revision()
+        await coordinator.start_journal()
+        await reconcile(store, coordinator, tiler, retriever, _settings(), _ENROLL)
+
+        return await coordinator.journal()
+
+    assert asyncio.run(go()) == {"doc-a"}
+
+
+def test_reconcile_runs_only_in_the_leading_process():
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    store._doc_ids = {"dangling"}
+    leader = make_coordinator(store)
+    follower = make_coordinator(store, valkey=leader.valkey)
+
+    asyncio.run(reconcile(store, leader, tiler, retriever, _settings(), _ENROLL))
+    store.deletes.clear()
+    store._doc_ids = {"dangling"}
+
+    asyncio.run(reconcile(store, follower, tiler, retriever, _settings(), _ENROLL))
+
+    assert store.deletes == []                                          # the leader's to do
 
 
 def test_reconcile_leaves_incomplete_for_reenroll():
@@ -78,7 +112,7 @@ def test_reconcile_leaves_incomplete_for_reenroll():
         "render_version": "rv-test", "source_url": None, "metadata": {"name": "B"},
     }]
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
+    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
 
     assert store.deletes == ["doc-b"]      # partial cleared
     assert store.upserts == []             # not re-embedded (tiler incomplete)
@@ -89,7 +123,7 @@ def test_failed_self_heal_clears_partial_and_stays_pending():
     tiler.pending_docs = [_doc("doc-a", 2, enrolled_at=0)]
     tiler.fail_tiles = {("doc-a", 1)}
 
-    asyncio.run(reconcile(store, tiler, retriever, _settings(), _ENROLL))
+    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
 
     assert store.deletes == ["doc-a", "doc-a"]                          # before, and after the failure
     assert tiler.metadata_patches == []                                 # never promoted

@@ -56,7 +56,7 @@ def test_ready_503_when_backends_missing(make_client):
     assert r.status_code == 503
     body = r.json()
     assert body["status"] == "not ready"
-    assert set(body["missing"]) == {"store", "retriever", "tiler", "vlm"}
+    assert set(body["missing"]) == {"store", "coordinator", "retriever", "tiler", "vlm"}
 
 
 def test_ready_200_when_all_present(make_client):

@@ -77,12 +77,14 @@ virag/
   main.py            app, lifespan (clients, fatal dependency checks, binding, reconcile, render_version check), router order
   settings.py        Settings.from_env() — every env var and its validation
   binding.py         the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
-  reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic) and /revision re-embed
+  reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic, in the leading process)
+  revision.py        /revision re-embed and /revision/rollback jobs
+  coordination.py    Coordinator: process leases, writers + journal, revision lock/status, reconcile lead
   errors.py          ApiError + the uniform {"error": {...}} envelope
   api/               chat_completions, enroll, revision, proxy, ops
-  clients/           retriever_client, qdrant_store, tiler_client, vlm_client
+  clients/           retriever_client, qdrant_store, valkey_store, tiler_client, vlm_client
 docs/                documentation (see the table above)
-deploy/service/      virag + tiler + Qdrant: docker-compose.yaml, .env.example, tiler metadata schema
+deploy/service/      virag + tiler + Qdrant + Valkey: docker-compose.yaml, .env.example, tiler metadata schema
 deploy/retriever/   vLLM retriever stack: docker-compose.yaml, .env.example, serve_retriever.example.sh
 ```
 
@@ -102,6 +104,6 @@ uvicorn virag.main:app --host 0.0.0.0 --port 8080
 (Use whatever Python environment tooling you prefer — a venv or a conda/mamba env with
 the dependencies installed; virag doesn't require a specific one.)
 
-Requires `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL` and `VLM_MODEL_NAME` in the environment
+Requires `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME` and `VALKEY_URL` in the environment
 (see [docs/CONFIG.md](docs/CONFIG.md)); every backend is checked at startup and a
 failure aborts the boot.

@@ -1,6 +1,7 @@
 """Enroll self-repair: keep Qdrant a consistent subset of the tiler.
 
-Runs at startup and (optionally) on an interval. Two passes:
+Runs at startup and (optionally) on an interval, in the one process leading it
+(`Coordinator.lead_reconcile`). Two passes:
 
   1. Enforce the `Qdrant ⊆ Tiler` invariant — delete any Qdrant points whose doc_id
      the tiler no longer has (a dangling hit would 404 on tile fetch).
@@ -22,16 +23,15 @@ import base64
 import hashlib
 import logging
 import time
-from collections.abc import Iterable, Iterator
-from contextlib import AsyncExitStack
-from itertools import islice
+from collections.abc import Iterable
 
 from virag.api.enroll import point_id
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.tiler_client import TilerService
+from virag.coordination import Coordinator
 from virag.settings import EnrollSettings, ReconcileSettings
-from virag.utils import gather
+from virag.utils import chunked, gather
 
 
 log = logging.getLogger("virag.reconcile")
@@ -42,14 +42,21 @@ _UNCAPPED_TILES = 128
 
 async def reconcile(
     store: QdrantStore,
+    coordinator: Coordinator,
     tiler: TilerService,
     retriever: RetrieverClient,
     settings: ReconcileSettings,
     enroll_settings: EnrollSettings,
 ) -> None:
-    """Run one reconcile pass: enforce the invariant, then clear stale pending enrolls."""
-    await enforce_subset(store, tiler)
-    await _clear_stale_pending(store, tiler, retriever, settings, enroll_settings)
+    """Run one reconcile pass if this process leads reconcile: enforce the invariant,
+    then clear stale pending enrolls."""
+    if not await coordinator.lead_reconcile():
+        log.debug("reconcile: led by another process")
+
+        return
+
+    await enforce_subset(store, coordinator, tiler)
+    await _clear_stale_pending(store, coordinator, tiler, retriever, settings, enroll_settings)
 
 
 def embeddable(doc: dict) -> bool:
@@ -60,6 +67,7 @@ def embeddable(doc: dict) -> bool:
 
 async def enforce_subset(
     store: QdrantStore,
+    coordinator: Coordinator,
     tiler: TilerService,
     *,
     collection: str | None = None,
@@ -75,7 +83,7 @@ async def enforce_subset(
     # A quarantined doc's tiles answer 410, so its points only crowd live hits out of
     # top_n. One being written right now is a re-enroll lifting the quarantine.
     quarantined = {doc["doc_id"] for doc in docs if doc.get("quarantined")} & qdrant_ids
-    quarantined -= store.writing()
+    quarantined -= await coordinator.writing()
 
     if dangling:
         log.warning("reconcile: %d dangling doc_id(s) in qdrant not in tiler; deleting", len(dangling))
@@ -94,6 +102,7 @@ async def enforce_subset(
 
 async def _clear_stale_pending(
     store: QdrantStore,
+    coordinator: Coordinator,
     tiler: TilerService,
     retriever: RetrieverClient,
     settings: ReconcileSettings,
@@ -114,11 +123,8 @@ async def _clear_stale_pending(
     log.warning("reconcile: %d stale pending enroll(s); clearing partial points", len(stale))
 
     # Registered as writers so a concurrent revision journals and later syncs these docs.
-    async with AsyncExitStack() as writing:
-        for doc in stale:
-            await writing.enter_async_context(store.writer(doc["doc_id"]))
-
-        await store.delete_by_docs([doc["doc_id"] for doc in stale])      # always clear the partial first
+    async with coordinator.writer(doc["doc_id"] for doc in stale) as physical:
+        await store.delete_by_docs([doc["doc_id"] for doc in stale], collection=physical)  # always clear the partial first
 
         # An incomplete or quarantined tiler doc can't be re-embedded (no servable tiles);
         # leave it for a re-enroll to restore.
@@ -137,12 +143,13 @@ async def _clear_stale_pending(
             retriever,
             healable,
             batch_size=enroll_settings.batch_size,
+            collection=physical,
             mark_enrolled=True,
         )
 
         if failed:
             # Leave no partial points behind; the docs stay pending for the next sweep.
-            await store.delete_by_docs(sorted(failed))
+            await store.delete_by_docs(sorted(failed), collection=physical)
             log.error("reconcile: self-heal failed for %d doc(s): %s", len(failed), sorted(failed))
 
         log.info("reconcile: self-healed %d doc(s)", len(healable) - len(failed))
@@ -311,11 +318,11 @@ async def _reembed_pass(
         batches = (
             batch
             for doc_id, doc in by_id.items()
-            for batch in _batches(((doc_id, n) for n in range(doc["tile_count"])), batch_size)
+            for batch in chunked(((doc_id, n) for n in range(doc["tile_count"])), batch_size)
         )
     else:
         tiles = ((doc_id, n) for doc_id, doc in by_id.items() for n in range(doc["tile_count"]))
-        batches = _batches(tiles, batch_size)
+        batches = chunked(tiles, batch_size)
 
     window = max(1, (tiler.max_concurrency or _UNCAPPED_TILES) // batch_size) + 1
     slots = asyncio.Semaphore(window)
@@ -335,20 +342,16 @@ async def _reembed_pass(
     return failed
 
 
-def _batches(items: Iterator, size: int) -> Iterator[list]:
-    """Lazily cut an iterator into lists of `size` (the last may be shorter)."""
-    while batch := list(islice(items, size)):
-        yield batch
-
-
 async def run_periodic(
     store: QdrantStore,
+    coordinator: Coordinator,
     tiler: TilerService,
     retriever: RetrieverClient,
     settings: ReconcileSettings,
     enroll_settings: EnrollSettings,
 ) -> None:
-    """Loop reconcile on the configured interval until cancelled (interval 0 = disabled)."""
+    """Loop reconcile on the configured interval until cancelled (interval 0 = disabled).
+    Every process loops; the pass runs in the one leading it."""
     if settings.interval_sec <= 0:
         return
 
@@ -356,7 +359,7 @@ async def run_periodic(
         await asyncio.sleep(settings.interval_sec)
 
         try:
-            await reconcile(store, tiler, retriever, settings, enroll_settings)
+            await reconcile(store, coordinator, tiler, retriever, settings, enroll_settings)
 
         except asyncio.CancelledError:
             raise

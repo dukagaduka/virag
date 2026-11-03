@@ -103,6 +103,17 @@ class QdrantStoreSettings(_Section):
         return self.chunk_size * 1024 * 1024
 
 
+class ValkeySettings(_Section):
+    """Valkey: where virag processes coordinate (leases, writers, the revision lock)."""
+
+    model_config = SettingsConfigDict(env_prefix="VALKEY_")
+
+    url: str                                    # redis://[:password@]host:port/db
+    prefix: str = "virag"                       # key namespace; one per deployment sharing a Valkey
+    timeout_sec: float = Field(2.0, gt=0)       # connect and per-command deadline
+    max_connections: int = Field(64, ge=1)
+
+
 class RetrieverSettings(_UpstreamSettings):
     """The retrieval embedding model behind an OpenAI-compatible `/embeddings` API."""
 
@@ -160,6 +171,12 @@ class RevisionSettings(_Section):
     revision_on_render_mismatch: bool = False   # on → revise at startup; off → log, wait for POST /revision
 
 
+class CoordinationSettings(_Section):
+    model_config = SettingsConfigDict(env_prefix="VIRAG_")
+
+    process_ttl_sec: int = Field(30, ge=3)      # a process silent this long counts as dead
+
+
 class Settings(_Section):
     model_config = SettingsConfigDict(env_prefix="VIRAG_")
 
@@ -172,12 +189,14 @@ class Settings(_Section):
     rag_settings: RagSettings = Field(default_factory=RagSettings)
     http_settings: HttpSettings = Field(default_factory=HttpSettings)
     qdrant_settings: QdrantStoreSettings = Field(default_factory=QdrantStoreSettings)  # type: ignore[arg-type]
+    valkey_settings: ValkeySettings = Field(default_factory=ValkeySettings)  # type: ignore[arg-type]
     retriever_settings: RetrieverSettings = Field(default_factory=RetrieverSettings)
     tiler_settings: TilerSettings = Field(default_factory=TilerSettings)
     vlm_settings: VLMSettings = Field(default_factory=VLMSettings)  # type: ignore[arg-type]
     enroll_settings: EnrollSettings = Field(default_factory=EnrollSettings)
     reconcile_settings: ReconcileSettings = Field(default_factory=ReconcileSettings)
     revision_settings: RevisionSettings = Field(default_factory=RevisionSettings)
+    coordination_settings: CoordinationSettings = Field(default_factory=CoordinationSettings)
 
 
     @classmethod
@@ -226,11 +245,13 @@ _SECTIONS: dict[str, type[BaseSettings]] = {
         RagSettings,
         HttpSettings,
         QdrantStoreSettings,
+        ValkeySettings,
         RetrieverSettings,
         TilerSettings,
         VLMSettings,
         EnrollSettings,
         ReconcileSettings,
         RevisionSettings,
+        CoordinationSettings,
     )
 }

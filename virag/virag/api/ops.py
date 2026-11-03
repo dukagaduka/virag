@@ -7,7 +7,7 @@ from virag.responses import OrjsonResponse
 
 router = APIRouter()
 
-_DEPENDENCIES = ("store", "retriever", "tiler", "vlm")
+_DEPENDENCIES = ("store", "coordinator", "retriever", "tiler", "vlm")
 
 
 @router.get("/health", summary="Liveness")

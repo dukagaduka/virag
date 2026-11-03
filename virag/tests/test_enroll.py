@@ -176,3 +176,33 @@ def test_enroll_rolls_back_on_upsert_failure(make_client):
     assert store.deletes == ["doc-a", "doc-a"]                        # start clear + rollback
     # pending is never promoted on failure — no patch sets a non-zero enrolled_at
     assert all(p[1].get("virag_enrolled_at") == 0 for p in tiler.metadata_patches)
+
+
+def test_enroll_writes_into_the_collection_pinned_at_begin(make_client):
+    client, store, _, _ = _client(make_client)
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+    assert r.status_code == 200
+    assert store.upserts[0]["collection"] == "c__v1"
+    assert store.delete_collections == ["c__v1"]                      # the start clear, same one
+
+
+def test_enroll_without_valkey_is_503_and_keeps_existing_points(make_client):
+    client, store, _, tiler = _client(make_client)
+    client.app.state.coordinator.valkey.down = True
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "NOT_READY"
+    assert store.deletes == []                                        # an earlier enroll's points stay
+    assert tiler.metadata_patches == []

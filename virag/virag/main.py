@@ -12,10 +12,13 @@ from virag.responses import OrjsonResponse
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerService
+from virag.clients.valkey_store import ValkeyStore
 from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding, enforce_metadata_schema, secret_hash
+from virag.coordination import Coordinator
 from virag.reconcile import reconcile, run_periodic
 from virag.revision import RevisionManager
+from virag.utils import cancel
 from virag.api import enroll as enroll_api
 from virag.api import chat_completions as chat_completions_api
 from virag.api import proxy as proxy_api
@@ -61,17 +64,6 @@ def _require_vector_size(dimension: int | None, vector_size: int) -> None:
         raise SettingsError(message)
 
 
-async def _cancel(task: asyncio.Task) -> None:
-    """Cancel a background task and wait for it to unwind."""
-    task.cancel()
-
-    try:
-        await task
-
-    except asyncio.CancelledError:
-        pass
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -84,6 +76,9 @@ async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
         store = QdrantStore.from_settings(settings.qdrant_settings, settings.http_settings)
         stack.push_async_callback(store.close)
+
+        valkey = ValkeyStore.from_settings(settings.valkey_settings)
+        stack.push_async_callback(valkey.close)
 
         retriever = RetrieverClient.from_settings(settings.retriever_settings, settings.http_settings)
         stack.push_async_callback(retriever.close)
@@ -103,14 +98,25 @@ async def lifespan(app: FastAPI):
         _require_vector_size(retriever.dimension, settings.qdrant_settings.vector_size)
         await _require_dependency("tiler", tiler.check_connection())
         await _require_dependency("vlm", vlm.check_connection())
+        await _require_dependency("valkey", valkey.check_connection())
 
         # Refuse to serve an unrelated Tiler/Qdrant pair; bind a fresh collection.
         render_version = await enforce_binding(store, tiler, secret_hash(settings.db_secret))
         # Reconcile depends on these indexed metadata fields being declared in the tiler.
         await enforce_metadata_schema(tiler)
 
+        # This process's lease: everything it holds cluster-wide hangs on it. The
+        # heartbeat is cancelled after the jobs below, and the lease handed back last.
+        coordinator = Coordinator(valkey, store, process_ttl_sec=settings.coordination_settings.process_ttl_sec)
+        await coordinator.register()
+        stack.push_async_callback(coordinator.close)
+
+        heartbeat_task = asyncio.create_task(coordinator.heartbeat())
+        stack.push_async_callback(cancel, heartbeat_task)
+
         revision = RevisionManager(
             store,
+            coordinator,
             tiler,
             retriever,
             settings.enroll_settings,
@@ -118,8 +124,9 @@ async def lifespan(app: FastAPI):
         )
         stack.push_async_callback(revision.close)
 
-        # Repair any partial/orphaned enrolls left by an earlier crash before serving.
-        await reconcile(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
+        # Repair any partial/orphaned enrolls left by an earlier crash before serving
+        # (in the process leading reconcile).
+        await reconcile(store, coordinator, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
 
         # A collection embedded from another render_version answers chat with
         # RENDER_VERSION_MISMATCH until rebuilt; with the flag on it is rebuilt right away.
@@ -127,12 +134,13 @@ async def lifespan(app: FastAPI):
 
         # Registered last, so it is cancelled first — before the clients it uses close.
         reconcile_task = asyncio.create_task(
-            run_periodic(store, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
+            run_periodic(store, coordinator, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
         )
-        stack.push_async_callback(_cancel, reconcile_task)
+        stack.push_async_callback(cancel, reconcile_task)
 
         app.state.settings = settings
         app.state.store = store
+        app.state.coordinator = coordinator
         app.state.retriever = retriever
         app.state.tiler = tiler
         app.state.vlm = vlm
@@ -140,11 +148,12 @@ async def lifespan(app: FastAPI):
         app.state.revision = revision
 
         log.info(
-            "ready: qdrant=%s vector_size=%d collection=%s distance=%s retriever=%s tiler=%s vlm=%s model=%s render_version=%s",
+            "ready: qdrant=%s vector_size=%d collection=%s distance=%s valkey_prefix=%s retriever=%s tiler=%s vlm=%s model=%s render_version=%s",
             settings.qdrant_settings.base_url,
             settings.qdrant_settings.vector_size,
             settings.qdrant_settings.collection_name,
             settings.qdrant_settings.distance_type.value,
+            settings.valkey_settings.prefix,
             settings.retriever_settings.base_url,
             settings.tiler_settings.base_url,
             settings.vlm_settings.base_url,

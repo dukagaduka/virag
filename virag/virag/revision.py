@@ -1,17 +1,22 @@
 """Corpus revision: re-embed everything into a fresh collection and blue-green swap it in.
 
-Runs as one background job per process (a second request gets 409). Writes that land
-while it builds are not mirrored into the new collection; instead the store journals
-the doc_ids of every writer (enroll, self-heal) active at the start or starting before
-the swap, and the job syncs exactly those docs after the swap:
+One job at a time across every virag process: a job holds `revision:on` (the
+Coordinator) and any process answers its status; a second request gets 409, and a job
+whose process died is taken over by the next request. Writes that land while it builds
+are not mirrored into the new collection; instead every writer (enroll, self-heal)
+active at the start or starting meanwhile is journaled, and the job syncs exactly those
+docs after the swap:
 
-  1. Drop any leftover target, create `<serving>__vN+1`, start the journal.
+  1. Resolve the serving collection, drop any leftover target, create `<serving>__vN+1`,
+     start the journal.
   2. Re-embed every complete tiler doc into it (flat tile stream, failed docs retried).
      Docs still failing abort the job without a swap — the old collection keeps serving.
   3. Enforce `Qdrant ⊆ Tiler` on the new collection, stamp it with the tiler's
-     render_version, then swap the alias. The replaced collection is retained as the
-     rollback target; from now on writers hit the new one.
-  4. Stop the journal and wait (up to the pending TTL) for writers of the old collection.
+     render_version, check the job is still this process's, then swap the alias. The
+     replaced collection is retained as the rollback target; writers pinned from now
+     on write into the new one.
+  4. Read the journal, wait (up to the pending TTL) for writers pinned to the old
+     collection.
   5. Sync the journaled docs into the new collection, enforce the invariant once more.
 
 A collection is bound to the render_version its tiles were embedded from (collection
@@ -21,11 +26,10 @@ swap if the tiler's render_version changed meanwhile. It is how virag follows a 
 tiler render (by POST /revision, or at startup with VIRAG_REVISION_ON_RENDER_MISMATCH)
 and how a new retriever model is rolled out.
 
-A rollback repoints the alias to the retained collection, drops the abandoned one and
-syncs the docs enrolled since that collection was retired; it is refused when that
-collection was embedded from another render_version than the tiler's.
-
-The journal, lock and state live in this process: correct for a single virag replica.
+A rollback repoints the alias to the retained collection, waits for the writers of the
+abandoned one, drops it and syncs the docs enrolled since the retained one was retired;
+it is refused when that collection was embedded from another render_version than the
+tiler's.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ import time
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerService
+from virag.coordination import Coordinator
 from virag.errors import ApiError
 from virag.reconcile import embeddable, enforce_subset, reembed_docs, sync_docs
 from virag.settings import EnrollSettings, ReconcileSettings
@@ -46,73 +51,84 @@ log = logging.getLogger("virag.revision")
 
 
 class RevisionManager:
-    """Owns the background revision/rollback job and its observable status."""
+    """Runs this process's revision/rollback job; the job's lock and status live in the
+    Coordinator, so every process answers for the cluster."""
 
     def __init__(
         self,
         store: QdrantStore,
+        coordinator: Coordinator,
         tiler: TilerService,
         retriever: RetrieverClient,
         enroll_settings: EnrollSettings,
         reconcile_settings: ReconcileSettings,
     ):
 
-        self.store     = store
-        self.tiler     = tiler
-        self.retriever = retriever
+        self.store       = store
+        self.coordinator = coordinator
+        self.tiler       = tiler
+        self.retriever   = retriever
 
         self.batch_size    = enroll_settings.batch_size
         self.drain_timeout = reconcile_settings.pending_ttl_sec
 
+        # This process's job, if it runs one; `status` is what it publishes.
         self._task: asyncio.Task | None = None
-        self.status: dict = {"state": "idle"}
+        self.status: dict = {}
 
 
     @property
     def running(self) -> bool:
+        """Whether this process runs a job right now."""
         return self._task is not None and not self._task.done()
+
+
+    async def get_status(self) -> dict:
+        """The current or last job's status, whichever process runs it."""
+        return await self.coordinator.get_status()
 
 
     async def start(self) -> dict:
         """Launch a revision in the background; 409 while a job is already running or
         while the tiler is not serving."""
-        self._refuse_if_running()
-        render_version = await self._tiler_render_version()
+        async def prepare():
+            render_version = await self._tiler_render_version()
 
-        self._launch("revision", self._revise(render_version))
+            return self._revise(render_version)
 
-        return self.status
+        return await self._launch("revision", prepare)
 
 
     async def start_rollback(self) -> dict:
         """Launch a rollback to the retained collection; 409 while a job is running, or
         when that collection was embedded from another render_version than the tiler's."""
-        self._refuse_if_running()
+        async def prepare():
+            abandoned, restored = await self.store.resolve()
+            if restored is None:
+                raise ApiError(status_code=409, message="No previous collection to roll back to")
 
-        if self.store.previous_name is None:
-            raise ApiError(status_code=409, message="No previous collection to roll back to")
+            render_version = await self._tiler_render_version()
+            meta = await self.store.get_collection_metadata(collection=restored)
 
-        render_version = await self._tiler_render_version()
-        meta = await self.store.get_collection_metadata(collection=self.store.previous_name)
+            if meta.get("render_version") != render_version:
+                raise ApiError(
+                    status_code=409,
+                    message=f"Previous collection {restored} was embedded from "
+                            f"render_version {meta.get('render_version')} but the tiler renders "
+                            f"{render_version}; chat would answer RENDER_VERSION_MISMATCH",
+                )
 
-        if meta.get("render_version") != render_version:
-            raise ApiError(
-                status_code=409,
-                message=f"Previous collection {self.store.previous_name} was embedded from "
-                        f"render_version {meta.get('render_version')} but the tiler renders "
-                        f"{render_version}; chat would answer RENDER_VERSION_MISMATCH",
-            )
+            return self._rollback(abandoned, restored)
 
-        self._launch("rollback", self._rollback())
-
-        return self.status
+        return await self._launch("rollback", prepare)
 
 
     async def revise_if_stale(self, *, auto: bool) -> None:
         """Startup check: a collection embedded from another render_version than the
         tiler's answers chat with 409 RENDER_VERSION_MISMATCH until it is rebuilt. With
-        `auto` (VIRAG_REVISION_ON_RENDER_MISMATCH) the rebuild starts right here;
-        otherwise the mismatch is logged and left to POST /revision."""
+        `auto` (VIRAG_REVISION_ON_RENDER_MISMATCH) the rebuild starts right here, unless
+        another process already runs it; otherwise the mismatch is logged and left to
+        POST /revision."""
         render_version = await self._tiler_render_version()
         embedded = (await self.store.get_collection_metadata()).get("render_version")
 
@@ -127,12 +143,21 @@ class RevisionManager:
             "starting the revision" if auto else "POST /revision",
         )
 
-        if auto:
+        if not auto:
+            return
+
+        try:
             await self.start()
+
+        except ApiError as e:
+            if e.status_code != 409:
+                raise
+
+            log.info("revision: not started here: %s", e.message)
 
 
     async def close(self) -> None:
-        """Cancel a running job on shutdown; the next revision rebuilds from scratch."""
+        """Cancel this process's job on shutdown; the next revision rebuilds from scratch."""
         if not self.running:
             return
 
@@ -143,15 +168,6 @@ class RevisionManager:
 
         except asyncio.CancelledError:
             pass
-
-
-    def _refuse_if_running(self) -> None:
-        if self.running:
-            raise ApiError(
-                status_code=409,
-                message=f"A {self.status['kind']} is already running",
-                details={"status": self.status},
-            )
 
 
     async def _tiler_render_version(self) -> str:
@@ -170,15 +186,40 @@ class RevisionManager:
         return info.get("render_version")
 
 
-    def _launch(self, kind: str, job) -> None:
-        # Re-checked here: the checks before it awaited, so another job may have started.
-        if self.running:
-            job.close()
+    async def _launch(self, kind: str, prepare) -> dict:
+        """Take the job (409 while a live process holds it), run `prepare` under it — its
+        checks; a refusal hands the job back — and run the job it returns in the background."""
+        holder = await self.coordinator.acquire_revision()
+        if holder is not None:
+            raise ApiError(
+                status_code=409,
+                message=f"A {holder.get('kind', 'revision')} is already running",
+                details={"status": holder},
+            )
 
-        self._refuse_if_running()
+        job = None
 
-        self.status = {"kind": kind, "state": "running", "started_at": int(time.time())}
+        try:
+            job = await prepare()
+
+            self.status = {
+                "kind": kind,
+                "state": "running",
+                "started_at": int(time.time()),
+                "owner": self.coordinator.identity,
+            }
+            await self.coordinator.set_status(self.status)
+
+        except BaseException:
+            if job is not None:
+                job.close()                                         # never started
+
+            await self.coordinator.release_revision()
+            raise
+
         self._task = asyncio.create_task(self._guarded(job))
+
+        return self.status
 
 
     async def _guarded(self, job) -> None:
@@ -194,6 +235,20 @@ class RevisionManager:
             log.exception("%s failed", self.status["kind"])
             self._finish("failed", error=repr(e))
 
+        finally:
+            try:
+                await self.coordinator.set_status(self.status)
+                await self.coordinator.release_revision()
+
+            except Exception as e:  # noqa: BLE001 - the job's own outcome is already logged
+                log.error("%s: cannot publish the outcome or release the job: %r", self.status["kind"], e)
+
+
+    async def _update(self, **fields) -> None:
+        """Record progress and publish it."""
+        self.status.update(fields)
+        await self.coordinator.set_status(self.status)
+
 
     def _finish(self, state: str, **fields) -> None:
         self.status.update(fields, state=state, finished_at=int(time.time()))
@@ -201,12 +256,15 @@ class RevisionManager:
 
     async def _revise(self, render_version: str) -> None:
         store = self.store
+        coordinator = self.coordinator
 
-        target = await store.create_revision_collection()
-        self.status.update(collection=target, render_version=render_version)
+        old, stale_previous = await store.resolve()
+
+        target = await store.create_revision_collection(old)
+        await self._update(collection=target, render_version=render_version, phase="building")
         log.info("revision: building %s from render_version %s", target, render_version)
 
-        store.start_journal()
+        await coordinator.start_journal()
         swapped = False
 
         try:
@@ -214,7 +272,7 @@ class RevisionManager:
             complete = [doc for doc in docs if embeddable(doc)]
 
             # Incomplete or quarantined docs have no servable tiles; leave them for a re-enroll.
-            self.status.update(total=len(docs), skipped=len(docs) - len(complete))
+            await self._update(total=len(docs), skipped=len(docs) - len(complete))
 
             failed = await reembed_docs(
                 store,
@@ -237,7 +295,7 @@ class RevisionManager:
 
                 return
 
-            await enforce_subset(store, self.tiler, collection=target)
+            await enforce_subset(store, coordinator, self.tiler, collection=target)
 
             # The vectors must match what the tiler renders now, not when the job began.
             current = await self._tiler_render_version()
@@ -252,14 +310,17 @@ class RevisionManager:
 
             await store.set_collection_metadata({"render_version": render_version}, collection=target)
 
-            old = store.physical_name
-            await store.swap_alias(target)
+            # Fencing: a process whose lease expired may already have been replaced by another.
+            if not await coordinator.owns_revision():
+                self._finish("failed", error="the job was lost (this process's lease expired); alias not swapped")
+
+                return
+
+            await store.swap_alias(target, old, stale_previous)
             swapped = True
             log.info("revision: alias now → %s (previous %s retained)", target, old)
 
         finally:
-            journal = store.stop_journal()
-
             if not swapped:
                 try:
                     await store.drop_collection(target)
@@ -267,7 +328,10 @@ class RevisionManager:
                 except Exception as e:  # noqa: BLE001 - never mask the original outcome
                     log.error("revision: cannot drop aborted build %s: %r", target, e)
 
-        if not await store.drain(old, self.drain_timeout):
+        journal = await coordinator.journal()
+        await self._update(phase="syncing")
+
+        if not await coordinator.drain(old, self.drain_timeout):
             log.warning("revision: writers of %s still running after %ss; reconcile will pick them up", old, self.drain_timeout)
 
         sync_failed = await sync_docs(
@@ -279,7 +343,7 @@ class RevisionManager:
             collection=target,
         )
 
-        await enforce_subset(store, self.tiler, collection=target)
+        await enforce_subset(store, coordinator, self.tiler, collection=target)
 
         self.status["synced"] = len(journal) - len(sync_failed)
         log.info("revision: done, %d doc(s) synced after the swap", self.status["synced"])
@@ -293,24 +357,29 @@ class RevisionManager:
         self._finish("succeeded")
 
 
-    async def _rollback(self) -> None:
+    async def _rollback(self, abandoned: str, restored: str) -> None:
         store = self.store
+        coordinator = self.coordinator
 
-        # Same journal as a revision: writers straddling the repoint wrote partly into
-        # the collection being dropped.
-        store.start_journal()
+        # Same journal as a revision: writers straddling the repoint wrote into the
+        # collection being dropped.
+        await coordinator.start_journal()
 
-        try:
-            restored, abandoned, retired_at = await store.rollback()
+        if not await coordinator.owns_revision():
+            self._finish("failed", error="the job was lost (this process's lease expired); alias not repointed")
 
-        finally:
-            journal = store.stop_journal()
+            return
 
-        self.status.update(collection=restored, abandoned=abandoned)
-        log.warning("rollback: alias now → %s, dropped %s", restored, abandoned)
+        retired_at = await store.rollback_alias(restored)
+        journal = await coordinator.journal()
 
-        if not await store.drain(abandoned, self.drain_timeout):
+        await self._update(collection=restored, abandoned=abandoned, phase="syncing")
+        log.warning("rollback: alias now → %s; dropping %s once its writers are done", restored, abandoned)
+
+        if not await coordinator.drain(abandoned, self.drain_timeout):
             log.warning("rollback: writers of %s still running after %ss; reconcile will pick them up", abandoned, self.drain_timeout)
+
+        await store.drop_collection(abandoned)
 
         # Docs enrolled after the original swap exist only in the dropped collection.
         missed = journal | {
@@ -325,9 +394,10 @@ class RevisionManager:
             self.retriever,
             missed,
             batch_size=self.batch_size,
+            collection=restored,
         )
 
-        await enforce_subset(store, self.tiler)
+        await enforce_subset(store, coordinator, self.tiler, collection=restored)
 
         self.status["synced"] = len(missed) - len(sync_failed)
 

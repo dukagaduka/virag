@@ -37,4 +37,6 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://localhost:8080/health || exit 1
 
-CMD ["uvicorn", "virag.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+# --timeout-graceful-shutdown stays under compose's stop_grace_period, so a long stream
+# open at `docker stop` cannot hold the shutdown (and the lease release) past SIGKILL.
+CMD ["uvicorn", "virag.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--timeout-graceful-shutdown", "20"]
