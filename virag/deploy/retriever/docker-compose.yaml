@@ -8,6 +8,11 @@ services:
 
     ports:
       - "${RETRIEVER_DEPLOY_HOST}:${RETRIEVER_DEPLOY_PORT}:8000"
+
+    # The bearer key the server requires on /v1/*; the healthcheck sends it too.
+    environment:
+      VLLM_API_KEY: ${RETRIEVER_DEPLOY_API_KEY}
+
     volumes:
       - ${RETRIEVER_DEPLOY_MODEL_PATH}:/model:ro
       # LoRA adapter — internal path is the constant /adapter; only the host path
@@ -23,7 +28,7 @@ services:
     restart: unless-stopped
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$VLLM_API_KEY\" http://localhost:8000/v1/models >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 60

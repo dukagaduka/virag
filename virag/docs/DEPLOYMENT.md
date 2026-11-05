@@ -46,9 +46,10 @@ the host: set `RETRIEVER_BASE_URL=http://host.docker.internal:<RETRIEVER_DEPLOY_
 `deploy/service/docker-compose.yaml`. If the retriever server runs on another machine, point
 `RETRIEVER_BASE_URL` at its address instead.
 
-In `deploy/service/.env` also set `RETRIEVER_MODEL_NAME` and `RETRIEVER_API_KEY` to the values
-of `SERVED_MODEL_NAME` and `API_KEY` in `serve_retriever.sh`; virag checks at startup that
-the server advertises that model and refuses to boot otherwise.
+In `deploy/service/.env` also set `RETRIEVER_MODEL_NAME` to `SERVED_MODEL_NAME` in
+`serve_retriever.sh` and `RETRIEVER_API_KEY` to `RETRIEVER_DEPLOY_API_KEY` in
+`deploy/retriever/.env`; virag checks at startup that the server advertises that model and
+refuses to boot otherwise.
 
 `virag` `depends_on` the tiler, Qdrant and Valkey only; the retriever server is outside the stack,
 so virag has `restart: unless-stopped` and retries until its dependency checks (including
@@ -69,13 +70,13 @@ Variables live in three places:
   `deploy/service/.env` (from [`.env.example`](../deploy/service/.env.example)) holds the
   application settings above together with the service-stack deploy variables;
   `deploy/retriever/.env` (from [`.env.example`](../deploy/retriever/.env.example)) holds
-  only the retriever deploy variables.
+  the retriever deploy variables, among them the server's bearer key
+  `RETRIEVER_DEPLOY_API_KEY` (passed in as `VLLM_API_KEY`; the healthcheck sends it too).
 - **vLLM serving parameters** — *not* in `.env`. They are written out, with a comment per
   parameter, directly in `deploy/retriever/serve_retriever.sh`. The tracked
   [`serve_retriever.example.sh`](../deploy/retriever/serve_retriever.example.sh) holds
   baseline values; copy it to `serve_retriever.sh` (git-ignored) and tune it for your
-  GPU. Keep `SERVED_MODEL_NAME` and `API_KEY` there in sync with virag's
-  `RETRIEVER_MODEL_NAME` and `RETRIEVER_API_KEY`.
+  GPU. Keep `SERVED_MODEL_NAME` there in sync with virag's `RETRIEVER_MODEL_NAME`.
 
 Set `TILER_DB_SECRET` to the **same** value it has on the tiler and (implicitly) the
 Qdrant collection — one secret, three consumers — *before* first boot. See

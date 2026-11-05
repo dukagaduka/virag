@@ -44,9 +44,10 @@ PORT="8000"
 # Порт OpenAI-compatible API внутри контейнера.
 # Наружу он пробрасывается через RERANKER_DEPLOY_PORT в .env, здесь менять не нужно.
 
-API_KEY="dummy"
-# Если строка непустая, сервер будет требовать Bearer token на /v1/*.
-# Оставь пустым для отключения авторизации.
+API_KEY="${VLLM_API_KEY:-}"
+# Bearer token, который сервер требует на /v1/*; пусто — без авторизации.
+# Задаётся в .env (RERANKER_DEPLOY_API_KEY): compose передаёт его в контейнер как
+# VLLM_API_KEY, им же ходит healthcheck. Здесь не меняй.
 
 SERVED_MODEL_NAME="qwen3-vl-reranker"
 # Имя модели, которое клиент указывает в поле "model".

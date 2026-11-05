@@ -34,10 +34,11 @@ PORT="8000"
 # Порт OpenAI-compatible API внутри контейнера.
 # Наружу он пробрасывается через RETRIEVER_DEPLOY_PORT в .env, здесь менять не нужно.
 
-API_KEY="dummy"
-# Если строка непустая, сервер будет требовать Bearer token на /v1/*.
-# Оставь пустым для отключения авторизации.
-# Должен совпадать с ключом, с которым virag ходит в этот endpoint.
+API_KEY="${VLLM_API_KEY:-}"
+# Bearer token, который сервер требует на /v1/*; пусто — без авторизации.
+# Задаётся в .env (RETRIEVER_DEPLOY_API_KEY): compose передаёт его в контейнер как
+# VLLM_API_KEY, им же ходит healthcheck. Здесь не меняй.
+# Должен совпадать с ключом, с которым virag ходит в этот endpoint (RETRIEVER_API_KEY).
 
 SERVED_MODEL_NAME="retriever-model"
 # Имя модели, которое клиент (virag) указывает в поле "model".
