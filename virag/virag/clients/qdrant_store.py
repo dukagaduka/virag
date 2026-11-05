@@ -212,8 +212,12 @@ class QdrantStore:
         self,
         vector: Sequence[float],
         *,
-        top_n: int = 5
+        top_k: int = 5,
+        score_threshold: float | None = None
     ) -> list[QueryResult]:
+        """The `top_k` points nearest to `vector`. Qdrant applies `score_threshold` by the
+        collection's distance: for cosine and dot it is a floor, for euclid and manhattan a
+        ceiling."""
 
         assert len(vector) == self.vector_size, (
             f"Vector size mismatch: got {len(vector)} but expected {self.vector_size}"
@@ -222,7 +226,8 @@ class QdrantStore:
         result = await self.qdrant.query_points(
             collection_name=self.serving_name,
             query=vector, # type: ignore
-            limit=top_n,
+            limit=top_k,
+            score_threshold=score_threshold,
             with_payload=True,
             with_vectors=False
         )

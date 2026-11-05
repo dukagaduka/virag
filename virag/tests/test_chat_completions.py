@@ -60,6 +60,32 @@ def test_rag_sources_in_json(make_client):
     assert sources[0] == {"name": "Doc A", "doc_id": "doc-a", "tile_num": 0, "score": 0.9}
 
 
+def test_rag_retriever_defaults_reach_qdrant(make_client):
+    store = _rag_store()
+    client = make_client(vlm=FakeVLM(), store=store, retriever=FakeRetriever(), tiler=FakeTiler())
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "q"}], "rag": True,
+    })
+
+    assert r.status_code == 200
+    assert store.queries == [{"top_k": 5, "score_threshold": None}]   # RETRIEVER_TOP_K / RETRIEVER_THRESHOLD
+
+
+def test_rag_overrides_reach_qdrant(make_client):
+    store, tiler = _rag_store(), FakeTiler()
+    client = make_client(vlm=FakeVLM(), store=store, retriever=FakeRetriever(), tiler=tiler)
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "q"}],
+        "rag": {"top_k": 1, "retriever_threshold": 0.5},
+    })
+
+    assert r.status_code == 200
+    assert store.queries == [{"top_k": 1, "score_threshold": 0.5}]    # the threshold is Qdrant's, not ours
+    assert tiler.get_tile_calls == [("doc-a", 0)]
+
+
 def test_rag_integrity_mismatch_skips_tile(make_client):
     # a hit whose stored image_hash does NOT match what the tiler regenerates
     bad_hit = FakeHit(score=0.9, payload={

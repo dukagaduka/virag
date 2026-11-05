@@ -57,8 +57,8 @@ That's it — open a new chat and the two `virag (…)` models are in the select
 | `VIRAG_BASE_URL` | `http://virag:8080` | Gateway base URL, no trailing slash. |
 | `VIRAG_API_KEY` | *(empty)* | Optional bearer token if the gateway is protected. |
 | `MODEL` | `my-vlm` | Upstream VLM name virag forwards to. |
-| `TOP_N` | `4` | Tiles to retrieve. Each tile is a page image ≈ a few hundred vision tokens; keep it modest — more tiles = a bigger, slower request and a longer prefill. |
-| `SCORE_THRESHOLD` | `0.25` | Drop Qdrant hits below this score. |
+| `TOP_K` | `4` | Candidate tiles to take from Qdrant (virag's `rag.top_k`). Each tile is a page image ≈ a few hundred vision tokens; keep it modest — more tiles = a bigger, slower request and a longer prefill. |
+| `RETRIEVER_THRESHOLD` | `0.25` | Minimum Qdrant score of a candidate (virag's `rag.retriever_threshold`). |
 | `FRAMING_TEXT` | *(empty)* | Prepended to injected tiles; blank = virag's server default. |
 | `SHOW_STATUS` | `true` | Show a "Retrieving…" / "Waiting for the model…" status line during RAG. |
 | `HEARTBEAT_SEC` | `10` | While waiting for the first token, re-emit a status this often (seconds) so a long prefill doesn't leave the stream silent and trip an idle disconnect. `0` disables. |
@@ -105,7 +105,7 @@ enough to see *which* document and page the model was grounded on.
 
 - **No citations appear.** (a) virag logged `rag retrieved: 0 hits` / `rag injected: 0
   tiles` — retrieval found nothing: the queried collection is empty, isn't the one you
-  enrolled into, or everything scored below `SCORE_THRESHOLD`. Enroll docs / lower the
+  enrolled into, or everything scored below `RETRIEVER_THRESHOLD`. Enroll docs / lower the
   threshold. (b) Your Open WebUI build uses the newer event type: in `virag_pipe.py`
   change `"type": "citation"` to `"type": "source"`.
 - **Answer cut off + `RemoteProtocolError` / `ReadTimeout` in logs.** The upstream VLM
@@ -116,7 +116,7 @@ enough to see *which* document and page the model was grounded on.
   VLM logs `aborted`.** The model's *prefill* (time-to-first-token) is long — common with
   several page-image tiles — and the delivery channel idled out during the silence. The
   `HEARTBEAT_SEC` keep-alive is meant to prevent exactly this; if it still happens, lower
-  `HEARTBEAT_SEC` (e.g. 5) and/or `TOP_N` so the first token arrives sooner.
+  `HEARTBEAT_SEC` (e.g. 5) and/or `TOP_K` so the first token arrives sooner.
 - **`virag error 422`.** RAG on with no user text to build a query from, or a bad `rag`
   field — check the message content and valve types.
 - **`virag error 502` / connection errors.** `VIRAG_BASE_URL` isn't reachable from the

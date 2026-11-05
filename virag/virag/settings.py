@@ -63,12 +63,11 @@ class _UpstreamSettings(_Section):
 
 
 class RagSettings(_Section):
-    """RAG defaults; a request's own `rag` object overrides them."""
+    """How retrieved tiles are framed in the prompt; a request's own `rag` object overrides it.
+    How many tiles are retrieved, and how close they must be, is set in `RetrieverSettings`."""
 
     model_config = SettingsConfigDict(env_prefix="VIRAG_")
 
-    top_n: int = Field(5, ge=1)
-    score_threshold: float | None = None        # unset = no threshold
     framing_text: str = _DEFAULT_FRAMING_TEXT
 
 
@@ -115,7 +114,9 @@ class ValkeySettings(_Section):
 
 
 class RetrieverSettings(_UpstreamSettings):
-    """The retrieval embedding model behind an OpenAI-compatible `/embeddings` API."""
+    """The retrieval embedding model behind an OpenAI-compatible `/embeddings` API, and
+    what a RAG query takes from Qdrant (a request's `rag` object overrides `top_k` and
+    `threshold`)."""
 
     model_config = SettingsConfigDict(env_prefix="RETRIEVER_")
 
@@ -127,6 +128,8 @@ class RetrieverSettings(_UpstreamSettings):
     max_concurrency: int = Field(32, ge=0)      # bulk (ingest) calls only; queries bypass it
     bulk_priority: int = Field(0, ge=0)         # 0 = never send vLLM `priority`
     image_batching: Literal["auto", "on", "off"] = "auto"
+    top_k: int = Field(5, ge=1)                 # candidates per RAG query
+    threshold: float | None = None              # min Qdrant score of a candidate; unset = no threshold
 
 
 class TilerSettings(_UpstreamSettings):

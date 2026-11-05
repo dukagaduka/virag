@@ -58,6 +58,22 @@ def test_zero_backoff_is_made_positive_for_grpc():
     assert policy["initialBackoff"] == "0.010s" and policy["maxBackoff"] == "0.010s"
 
 
+def test_query_hands_top_k_and_threshold_to_qdrant(monkeypatch):
+    store = _store()
+    calls = []
+
+    async def query_points(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(points=[SimpleNamespace(id=1, score=0.7, payload={"doc_id": "d"})])
+
+    monkeypatch.setattr(store.qdrant, "query_points", query_points)
+
+    hits = asyncio.run(store.query([0.0] * 4, top_k=3, score_threshold=0.25))
+
+    assert calls[0]["limit"] == 3 and calls[0]["score_threshold"] == 0.25
+    assert [(hit.id, hit.score) for hit in hits] == [(1, 0.7)]
+
+
 @pytest.mark.parametrize("code", [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED])
 def test_unreachable_qdrant_becomes_503(monkeypatch, code):
     store = _store()

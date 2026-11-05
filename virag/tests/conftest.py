@@ -90,9 +90,13 @@ class FakeStore:
         self.dropped: list[str] = []
         self.rollback_retired_at = 0
         self.on_build = None                                  # async hook, runs as a revision builds
+        self.queries: list[dict] = []
 
-    async def query(self, vector, top_n):
-        return self._hits[:top_n]
+    async def query(self, vector, *, top_k=5, score_threshold=None):
+        self.queries.append({"top_k": top_k, "score_threshold": score_threshold})
+        hits = [hit for hit in self._hits if score_threshold is None or hit.score >= score_threshold]
+
+        return hits[:top_k]
 
     async def upsert(self, vectors, payloads, ids=None, wait=True, collection=None):
         self.upserts.append({"vectors": vectors, "payloads": payloads, "ids": ids, "collection": collection})
@@ -405,7 +409,7 @@ def _json_bytes(obj) -> bytes:
 # ---------------------------------------------------------------------------
 
 def make_settings(**overrides) -> Settings:
-    rag = overrides.pop("rag_settings", RagSettings(top_n=5, score_threshold=None, framing_text="FRAME"))
+    rag = overrides.pop("rag_settings", RagSettings(framing_text="FRAME"))
     return Settings(
         host="127.0.0.1",
         port=8080,
@@ -421,7 +425,7 @@ def make_settings(**overrides) -> Settings:
         retriever_settings=RetrieverSettings(
             base_url="http://retriever/v1", model_name="retriever", api_key="k-retriever", batch_size=16,
             max_concurrency=0, bulk_priority=0, image_batching="auto", timeout_sec=60,
-            connect_timeout_sec=10, max_connections=100, max_retries=0,
+            connect_timeout_sec=10, max_connections=100, max_retries=0, top_k=5, threshold=None,
         ),
         tiler_settings=TilerSettings(
             base_url="http://tiler", max_concurrency=0, timeout_sec=120, connect_timeout_sec=10, max_connections=100, max_retries=0,

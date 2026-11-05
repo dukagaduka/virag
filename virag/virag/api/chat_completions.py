@@ -30,7 +30,7 @@ async def chat_completions(request: Request):
     body = await _read_body(request)
     settings = request.app.state.settings
 
-    rag_config = _rag_config(body.pop("rag", None), settings.rag_settings)
+    rag_config = _rag_config(body.pop("rag", None), settings.rag_settings, settings.retriever_settings)
 
     sources = None
     if rag_config is not None:
@@ -64,13 +64,13 @@ async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | N
             message="RAG is enabled but no user text was found to build the query",
         )
 
-    log.info("rag query: top_n=%d threshold=%s preview=%r", config["top_n"], config["score_threshold"], query[:120])
+    log.info(
+        "rag query: top_k=%d retriever_threshold=%s preview=%r",
+        config["top_k"], config["retriever_threshold"], query[:120],
+    )
 
     vector = (await retriever.embed_texts([query]))[0]
-    hits = await store.query(vector, top_n=config["top_n"])
-
-    if config["score_threshold"] is not None:
-        hits = [hit for hit in hits if hit.score >= config["score_threshold"]]
+    hits = await store.query(vector, top_k=config["top_k"], score_threshold=config["retriever_threshold"])
 
     log.info("rag retrieved: %d hits", len(hits))
 
@@ -312,18 +312,14 @@ async def _read_body(request: Request) -> dict:
     return body
 
 
-def _rag_config(raw, defaults) -> dict | None:
-    """Normalize the `rag` trigger into a config dict, or None when RAG is off."""
+def _rag_config(raw, rag, retriever) -> dict | None:
+    """Normalize the `rag` trigger into a config dict, or None when RAG is off; what the
+    request leaves out comes from the `rag` and `retriever` settings."""
     if raw is None or raw is False:
         return None
 
     if raw is True:
-        return {
-            "top_n": defaults.top_n,
-            "score_threshold": defaults.score_threshold,
-            "framing_text": defaults.framing_text,
-            "include_sources": False,
-        }
+        raw = {}
 
     if not isinstance(raw, dict):
         raise ApiError(
@@ -331,21 +327,23 @@ def _rag_config(raw, defaults) -> dict | None:
             message="`rag` must be an object or a boolean",
         )
 
-    top_n = raw.get("top_n", defaults.top_n)
-    if not isinstance(top_n, int) or isinstance(top_n, bool) or top_n < 1:
+    top_k = raw.get("top_k", retriever.top_k)
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
         raise ApiError(
             status_code=422,
-            message="`rag.top_n` must be a positive integer",
+            message="`rag.top_k` must be a positive integer",
         )
 
-    threshold = raw.get("score_threshold", defaults.score_threshold)
-    if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float))):
+    retriever_threshold = raw.get("retriever_threshold", retriever.threshold)
+    if retriever_threshold is not None and (
+        isinstance(retriever_threshold, bool) or not isinstance(retriever_threshold, (int, float))
+    ):
         raise ApiError(
             status_code=422,
-            message="`rag.score_threshold` must be a number or null",
+            message="`rag.retriever_threshold` must be a number or null",
         )
 
-    framing_text = raw.get("framing_text", defaults.framing_text)
+    framing_text = raw.get("framing_text", rag.framing_text)
     if not isinstance(framing_text, str):
         raise ApiError(
             status_code=422,
@@ -353,8 +351,8 @@ def _rag_config(raw, defaults) -> dict | None:
         )
 
     return {
-        "top_n": top_n,
-        "score_threshold": threshold,
+        "top_k": top_k,
+        "retriever_threshold": retriever_threshold,
         "framing_text": framing_text,
         "include_sources": bool(raw.get("include_sources", False)),
     }

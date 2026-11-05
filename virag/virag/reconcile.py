@@ -81,7 +81,7 @@ async def enforce_subset(
     dangling = qdrant_ids - {doc["doc_id"] for doc in docs}
 
     # A quarantined doc's tiles answer 410, so its points only crowd live hits out of
-    # top_n. One being written right now is a re-enroll lifting the quarantine.
+    # top_k. One being written right now is a re-enroll lifting the quarantine.
     quarantined = {doc["doc_id"] for doc in docs if doc.get("quarantined")} & qdrant_ids
     quarantined -= await coordinator.writing()
 

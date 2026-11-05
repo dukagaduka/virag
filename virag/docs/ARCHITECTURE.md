@@ -44,9 +44,9 @@ OpenAI-compatible SDK via `extra_body`, which flattens to top-level JSON.
 `rag` is normalized (`_rag_config`) into a config or `None`:
 
 - absent / `false` → RAG off.
-- `true` → RAG on with server defaults (`VIRAG_TOP_N`, `VIRAG_SCORE_THRESHOLD`,
+- `true` → RAG on with server defaults (`RETRIEVER_TOP_K`, `RETRIEVER_THRESHOLD`,
   `VIRAG_FRAMING_TEXT`), `include_sources=false`.
-- an object → per-request overrides: `top_n`, `score_threshold`, `framing_text`,
+- an object → per-request overrides: `top_k`, `retriever_threshold`, `framing_text`,
   `include_sources`. Each is validated; a bad type is a `422`.
 
 ## 3. The retrieval pipeline
@@ -57,7 +57,9 @@ When RAG is on, `_run_rag` runs before the upstream call:
    text parts of multimodal content. No user text → `422` (RAG was asked for but there
    is nothing to retrieve on).
 2. **Embed.** One text embedding via the retriever client (`embed_texts`).
-3. **Search.** Qdrant top-`N`; if `score_threshold` is set, drop hits below it.
+3. **Search.** Qdrant top-`K` (`top_k`); a `retriever_threshold` goes into the same
+   query as Qdrant's `score_threshold`, so Qdrant applies it by the collection's
+   distance (a floor for `Cosine`/`Dot`, a ceiling for `Euclid`/`Manhattan`).
 4. **Fetch tiles.** For each hit, call doc-tiler `GET /get_tile?doc_id&tile_num`
    (concurrently) and base64-encode the JPEG. A tile the tiler refuses (`404`, `410`,
    its own hash `409`, …) is logged and **skipped**, not fatal. A tiler that is
@@ -239,7 +241,7 @@ the one process leading it (§10). Two passes:
    This is also how a document deleted from the tiler gets its stale points removed
    (delete-propagation) — on the next reconcile pass. Points of a doc the tiler
    quarantined go too: its tiles answer `410`, so they would only crowd live hits out
-   of `top_n`. A doc with a write in flight anywhere in the cluster (a re-enroll lifting
+   of `top_k`. A doc with a write in flight anywhere in the cluster (a re-enroll lifting
    the quarantine) is left alone; a re-enroll brings the points back.
 2. *Clear stale pending.* Find docs with `virag_enrolled_at == 0` **and**
    `virag_started_at < now − VIRAG_PENDING_TTL_SEC` (the TTL gate skips in-flight

@@ -33,13 +33,13 @@ class Pipe:
             default="my-vlm",
             description="Upstream VLM model name virag should call.",
         )
-        TOP_N: int = Field(
+        TOP_K: int = Field(
             default=4,
-            description="Tiles to retrieve.",
+            description="Candidate tiles to take from Qdrant.",
         )
-        SCORE_THRESHOLD: float = Field(
+        RETRIEVER_THRESHOLD: float = Field(
             default=0.25,
-            description="Drop hits below this Qdrant score.",
+            description="Minimum Qdrant score of a candidate.",
         )
         FRAMING_TEXT: str = Field(
             default="",
@@ -82,8 +82,8 @@ class Pipe:
 
         if use_rag:
             rag = {
-                "top_n": self.valves.TOP_N,
-                "score_threshold": self.valves.SCORE_THRESHOLD,
+                "top_k": self.valves.TOP_K,
+                "retriever_threshold": self.valves.RETRIEVER_THRESHOLD,
                 "include_sources": True,
             }
 

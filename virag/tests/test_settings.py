@@ -21,7 +21,7 @@ def _base_env(monkeypatch):
 _ALL_KEYS = {
     "VIRAG_SELF_HEAL", "VIRAG_RECONCILE_INTERVAL_SEC", "VIRAG_PENDING_TTL_SEC",
     "QDRANT_GRPC_PORT", "QDRANT_TIMEOUT_SEC", "QDRANT_MAX_RETRIES", "QDRANT_CHUNK_SIZE", "QDRANT_MAX_BATCH_CHUNKS",
-    "VIRAG_HOST", "VIRAG_PORT", "TILER_DB_SECRET", "VIRAG_TOP_N", "VIRAG_SCORE_THRESHOLD",
+    "VIRAG_HOST", "VIRAG_PORT", "TILER_DB_SECRET", "RETRIEVER_TOP_K", "RETRIEVER_THRESHOLD",
     "VIRAG_FRAMING_TEXT", "QDRANT_BASE_URL", "QDRANT_COLLECTION_NAME", "QDRANT_VECTOR_SIZE",
     "QDRANT_DISTANCE_TYPE", "RETRIEVER_BASE_URL", "RETRIEVER_MODEL_NAME", "RETRIEVER_API_KEY",
     "RETRIEVER_BATCH_SIZE", "RETRIEVER_MAX_CONCURRENCY", "RETRIEVER_BULK_PRIORITY",
@@ -42,8 +42,8 @@ def test_defaults(monkeypatch):
     assert s.host == "127.0.0.1"
     assert s.port == 8080
     assert s.db_secret == ""
-    assert s.rag_settings.top_n == 5
-    assert s.rag_settings.score_threshold is None
+    assert s.retriever_settings.top_k == 5
+    assert s.retriever_settings.threshold is None
     assert s.rag_settings.framing_text == _DEFAULT_FRAMING_TEXT
     assert s.qdrant_settings.vector_size == 768
     assert s.qdrant_settings.distance_type == Distance.COSINE
@@ -68,31 +68,31 @@ def test_port_bounds(monkeypatch):
         Settings.from_env()
 
 
-def test_top_n_must_be_positive(monkeypatch):
+def test_top_k_must_be_positive(monkeypatch):
     _base_env(monkeypatch)
-    monkeypatch.setenv("VIRAG_TOP_N", "0")
+    monkeypatch.setenv("RETRIEVER_TOP_K", "0")
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError, match="RETRIEVER_TOP_K"):
         Settings.from_env()
 
 
-def test_score_threshold_empty_is_none(monkeypatch):
+def test_retriever_threshold_empty_is_none(monkeypatch):
     _base_env(monkeypatch)
-    monkeypatch.setenv("VIRAG_SCORE_THRESHOLD", "")
-    assert Settings.from_env().rag_settings.score_threshold is None
+    monkeypatch.setenv("RETRIEVER_THRESHOLD", "")
+    assert Settings.from_env().retriever_settings.threshold is None
 
 
-def test_score_threshold_parsed(monkeypatch):
+def test_retriever_threshold_parsed(monkeypatch):
     _base_env(monkeypatch)
-    monkeypatch.setenv("VIRAG_SCORE_THRESHOLD", "0.42")
-    assert Settings.from_env().rag_settings.score_threshold == pytest.approx(0.42)
+    monkeypatch.setenv("RETRIEVER_THRESHOLD", "0.42")
+    assert Settings.from_env().retriever_settings.threshold == pytest.approx(0.42)
 
 
-def test_score_threshold_bad_float(monkeypatch):
+def test_retriever_threshold_bad_float(monkeypatch):
     _base_env(monkeypatch)
-    monkeypatch.setenv("VIRAG_SCORE_THRESHOLD", "high")
+    monkeypatch.setenv("RETRIEVER_THRESHOLD", "high")
 
-    with pytest.raises(SettingsError):
+    with pytest.raises(SettingsError, match="RETRIEVER_THRESHOLD"):
         Settings.from_env()
 
 

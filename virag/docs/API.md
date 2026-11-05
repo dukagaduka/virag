@@ -29,15 +29,15 @@ Put it at the top level of the request body. With an OpenAI SDK, pass it via
 | Form | Effect |
 |---|---|
 | absent / `false` | RAG off — plain passthrough. |
-| `true` | RAG on with server defaults (`VIRAG_TOP_N`, `VIRAG_SCORE_THRESHOLD`, `VIRAG_FRAMING_TEXT`), no sources. |
+| `true` | RAG on with server defaults (`RETRIEVER_TOP_K`, `RETRIEVER_THRESHOLD`, `VIRAG_FRAMING_TEXT`), no sources. |
 | object | RAG on with overrides. |
 
 `rag` object fields (all optional):
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `top_n` | positive int | `VIRAG_TOP_N` | Tiles to retrieve. |
-| `score_threshold` | number \| null | `VIRAG_SCORE_THRESHOLD` | Drop hits below this Qdrant score. |
+| `top_k` | positive int | `RETRIEVER_TOP_K` | Candidate tiles to take from Qdrant. |
+| `retriever_threshold` | number \| null | `RETRIEVER_THRESHOLD` | Minimum Qdrant score of a candidate, applied by Qdrant in the search (a floor for `Cosine`/`Dot`, a ceiling for `Euclid`/`Manhattan`); `null` = none. |
 | `framing_text` | string | `VIRAG_FRAMING_TEXT` | Text prepended to the injected tiles. |
 | `include_sources` | bool | `false` | Return the `sources` array (below). |
 
@@ -63,7 +63,7 @@ curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -
 curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "my-vlm",
   "messages": [{"role": "user", "content": "What was Q3 revenue?"}],
-  "rag": {"top_n": 8, "score_threshold": 0.35, "include_sources": true}
+  "rag": {"top_k": 8, "retriever_threshold": 0.35, "include_sources": true}
 }' | jq
 ```
 
@@ -73,7 +73,7 @@ Python (OpenAI SDK):
 client.chat.completions.create(
     model="my-vlm",
     messages=[{"role": "user", "content": "What was Q3 revenue?"}],
-    extra_body={"rag": {"top_n": 8, "include_sources": True}},
+    extra_body={"rag": {"top_k": 8, "include_sources": True}},
 )
 ```
 

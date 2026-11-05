@@ -34,12 +34,12 @@ checks the version at startup.
 ## RAG defaults
 
 These are the fallbacks when a request sends `rag: true`; a `rag` **object** overrides
-them per request (see [API.md](API.md)).
+them per request (see [API.md](API.md)). How many tiles a query takes and how close
+they must be are the retriever's: `RETRIEVER_TOP_K` and `RETRIEVER_THRESHOLD`
+([Retriever](#retriever-openai-compatible-embeddings-eg-vllm)).
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `VIRAG_TOP_N` | no | `5` | Number of tiles to retrieve (≥ 1). |
-| `VIRAG_SCORE_THRESHOLD` | no | *(none)* | Minimum Qdrant score; empty/unset = no threshold. Must parse as a float. |
 | `VIRAG_FRAMING_TEXT` | no | built-in prompt | Text prepended to retrieved tiles. Empty falls back to the built-in default ("The following image tiles are retrieved document context. Use them to answer the question."). |
 
 ## Enroll
@@ -131,6 +131,8 @@ passthrough proxies.
 | `RETRIEVER_TIMEOUT_SEC` | no | `60` | Per-read deadline: max silence between bytes (≥ 1). |
 | `RETRIEVER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `RETRIEVER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the retriever server (≥ 1). |
+| `RETRIEVER_TOP_K` | no | `5` | Candidate tiles a RAG query takes from Qdrant (≥ 1); all of them reach the VLM. Request override: `rag.top_k`. |
+| `RETRIEVER_THRESHOLD` | no | *(none)* | Minimum Qdrant score of a candidate; empty/unset = no threshold. Must parse as a float. Passed to Qdrant as `score_threshold`, so it follows `QDRANT_DISTANCE_TYPE`: a floor for `Cosine`/`Dot`, a ceiling for `Euclid`/`Manhattan`. Request override: `rag.retriever_threshold`. |
 | `RETRIEVER_MAX_RETRIES` | no | `3` | Retries for a transient failure (≥ 0). |
 
 ## Tiler (doc-tiler)

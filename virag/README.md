@@ -38,7 +38,7 @@ curl -s -X POST localhost:48000/enroll \
 curl -s localhost:48000/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "my-vlm",
   "messages": [{"role": "user", "content": "What was Q3 revenue?"}],
-  "rag": {"top_n": 8, "include_sources": true}
+  "rag": {"top_k": 8, "include_sources": true}
 }' | jq
 ```
 
