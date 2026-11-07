@@ -10,6 +10,7 @@ from virag.settings import Settings, SettingsError
 from virag.errors import ApiError, install_error_handlers
 from virag.responses import OrjsonResponse
 from virag.clients.qdrant_store import QdrantStore
+from virag.clients.reranker_client import RerankerClient
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerService
 from virag.clients.valkey_store import ValkeyStore
@@ -53,6 +54,32 @@ async def _require_dependency(name: str, coro) -> None:
         raise
 
 
+async def _check_reranker(reranker: RerankerClient | None, settings: Settings) -> None:
+    """The reranker is optional: off, or failing its check, it is logged and chat goes
+    on with the retriever's order until it answers."""
+    rs = settings.reranker_settings
+
+    if reranker is None:
+        ignored = sorted(f"RERANKER_{name.upper()}" for name in rs.model_fields_set - {"base_url"})
+        log.warning(
+            "reranker: off (RERANKER_BASE_URL unset); the VLM gets all RETRIEVER_TOP_K=%d candidates%s",
+            settings.retriever_settings.top_k,
+            f"; ignored: {', '.join(ignored)}" if ignored else "",
+        )
+
+        return
+
+    try:
+        await reranker.check_connection()
+        log.info("dependency ok: reranker (top_n=%d threshold=%s)", rs.top_n, rs.threshold)
+
+    except ApiError as e:
+        log.warning(
+            "reranker check failed, chat uses the retriever's order until it answers: %s | details=%s",
+            e.message, e.details,
+        )
+
+
 def _require_vector_size(dimension: int | None, vector_size: int) -> None:
     """The retriever's vectors must fit the collection, or the first upsert fails."""
     if dimension != vector_size:
@@ -83,6 +110,11 @@ async def lifespan(app: FastAPI):
         retriever = RetrieverClient.from_settings(settings.retriever_settings, settings.http_settings)
         stack.push_async_callback(retriever.close)
 
+        reranker = None
+        if settings.reranker_settings.enabled:
+            reranker = RerankerClient.from_settings(settings.reranker_settings, settings.http_settings)
+            stack.push_async_callback(reranker.close)
+
         tiler = TilerService.from_settings(settings.tiler_settings, settings.http_settings)
         stack.push_async_callback(tiler.close)
 
@@ -99,6 +131,7 @@ async def lifespan(app: FastAPI):
         await _require_dependency("tiler", tiler.check_connection())
         await _require_dependency("vlm", vlm.check_connection())
         await _require_dependency("valkey", valkey.check_connection())
+        await _check_reranker(reranker, settings)
 
         # Refuse to serve an unrelated Tiler/Qdrant pair; bind a fresh collection.
         render_version = await enforce_binding(store, tiler, secret_hash(settings.db_secret))
@@ -142,19 +175,21 @@ async def lifespan(app: FastAPI):
         app.state.store = store
         app.state.coordinator = coordinator
         app.state.retriever = retriever
+        app.state.reranker = reranker
         app.state.tiler = tiler
         app.state.vlm = vlm
         app.state.qdrant_http = qdrant_http
         app.state.revision = revision
 
         log.info(
-            "ready: qdrant=%s vector_size=%d collection=%s distance=%s valkey_prefix=%s retriever=%s tiler=%s vlm=%s model=%s render_version=%s",
+            "ready: qdrant=%s vector_size=%d collection=%s distance=%s valkey_prefix=%s retriever=%s reranker=%s tiler=%s vlm=%s model=%s render_version=%s",
             settings.qdrant_settings.base_url,
             settings.qdrant_settings.vector_size,
             settings.qdrant_settings.collection_name,
             settings.qdrant_settings.distance_type.value,
             settings.valkey_settings.prefix,
             settings.retriever_settings.base_url,
+            settings.reranker_settings.base_url or "off",
             settings.tiler_settings.base_url,
             settings.vlm_settings.base_url,
             settings.vlm_settings.model_name,

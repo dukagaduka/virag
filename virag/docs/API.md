@@ -29,20 +29,28 @@ Put it at the top level of the request body. With an OpenAI SDK, pass it via
 | Form | Effect |
 |---|---|
 | absent / `false` | RAG off — plain passthrough. |
-| `true` | RAG on with server defaults (`RETRIEVER_TOP_K`, `RETRIEVER_THRESHOLD`, `VIRAG_FRAMING_TEXT`), no sources. |
+| `true` | RAG on with server defaults (`RETRIEVER_TOP_K`, `RETRIEVER_THRESHOLD`, `RERANKER_TOP_N`, `RERANKER_THRESHOLD`, `VIRAG_FRAMING_TEXT`), no sources. |
 | object | RAG on with overrides. |
 
 `rag` object fields (all optional):
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `top_k` | positive int | `RETRIEVER_TOP_K` | Candidate tiles to take from Qdrant. |
+| `top_k` | positive int | `RETRIEVER_TOP_K` | Candidate tiles to take from Qdrant. Without a reranker they all reach the VLM. |
 | `retriever_threshold` | number \| null | `RETRIEVER_THRESHOLD` | Minimum Qdrant score of a candidate, applied by Qdrant in the search (a floor for `Cosine`/`Dot`, a ceiling for `Euclid`/`Manhattan`); `null` = none. |
+| `top_n` | positive int | `RERANKER_TOP_N` | With a reranker: tiles it passes to the VLM, best first; at most `top_k`. |
+| `reranker_threshold` | number in `[0, 1]` \| null | `RERANKER_THRESHOLD` | With a reranker: minimum relevance of a tile; `null` = none. |
 | `framing_text` | string | `VIRAG_FRAMING_TEXT` | Text prepended to the injected tiles. |
 | `include_sources` | bool | `false` | Return the `sources` array (below). |
 
-A wrong type on any of these is a `422`. RAG on but no user text to build a query from
-is also a `422`.
+A wrong type on any of these is a `422`, and so is a `top_n` above `top_k` while the
+reranker is on (without one, `top_n` and `reranker_threshold` are checked for type and
+otherwise ignored). RAG on but no user text to build a query from is also a `422`.
+
+With a reranker configured, the `top_k` candidates are scored against the query text and
+the VLM gets those at or above `reranker_threshold`, best first, at most `top_n`. A
+reranker that fails never fails the chat: that request takes the retriever's order, cut
+to `top_n`, and virag logs it (see [CONFIG.md](CONFIG.md#reranker-optional)).
 
 A retrieved tile the tiler refuses (gone, quarantined, or hashing differently than
 enrolled) is skipped. Two failures fail the whole request instead of answering without
@@ -63,7 +71,7 @@ curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -
 curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
   "model": "my-vlm",
   "messages": [{"role": "user", "content": "What was Q3 revenue?"}],
-  "rag": {"top_k": 8, "retriever_threshold": 0.35, "include_sources": true}
+  "rag": {"top_k": 16, "retriever_threshold": 0.2, "top_n": 4, "reranker_threshold": 0.1, "include_sources": true}
 }' | jq
 ```
 
@@ -79,8 +87,10 @@ client.chat.completions.create(
 
 ### Sources
 
-When `include_sources` is true, each injected tile is reported as
-`{name, doc_id, tile_num, score}` (`name` from the tile's `metadata.name`).
+When `include_sources` is true, each injected tile is reported, in prompt order, as
+`{name, doc_id, tile_num, score}` (`name` from the tile's `metadata.name`, `score` the
+Qdrant one), plus `rerank_score` for a tile the reranker scored (absent without a
+reranker, or when the request fell back to the retriever's order).
 
 - **Non-streaming:** added as a top-level `"sources"` key on the (200, JSON) response.
 - **Streaming (`"stream": true`):** delivered as a synthetic

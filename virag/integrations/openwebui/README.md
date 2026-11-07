@@ -57,8 +57,10 @@ That's it — open a new chat and the two `virag (…)` models are in the select
 | `VIRAG_BASE_URL` | `http://virag:8080` | Gateway base URL, no trailing slash. |
 | `VIRAG_API_KEY` | *(empty)* | Optional bearer token if the gateway is protected. |
 | `MODEL` | `my-vlm` | Upstream VLM name virag forwards to. |
-| `TOP_K` | `4` | Candidate tiles to take from Qdrant (virag's `rag.top_k`). Each tile is a page image ≈ a few hundred vision tokens; keep it modest — more tiles = a bigger, slower request and a longer prefill. |
-| `RETRIEVER_THRESHOLD` | `0.25` | Minimum Qdrant score of a candidate (virag's `rag.retriever_threshold`). |
+| `TOP_K` | `0` | Candidate tiles to take from Qdrant (virag's `rag.top_k`); `0` = virag's `RETRIEVER_TOP_K`. Without a reranker every candidate reaches the model — each tile is a page image ≈ a few hundred vision tokens, so keep it modest: more tiles = a bigger, slower request and a longer prefill. |
+| `RETRIEVER_THRESHOLD` | `0.25` | Minimum Qdrant score of a candidate (virag's `rag.retriever_threshold`); negative = virag's `RETRIEVER_THRESHOLD`. |
+| `TOP_N` | `0` | With a reranker on virag: tiles it passes to the model, at most the effective `TOP_K` (virag's `rag.top_n`); `0` = virag's `RERANKER_TOP_N`. |
+| `RERANKER_THRESHOLD` | `-1` | With a reranker on virag: minimum relevance, `0`–`1` (virag's `rag.reranker_threshold`); negative = virag's `RERANKER_THRESHOLD`. |
 | `FRAMING_TEXT` | *(empty)* | Prepended to injected tiles; blank = virag's server default. |
 | `SHOW_STATUS` | `true` | Show a "Retrieving…" / "Waiting for the model…" status line during RAG. |
 | `HEARTBEAT_SEC` | `10` | While waiting for the first token, re-emit a status this often (seconds) so a long prefill doesn't leave the stream silent and trip an idle disconnect. `0` disables. |
@@ -93,7 +95,8 @@ path is faster and cheaper.
 ## How sources show up
 
 After the answer streams in, each retrieved tile appears as a citation chip. The chip's
-preview carries `name`, `doc_id`, `tile_num`, `score` (from virag's `sources` entries).
+preview carries `name`, `doc_id`, `tile_num`, `score` and, for a reranked tile,
+`rerank_score` (from virag's `sources` entries).
 Citations render **text**, so the chip shows tile metadata rather than the image itself —
 enough to see *which* document and page the model was grounded on.
 
@@ -116,7 +119,8 @@ enough to see *which* document and page the model was grounded on.
   VLM logs `aborted`.** The model's *prefill* (time-to-first-token) is long — common with
   several page-image tiles — and the delivery channel idled out during the silence. The
   `HEARTBEAT_SEC` keep-alive is meant to prevent exactly this; if it still happens, lower
-  `HEARTBEAT_SEC` (e.g. 5) and/or `TOP_K` so the first token arrives sooner.
+  `HEARTBEAT_SEC` (e.g. 5) and/or the tiles sent (`TOP_N` with a reranker, `TOP_K` without)
+  so the first token arrives sooner.
 - **`virag error 422`.** RAG on with no user text to build a query from, or a bad `rag`
   field — check the message content and valve types.
 - **`virag error 502` / connection errors.** `VIRAG_BASE_URL` isn't reachable from the

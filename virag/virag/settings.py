@@ -132,6 +132,27 @@ class RetrieverSettings(_UpstreamSettings):
     threshold: float | None = None              # min Qdrant score of a candidate; unset = no threshold
 
 
+class RerankerSettings(_UpstreamSettings):
+    """The optional reranker that picks the tiles for the VLM out of the retriever's
+    candidates; off while `base_url` is unset (a request's `rag` object overrides
+    `top_n` and `threshold`)."""
+
+    model_config = SettingsConfigDict(env_prefix="RERANKER_")
+
+    base_url: str | None = None                 # the server root, without /v1; unset = no reranker
+    model_name: str = "reranker-model"
+    api_key: str = "dummy"
+    api: Literal["score", "rerank"] = "score"   # vLLM `/score` | Cohere/Jina-style `/v1/rerank`
+    timeout_sec: int = Field(30, ge=1)
+    batch_size: int = Field(8, ge=1)            # tiles per request
+    top_n: int = Field(5, ge=1)                 # tiles the VLM gets; at most RETRIEVER_TOP_K
+    threshold: float | None = Field(None, ge=0, le=1)  # min relevance of a tile; unset = no threshold
+
+    @property
+    def enabled(self) -> bool:
+        return self.base_url is not None
+
+
 class TilerSettings(_UpstreamSettings):
     model_config = SettingsConfigDict(env_prefix="TILER_")
 
@@ -194,12 +215,25 @@ class Settings(_Section):
     qdrant_settings: QdrantStoreSettings = Field(default_factory=QdrantStoreSettings)  # type: ignore[arg-type]
     valkey_settings: ValkeySettings = Field(default_factory=ValkeySettings)  # type: ignore[arg-type]
     retriever_settings: RetrieverSettings = Field(default_factory=RetrieverSettings)
+    reranker_settings: RerankerSettings = Field(default_factory=RerankerSettings)
     tiler_settings: TilerSettings = Field(default_factory=TilerSettings)
     vlm_settings: VLMSettings = Field(default_factory=VLMSettings)  # type: ignore[arg-type]
     enroll_settings: EnrollSettings = Field(default_factory=EnrollSettings)
     reconcile_settings: ReconcileSettings = Field(default_factory=ReconcileSettings)
     revision_settings: RevisionSettings = Field(default_factory=RevisionSettings)
     coordination_settings: CoordinationSettings = Field(default_factory=CoordinationSettings)
+
+    @model_validator(mode="after")
+    def _reranker_within_candidates(self) -> Settings:
+        # The reranker picks its tiles out of the retriever's candidates.
+        reranker, retriever = self.reranker_settings, self.retriever_settings
+
+        if reranker.enabled and reranker.top_n > retriever.top_k:
+            raise ValueError(
+                f"`RERANKER_TOP_N` ({reranker.top_n}) must not exceed `RETRIEVER_TOP_K` ({retriever.top_k})."
+            )
+
+        return self
 
 
     @classmethod
@@ -250,6 +284,7 @@ _SECTIONS: dict[str, type[BaseSettings]] = {
         QdrantStoreSettings,
         ValkeySettings,
         RetrieverSettings,
+        RerankerSettings,
         TilerSettings,
         VLMSettings,
         EnrollSettings,

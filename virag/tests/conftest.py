@@ -23,6 +23,7 @@ from virag.api import chat_completions as chat_api
 from virag.api import enroll as enroll_api
 from virag.api import ops as ops_api
 from virag.api import proxy as proxy_api
+from virag.clients.reranker_client import RerankerClient
 from virag.clients.tiler_client import Tile, TileResult, TilerService
 from virag.coordination import Coordinator
 from virag.errors import ApiError, install_error_handlers
@@ -33,6 +34,7 @@ from virag.settings import (
     QdrantStoreSettings,
     RagSettings,
     ReconcileSettings,
+    RerankerSettings,
     Settings,
     TilerSettings,
     ValkeySettings,
@@ -73,6 +75,23 @@ class FakeRetriever:
     async def embed_images(self, images, *, bulk=False):
         self.image_calls.append(list(images))
         return [[0.5] * self.dim for _ in images]
+
+
+class FakeReranker:
+    """Scores the i-th image of a call with `scores[i]`; `error` makes every call fail."""
+
+    rejected = staticmethod(RerankerClient.rejected)
+
+    def __init__(self, scores: list[float] | None = None, error: ApiError | None = None):
+        self._scores = scores or []
+        self._error = error
+        self.calls: list[tuple[str, int]] = []
+
+    async def score(self, query, base64_images, *, image_mime="image/jpeg"):
+        self.calls.append((query, len(base64_images)))
+        if self._error is not None:
+            raise self._error
+        return self._scores[:len(base64_images)]
 
 
 class FakeStore:
@@ -427,6 +446,7 @@ def make_settings(**overrides) -> Settings:
             max_concurrency=0, bulk_priority=0, image_batching="auto", timeout_sec=60,
             connect_timeout_sec=10, max_connections=100, max_retries=0, top_k=5, threshold=None,
         ),
+        reranker_settings=overrides.pop("reranker_settings", RerankerSettings(base_url=None)),
         tiler_settings=TilerSettings(
             base_url="http://tiler", max_concurrency=0, timeout_sec=120, connect_timeout_sec=10, max_connections=100, max_retries=0,
         ),
@@ -448,9 +468,9 @@ def make_store(settings: Settings | None = None):
     return QdrantStore.from_settings(settings.qdrant_settings, settings.http_settings)
 
 
-def build_app(*, settings=None, store=None, coordinator=None, retriever=None, tiler=None, vlm=None) -> FastAPI:
+def build_app(*, settings=None, store=None, coordinator=None, retriever=None, reranker=None, tiler=None, vlm=None) -> FastAPI:
     """The same routers as create_app(), but no lifespan — state is injected. A store
-    without a coordinator gets one of its own."""
+    without a coordinator gets one of its own; no reranker means it is off."""
     app = FastAPI()
     install_error_handlers(app)
     app.include_router(ops_api.router)
@@ -464,6 +484,7 @@ def build_app(*, settings=None, store=None, coordinator=None, retriever=None, ti
         app.state.coordinator = coordinator if coordinator is not None else make_coordinator(store)
     if retriever is not None:
         app.state.retriever = retriever
+    app.state.reranker = reranker
     if tiler is not None:
         app.state.tiler = tiler
     if vlm is not None:

@@ -4,8 +4,9 @@ All application configuration is read from environment variables at startup by
 `Settings.from_env()` (`virag/settings.py`). Four variables are **required** and abort
 startup if unset — `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME`, `VALKEY_URL`;
 everything else has a default. A ready-to-edit template — including the Compose/deployment
-variables — lives at [`deploy/service/.env.example`](../deploy/service/.env.example) and
-[`deploy/retriever/.env.example`](../deploy/retriever/.env.example).
+variables — lives at [`deploy/service/.env.example`](../deploy/service/.env.example),
+[`deploy/retriever/.env.example`](../deploy/retriever/.env.example) and
+[`deploy/reranker/.env.example`](../deploy/reranker/.env.example).
 
 Every variable, its default and its bounds are declared once, as pydantic-settings
 fields in `virag/settings.py`: each section reads its own prefix and a field's name is
@@ -35,8 +36,10 @@ checks the version at startup.
 
 These are the fallbacks when a request sends `rag: true`; a `rag` **object** overrides
 them per request (see [API.md](API.md)). How many tiles a query takes and how close
-they must be are the retriever's: `RETRIEVER_TOP_K` and `RETRIEVER_THRESHOLD`
-([Retriever](#retriever-openai-compatible-embeddings-eg-vllm)).
+they must be are set with the retriever (`RETRIEVER_TOP_K`, `RETRIEVER_THRESHOLD`) and
+the reranker (`RERANKER_TOP_N`, `RERANKER_THRESHOLD`) — see
+[Retriever](#retriever-openai-compatible-embeddings-eg-vllm) and
+[Reranker](#reranker-optional).
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
@@ -83,8 +86,9 @@ leases, the writers registry, the revision job and the reconcile lead. See
 | `VALKEY_MAX_CONNECTIONS` | no | `64` | Connection pool size (≥ 1). |
 | `VIRAG_PROCESS_TTL_SEC` | no | `30` | Lease TTL (≥ 3), renewed every third of it. A process silent this long counts as dead: its revision job, reconcile lead and writers are taken over or ignored. Lower = faster takeover, less tolerance for a stalled event loop or a Valkey blip. |
 
-The bulk concurrency caps (`RETRIEVER_MAX_CONCURRENCY`, `TILER_MAX_CONCURRENCY`) and
-`VLM_MAX_CONCURRENCY` are per process: N processes allow N times as much.
+The bulk concurrency caps (`RETRIEVER_MAX_CONCURRENCY`, `TILER_MAX_CONCURRENCY`),
+`VLM_MAX_CONCURRENCY` and `RERANKER_MAX_CONCURRENCY` are per process: N processes allow
+N times as much.
 
 ## Qdrant
 
@@ -131,9 +135,36 @@ passthrough proxies.
 | `RETRIEVER_TIMEOUT_SEC` | no | `60` | Per-read deadline: max silence between bytes (≥ 1). |
 | `RETRIEVER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `RETRIEVER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the retriever server (≥ 1). |
-| `RETRIEVER_TOP_K` | no | `5` | Candidate tiles a RAG query takes from Qdrant (≥ 1); all of them reach the VLM. Request override: `rag.top_k`. |
-| `RETRIEVER_THRESHOLD` | no | *(none)* | Minimum Qdrant score of a candidate; empty/unset = no threshold. Must parse as a float. Passed to Qdrant as `score_threshold`, so it follows `QDRANT_DISTANCE_TYPE`: a floor for `Cosine`/`Dot`, a ceiling for `Euclid`/`Manhattan`. Request override: `rag.retriever_threshold`. |
 | `RETRIEVER_MAX_RETRIES` | no | `3` | Retries for a transient failure (≥ 0). |
+| `RETRIEVER_TOP_K` | no | `5` | Candidate tiles a RAG query takes from Qdrant (≥ 1). Without a reranker all of them reach the VLM; with one, it picks `RERANKER_TOP_N` of them. Request override: `rag.top_k`. |
+| `RETRIEVER_THRESHOLD` | no | *(none)* | Minimum Qdrant score of a candidate; empty/unset = no threshold. Must parse as a float. Passed to Qdrant as `score_threshold`, so it follows `QDRANT_DISTANCE_TYPE`: a floor for `Cosine`/`Dot`, a ceiling for `Euclid`/`Manhattan`. Request override: `rag.retriever_threshold`. |
+
+## Reranker (optional)
+
+Picks the tiles for the VLM out of the retriever's candidates. It scores each
+(query, tile) pair on its own, so the `RETRIEVER_TOP_K` candidates go
+`RERANKER_BATCH_SIZE` per request, all at once, and the cut to `RERANKER_TOP_N` is made
+over all their scores. With `RERANKER_BASE_URL` unset it is off, and startup logs a
+warning (naming any `RERANKER_*` variable set anyway, as ignored). It never blocks
+startup or a chat: a reranker failing its startup check is logged; one failing a request
+is logged — a warning for an outage, an error for a refusal or an unreadable reply (a
+contract mismatch to fix) — and that request goes on with the retriever's order, cut to
+`RERANKER_TOP_N`.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `RERANKER_BASE_URL` | no | *(none)* | Reranker server root, **without** `/v1` (e.g. `http://host.docker.internal:48007`); unset = no reranker. |
+| `RERANKER_MODEL_NAME` | no | `reranker-model` | Must match `SERVED_MODEL_NAME` in `serve_reranker.sh`; checked at startup via `/v1/models`. |
+| `RERANKER_API_KEY` | no | `dummy` | Bearer key (must match `RERANKER_DEPLOY_API_KEY` in `deploy/reranker/.env`). |
+| `RERANKER_API` | no | `score` | Wire format. `score` — vLLM's `/score`: scores only, in input order. `rerank` — the Cohere/Jina-style `/v1/rerank` (`query`, `documents`, `return_documents: false`) that SGLang and others implement too; vLLM serves it but echoes every image back, so use `score` against vLLM. |
+| `RERANKER_BATCH_SIZE` | no | `8` | Tiles per request (≥ 1). Not for speed — a vLLM reranker queues the pairs itself — but to keep each request short of `RERANKER_TIMEOUT_SEC`, to replay only one batch on a failure, and to let concurrent chats interleave on the server. |
+| `RERANKER_TOP_N` | no | `5` | Tiles the VLM gets, best first (≥ 1; ≤ `RETRIEVER_TOP_K` while the reranker is on, else startup fails). Request override: `rag.top_n`. |
+| `RERANKER_THRESHOLD` | no | *(none)* | Minimum relevance of a tile, `0`–`1`; empty/unset = no threshold. Request override: `rag.reranker_threshold`. |
+| `RERANKER_TIMEOUT_SEC` | no | `30` | Per-read deadline: max silence between bytes (≥ 1). |
+| `RERANKER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
+| `RERANKER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the reranker (≥ 1). |
+| `RERANKER_MAX_CONCURRENCY` | no | `0` | Max concurrent reranker requests from this process; `0` = unlimited (≥ 0; must be ≤ `RERANKER_MAX_CONNECTIONS`). |
+| `RERANKER_MAX_RETRIES` | no | `3` | Retries for a transient failure (≥ 0). |
 
 ## Tiler (doc-tiler)
 

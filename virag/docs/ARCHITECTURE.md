@@ -10,9 +10,10 @@ opts into retrieval per request.
 - **Stack:** Python 3.11+, FastAPI, pydantic-settings (configuration), async `httpx2` (one pooled client per upstream, see `clients/http_service.py`), `qdrant-client` (async, over gRPC).
 - **Backends (all external):** a retriever server (vLLM, OpenAI-compatible), the
   doc-tiler service, a Qdrant instance, the upstream VLM, and a Valkey the virag
-  processes coordinate through.
+  processes coordinate through; optionally a reranker server (vLLM).
 - **Scope:** the gateway only. Tiling/rendering lives in doc-tiler; embedding lives in
-  the vLLM server; vector storage lives in Qdrant; generation lives in the VLM. virag
+  the vLLM server; reranking in its own server; vector storage lives in Qdrant;
+  generation lives in the VLM. virag
   itself keeps no state: any number of processes (replicas, uvicorn workers) serve
   side by side (§10).
 
@@ -45,9 +46,10 @@ OpenAI-compatible SDK via `extra_body`, which flattens to top-level JSON.
 
 - absent / `false` → RAG off.
 - `true` → RAG on with server defaults (`RETRIEVER_TOP_K`, `RETRIEVER_THRESHOLD`,
-  `VIRAG_FRAMING_TEXT`), `include_sources=false`.
-- an object → per-request overrides: `top_k`, `retriever_threshold`, `framing_text`,
-  `include_sources`. Each is validated; a bad type is a `422`.
+  `RERANKER_TOP_N`, `RERANKER_THRESHOLD`, `VIRAG_FRAMING_TEXT`), `include_sources=false`.
+- an object → per-request overrides: `top_k`, `retriever_threshold`, `top_n`,
+  `reranker_threshold`, `framing_text`, `include_sources`. Each is validated; a bad
+  type, or a `top_n` above `top_k` while a reranker is on, is a `422`.
 
 ## 3. The retrieval pipeline
 
@@ -72,11 +74,21 @@ When RAG is on, `_run_rag` runs before the upstream call:
    tiles would hide that. Otherwise the regenerated tile's sha256 must match the
    `image_hash`; a mismatch is logged and the tile **skipped**. This is what guarantees
    the model sees the exact bytes that were embedded, not a drifted re-render.
-6. **Inject.** Prepend, into the last user message, a `framing_text` text part followed
+6. **Rerank** (only with `RERANKER_BASE_URL` set). The surviving tiles — the very bytes
+   just fetched, no second render — are scored against the query text by the reranker
+   (`RerankerClient.score`). It scores each (query, tile) pair on its own, so a score
+   does not depend on the other tiles of its request: the tiles go
+   `RERANKER_BATCH_SIZE` per request, all at once, and the scores of every batch are
+   merged before the cut. Tiles below `reranker_threshold` are dropped, the rest sorted
+   best first and cut to `top_n`. A failing reranker (down, overloaded, or refusing the
+   request) does not fail the chat: it is logged — a refusal or an unreadable reply as
+   an error, being a contract mismatch, an outage as a warning — and the tiles keep the
+   retriever's order, cut to `top_n`. Without a reranker all `top_k` tiles go on.
+7. **Inject.** Prepend, into the last user message, a `framing_text` text part followed
    by one `image_url` part per surviving tile (`data:image/jpeg;base64,…`), then the
    caller's original content. Structure preserved for both string and multimodal
    messages.
-7. **Passthrough.** The augmented body goes to the VLM unchanged otherwise.
+8. **Passthrough.** The augmented body goes to the VLM unchanged otherwise.
 
 If retrieval yields zero usable tiles, the request still goes upstream — just without
 injected context (logged as `rag injected: 0 tiles`).
@@ -84,8 +96,9 @@ injected context (logged as `rag injected: 0 tiles`).
 ## 4. Sources
 
 When `rag.include_sources` is true, the response carries a `sources` array — one entry
-per injected tile: `{name, doc_id, tile_num, score}` (`name` from the tile's
-`metadata.name`).
+per injected tile, in prompt order: `{name, doc_id, tile_num, score}` (`name` from the
+tile's `metadata.name`, `score` the Qdrant one), plus `rerank_score` for a tile the
+reranker scored.
 
 - **Non-streaming:** the upstream JSON is parsed and `sources` is added as a top-level
   key (only on a `200` with a JSON body; otherwise the upstream response passes
@@ -374,5 +387,5 @@ virag/
     proxy.py             # reverse proxy for /tiler, /retriever, /qdrant, /v1/*
     ops.py               # /health, /ready
   clients/
-    retriever_client.py  qdrant_store.py  valkey_store.py  tiler_client.py  vlm_client.py
+    retriever_client.py  reranker_client.py  qdrant_store.py  valkey_store.py  tiler_client.py  vlm_client.py
 ```

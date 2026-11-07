@@ -32,6 +32,9 @@ _ALL_KEYS = {
     "TILER_CONNECT_TIMEOUT_SEC", "TILER_MAX_CONNECTIONS", "TILER_MAX_RETRIES", "TILER_MAX_CONCURRENCY",
     "HTTP_RETRY_BACKOFF_BASE_SEC", "HTTP_RETRY_BACKOFF_CAP_SEC",
     "VALKEY_URL", "VALKEY_PREFIX", "VALKEY_TIMEOUT_SEC", "VALKEY_MAX_CONNECTIONS", "VIRAG_PROCESS_TTL_SEC",
+    "RERANKER_BASE_URL", "RERANKER_MODEL_NAME", "RERANKER_API_KEY", "RERANKER_API", "RERANKER_TIMEOUT_SEC",
+    "RERANKER_BATCH_SIZE", "RERANKER_TOP_N", "RERANKER_THRESHOLD", "RERANKER_CONNECT_TIMEOUT_SEC",
+    "RERANKER_MAX_CONNECTIONS", "RERANKER_MAX_CONCURRENCY", "RERANKER_MAX_RETRIES",
 }
 
 
@@ -167,6 +170,72 @@ def test_retriever_and_enroll_defaults(monkeypatch):
     assert s.retriever_settings.bulk_priority == 0
     assert s.retriever_settings.image_batching == "auto"
     assert s.enroll_settings.batch_size == 32
+
+
+def test_reranker_off_by_default(monkeypatch):
+    _base_env(monkeypatch)
+    rs = Settings.from_env().reranker_settings
+
+    assert not rs.enabled
+    assert (rs.api, rs.batch_size, rs.top_n, rs.threshold, rs.timeout_sec) == ("score", 8, 5, None, 30)
+    assert rs.model_fields_set == set()             # nothing set: the startup warning lists no ignored vars
+
+
+def test_reranker_on_with_base_url(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("RERANKER_BASE_URL", "http://reranker:8000")
+    monkeypatch.setenv("RERANKER_API", "rerank")
+    rs = Settings.from_env().reranker_settings
+
+    assert rs.enabled and rs.base_url == "http://reranker:8000" and rs.api == "rerank"
+
+
+def test_reranker_set_vars_are_tracked_while_off(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("RERANKER_TOP_N", "3")
+
+    assert Settings.from_env().reranker_settings.model_fields_set == {"top_n"}
+
+
+def test_reranker_top_n_cannot_exceed_top_k(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("RERANKER_BASE_URL", "http://reranker:8000")
+    monkeypatch.setenv("RETRIEVER_TOP_K", "4")
+    monkeypatch.setenv("RERANKER_TOP_N", "5")
+
+    with pytest.raises(SettingsError, match="RERANKER_TOP_N"):
+        Settings.from_env()
+
+
+def test_reranker_top_n_may_equal_top_k(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("RERANKER_BASE_URL", "http://reranker:8000")
+    monkeypatch.setenv("RETRIEVER_TOP_K", "5")
+    monkeypatch.setenv("RERANKER_TOP_N", "5")
+
+    assert Settings.from_env().reranker_settings.top_n == 5
+
+
+def test_reranker_top_n_unbound_while_off(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("RETRIEVER_TOP_K", "4")
+    monkeypatch.setenv("RERANKER_TOP_N", "5")
+
+    assert Settings.from_env().reranker_settings.top_n == 5
+
+
+@pytest.mark.parametrize("name, value", [
+    ("RERANKER_THRESHOLD", "1.5"),
+    ("RERANKER_THRESHOLD", "-0.1"),
+    ("RERANKER_API", "listwise"),
+    ("RERANKER_BATCH_SIZE", "0"),
+])
+def test_reranker_bounds(monkeypatch, name, value):
+    _base_env(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(SettingsError, match=name):
+        Settings.from_env()
 
 
 def test_image_batching_mode_validated(monkeypatch):

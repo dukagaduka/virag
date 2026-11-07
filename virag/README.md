@@ -82,10 +82,11 @@ virag/
   coordination.py    Coordinator: process leases, writers + journal, revision lock/status, reconcile lead
   errors.py          ApiError + the uniform {"error": {...}} envelope
   api/               chat_completions, enroll, revision, proxy, ops
-  clients/           retriever_client, qdrant_store, valkey_store, tiler_client, vlm_client
+  clients/           retriever_client, reranker_client, qdrant_store, valkey_store, tiler_client, vlm_client
 docs/                documentation (see the table above)
 deploy/service/      virag + tiler + Qdrant + Valkey: docker-compose.yaml, .env.example, tiler metadata schema
 deploy/retriever/   vLLM retriever stack: docker-compose.yaml, .env.example, serve_retriever.example.sh
+deploy/reranker/    optional vLLM reranker stack: docker-compose.yaml, .env.example, serve_reranker.example.sh
 ```
 
 ## Development

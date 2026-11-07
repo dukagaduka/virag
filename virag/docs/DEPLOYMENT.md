@@ -1,11 +1,12 @@
 # Deployment
 
 virag is a small stateless gateway; the interesting part of deploying it is the
-**backends it needs**: doc-tiler, Qdrant, Valkey, a retriever server, and an upstream VLM.
-Deployment is split into two independent Compose stacks under [`deploy/`](../deploy/):
-[`service/`](../deploy/service/) (virag, doc-tiler, Qdrant, Valkey) and
-[`retriever/`](../deploy/retriever/) (the vLLM retriever server). The VLM is external
-(you point `VLM_BASE_URL` at it).
+**backends it needs**: doc-tiler, Qdrant, Valkey, a retriever server, an upstream VLM,
+and optionally a reranker server. Deployment is split into independent Compose stacks
+under [`deploy/`](../deploy/): [`service/`](../deploy/service/) (virag, doc-tiler,
+Qdrant, Valkey), [`retriever/`](../deploy/retriever/) (the vLLM retriever server) and
+[`reranker/`](../deploy/reranker/) (the optional vLLM reranker server). The VLM is
+external (you point `VLM_BASE_URL` at it).
 
 ---
 
@@ -50,6 +51,20 @@ In `deploy/service/.env` also set `RETRIEVER_MODEL_NAME` to `SERVED_MODEL_NAME` 
 `serve_retriever.sh` and `RETRIEVER_API_KEY` to `RETRIEVER_DEPLOY_API_KEY` in
 `deploy/retriever/.env`; virag checks at startup that the server advertises that model and
 refuses to boot otherwise.
+
+### Connecting virag to the reranker stack (optional)
+
+The same way, through the host: `RERANKER_BASE_URL=http://host.docker.internal:<RERANKER_DEPLOY_PORT>`
+— the server **root**, without `/v1` (virag calls `/score` and `/v1/models` under it).
+Set `RERANKER_MODEL_NAME` to `SERVED_MODEL_NAME` in `serve_reranker.sh` and
+`RERANKER_API_KEY` to `RERANKER_DEPLOY_API_KEY` in `deploy/reranker/.env`. Leave
+`RERANKER_BASE_URL` empty to run without one. The reranker is never a startup
+dependency: one that is down or misconfigured is logged at startup, and every chat
+falls back to the retriever's order until it answers.
+
+vLLM's `--api-key` guards `/v1/*` only — `/score` and `/rerank` answer without the key.
+Keep the reranker's port reachable from virag alone (`RERANKER_DEPLOY_HOST=127.0.0.1`,
+or a firewall), not on a public interface.
 
 `virag` `depends_on` the tiler, Qdrant and Valkey only; the retriever server is outside the stack,
 so virag has `restart: unless-stopped` and retries until its dependency checks (including
@@ -139,8 +154,10 @@ caps (`*_MAX_CONCURRENCY`) multiply with the process count — size them accordi
   `ready: …` summary at startup (all backends + `render_version`), `lease: <token>
   (<host>/<pid>)` naming the process in Valkey, `taking over from dead process` when a
   revision job or the reconcile lead moves, `lease: … expired` (critical) when a process
-  stops itself, per-request `rag
-  query` / `rag retrieved` / `rag injected` counts, `integrity:` warnings when a tile's
+  stops itself, `reranker: off` (warning) when none is configured, per-request `rag
+  query` / `rag retrieved` / `rag reranked` / `rag injected` counts, `rag rerank failed`
+  (a warning for an outage, an error for a refusal) when a chat fell back to the
+  retriever's order, `integrity:` warnings when a tile's
   hash doesn't match its Qdrant payload, and `reconcile:` lines when a pass deletes
   dangling or quarantined docs' Qdrant points, clears stale-pending enrolls, or self-heals
   a doc.

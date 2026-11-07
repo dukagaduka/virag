@@ -61,13 +61,18 @@ The reverse proxy injects bearer credentials so backends can stay locked down be
 gateway:
 
 - `/retriever/*` and calls to the retriever server → `Authorization: Bearer <RETRIEVER_API_KEY>`.
+- calls to the reranker server → `Authorization: Bearer <RERANKER_API_KEY>` (no proxy route).
 - `/v1/*` (passthrough) and chat-completions → `Authorization: Bearer <VLM_API_KEY>`.
 - `/tiler/*` and `/qdrant/*` → no auth injected.
 
 Notes:
 
-- These keys live in the environment (`RETRIEVER_API_KEY`, `VLM_API_KEY`) and default to
-  `dummy`; set real values in any deployment where the backends enforce auth.
+- These keys live in the environment (`RETRIEVER_API_KEY`, `RERANKER_API_KEY`,
+  `VLM_API_KEY`) and default to `dummy`; set real values in any deployment where the
+  backends enforce auth.
+- vLLM's `--api-key` guards `/v1/*` only. A reranker's `/score` and `/rerank` answer
+  without the key, so the key alone does not lock the reranker down: keep its port
+  private to virag.
 - virag itself does **not** authenticate its own callers — it is designed to sit behind
   your own gateway/network policy. Don't expose it directly to untrusted clients.
 - Hop-by-hop headers (RFC 7230) and `Host`/`Content-Length` are stripped in both
@@ -88,7 +93,8 @@ Notes:
 
 - [ ] `TILER_DB_SECRET` set to a strong value, identical on virag and the tiler, before
       the stack's first boot.
-- [ ] Real `VLM_API_KEY` / `RETRIEVER_API_KEY` if the upstreams enforce auth.
+- [ ] Real `VLM_API_KEY` / `RETRIEVER_API_KEY` / `RERANKER_API_KEY` if the upstreams enforce auth.
+- [ ] Reranker port reachable by virag only: its `/score` is not covered by the vLLM key.
 - [ ] virag reachable only from a trusted gateway/network — it has no built-in
       client authentication.
 - [ ] Backends (tiler, Qdrant, retriever) not separately exposed if the proxy routes

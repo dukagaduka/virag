@@ -34,12 +34,20 @@ class Pipe:
             description="Upstream VLM model name virag should call.",
         )
         TOP_K: int = Field(
-            default=4,
-            description="Candidate tiles to take from Qdrant.",
+            default=0,
+            description="Candidate tiles to take from Qdrant (0 = server default).",
         )
         RETRIEVER_THRESHOLD: float = Field(
             default=0.25,
-            description="Minimum Qdrant score of a candidate.",
+            description="Minimum Qdrant score of a candidate (negative = server default).",
+        )
+        TOP_N: int = Field(
+            default=0,
+            description="Tiles the reranker passes to the model, at most TOP_K (0 = server default).",
+        )
+        RERANKER_THRESHOLD: float = Field(
+            default=-1.0,
+            description="Minimum reranker relevance, 0..1 (negative = server default).",
         )
         FRAMING_TEXT: str = Field(
             default="",
@@ -81,11 +89,20 @@ class Pipe:
         }
 
         if use_rag:
-            rag = {
-                "top_k": self.valves.TOP_K,
-                "retriever_threshold": self.valves.RETRIEVER_THRESHOLD,
-                "include_sources": True,
-            }
+            rag = {"include_sources": True}
+
+            # Unset valves leave the field to virag's own defaults.
+            if self.valves.TOP_K > 0:
+                rag["top_k"] = self.valves.TOP_K
+
+            if self.valves.RETRIEVER_THRESHOLD >= 0:
+                rag["retriever_threshold"] = self.valves.RETRIEVER_THRESHOLD
+
+            if self.valves.TOP_N > 0:
+                rag["top_n"] = self.valves.TOP_N
+
+            if self.valves.RERANKER_THRESHOLD >= 0:
+                rag["reranker_threshold"] = self.valves.RERANKER_THRESHOLD
 
             if self.valves.FRAMING_TEXT:
                 rag["framing_text"] = self.valves.FRAMING_TEXT
@@ -213,10 +230,15 @@ class Pipe:
 
             label = name if tile is None else f"{name} · tile {tile}"
 
+            rerank_score = s.get("rerank_score")
+
+            summary = f"doc_id={doc_id} · tile={tile}"
+
             if isinstance(score, (int, float)):
-                summary = f"doc_id={doc_id} · tile={tile} · score={score:.3f}"
-            else:
-                summary = f"doc_id={doc_id} · tile={tile}"
+                summary += f" · score={score:.3f}"
+
+            if isinstance(rerank_score, (int, float)):
+                summary += f" · rerank_score={rerank_score:.3f}"
 
             # Newer OpenWebUI builds use "source"; older ones use "citation".
             # "citation" is still accepted by current builds, so we target it.
