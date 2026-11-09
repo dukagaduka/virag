@@ -225,8 +225,9 @@ than the tiler renders now is refused too: chat would answer `RENDER_VERSION_MIS
 ## `GET /v1/models`
 
 The OpenAI model list, with exactly one model: the upstream VLM's own entry for
-`VLM_MODEL_NAME` (virag answers every chat with that model, whatever the request's
-`model` says). When the upstream lists no such entry or does not answer, a minimal
+`VLM_MODEL_NAME`, the model virag is set up (and vision-probed) for. A chat request's
+`model` is forwarded to the upstream as is, so clients should send this one. When the
+upstream lists no such entry or does not answer, a minimal
 `{"id": VLM_MODEL_NAME, "object": "model", …}` stands in. No other `/v1/*` route exists.
 
 ---

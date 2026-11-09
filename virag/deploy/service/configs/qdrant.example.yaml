@@ -1,0 +1,9 @@
+# Qdrant overrides, merged over the image's defaults. Copy to qdrant.yaml (git-ignored)
+# and set the key; virag's QDRANT_API_KEY in virag.env must be the same.
+# Generate one: openssl rand -hex 32
+#
+# Every REST and gRPC call needs it (`api-key` header or `Authorization: Bearer`), the
+# dashboard included; /healthz, /livez and /readyz stay open.
+
+service:
+  api_key: dummy

@@ -44,8 +44,9 @@ flowchart LR
   them from doc-tiler, verifies each tile's hash against what was enrolled, injects the
   images into the prompt, and forwards to the VLM.
 
-The three stateful parts (virag, doc-tiler, the Qdrant collection) are locked together by
-one shared secret (`TILER_DB_SECRET`) so a mismatched pair refuses to start — see
+The Qdrant collection is bound to the doc-tiler volume it was embedded from (the
+volume's `volume_id`), so a mismatched pair refuses to start; clients reach virag with its
+own API keys, and virag holds the keys of every backend — see
 [virag/docs/SECURITY.md](virag/docs/SECURITY.md).
 
 ## Getting started
@@ -54,8 +55,10 @@ Each service is self-contained (its own `Dockerfile`, package, `deploy/`). The f
 comes up from virag's Compose file:
 
 ```bash
-cd virag/deploy
-cp .env.example .env      # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE
+cd virag/deploy/service
+cp .env.example .env && cp virag.env.example virag.env && cp tiler.env.example tiler.env
+cp configs/valkey.example.conf configs/valkey.conf && cp configs/qdrant.example.yaml configs/qdrant.yaml
+# replace every `dummy` (keys, passwords), set VLM_*, QDRANT_VECTOR_SIZE — see virag/docs/DEPLOYMENT.md
 docker compose up --build
 ```
 

@@ -23,19 +23,22 @@ cd deploy/retriever
 cp .env.example .env && cp serve_retriever.example.sh serve_retriever.sh
 docker compose up -d
 
-# virag + tiler + Qdrant
+# virag + tiler + Qdrant + Valkey
 cd ../service
-cp .env.example .env     # set VIRAG_API_KEY, VIRAG_ADMIN_API_KEY, TILER_API_KEY, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE, RETRIEVER_BASE_URL
+cp .env.example .env && cp virag.env.example virag.env && cp tiler.env.example tiler.env
+cp configs/valkey.example.conf configs/valkey.conf && cp configs/qdrant.example.yaml configs/qdrant.yaml
+# replace every `dummy` (keys, passwords), set VLM_*, QDRANT_VECTOR_SIZE, RETRIEVER_BASE_URL
 docker compose up --build
 curl -s localhost:48000/ready | jq
 
-# enroll a document
-curl -s -X POST localhost:48000/enroll \
+# enroll a document (admin key)
+curl -s -X POST localhost:48000/enroll -H "Authorization: Bearer $VIRAG_ADMIN_API_KEY" \
      -F doc_type=PDF -F document=@report.pdf \
      -F 'metadata={"name":"2024 Annual Report"}' | jq
 
 # ask a question with RAG on
-curl -s localhost:48000/v1/chat/completions -H 'content-type: application/json' -d '{
+curl -s localhost:48000/v1/chat/completions -H "Authorization: Bearer $VIRAG_API_KEY" \
+     -H 'content-type: application/json' -d '{
   "model": "my-vlm",
   "messages": [{"role": "user", "content": "What was Q3 revenue?"}],
   "rag": {"top_k": 8, "include_sources": true}
@@ -84,7 +87,7 @@ virag/
   api/               chat_completions, models, enroll, revision, ops, auth
   clients/           retriever_client, reranker_client, qdrant_store, valkey_store, tiler_client, vlm_client
 docs/                documentation (see the table above)
-deploy/service/      virag + tiler + Qdrant + Valkey: docker-compose.yaml, .env.example, tiler metadata schema
+deploy/service/      virag + tiler + Qdrant + Valkey: docker-compose.yaml, .env / virag.env / tiler.env examples, configs/, tiler metadata schema
 deploy/retriever/   vLLM retriever stack: docker-compose.yaml, .env.example, serve_retriever.example.sh
 deploy/reranker/    optional vLLM reranker stack: docker-compose.yaml, .env.example, serve_reranker.example.sh
 ```

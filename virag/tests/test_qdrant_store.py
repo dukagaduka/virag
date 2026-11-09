@@ -146,3 +146,20 @@ def test_first_start_race_adopts_the_collection_another_process_created():
     store.qdrant.create_collection = create_collection
 
     assert asyncio.run(store._resolve_or_create()) == "c__v1"
+
+
+@pytest.mark.parametrize("code, message", [
+    (grpc.StatusCode.UNAUTHENTICATED, "QDRANT_API_KEY"),
+    (grpc.StatusCode.UNAVAILABLE, "unavailable"),
+])
+def test_startup_names_a_rejected_key_and_an_unreachable_qdrant(code, message):
+    store = _store()
+
+    async def get_aliases():
+        raise _RpcError(code)
+
+    store.qdrant.get_aliases = get_aliases
+
+    with pytest.raises(ApiError, match=message) as error:
+        asyncio.run(store.create_collection())
+    assert error.value.status_code == 503

@@ -3,10 +3,10 @@
 All application configuration is read from environment variables at startup by
 `Settings.from_env()` (`virag/settings.py`). Four variables are **required** and abort
 startup if unset — `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME`, `VALKEY_URL`;
-everything else has a default. A ready-to-edit template — including the Compose/deployment
-variables — lives at [`deploy/service/.env.example`](../deploy/service/.env.example),
-[`deploy/retriever/.env.example`](../deploy/retriever/.env.example) and
-[`deploy/reranker/.env.example`](../deploy/reranker/.env.example).
+everything else has a default. A ready-to-edit template lives at
+[`deploy/service/virag.env.example`](../deploy/service/virag.env.example); the Compose
+variables are in [`deploy/service/.env.example`](../deploy/service/.env.example) (see
+[DEPLOYMENT.md](DEPLOYMENT.md) for which file holds what).
 
 Every variable, its default and its bounds are declared once, as pydantic-settings
 fields in `virag/settings.py`: each section reads its own prefix and a field's name is
@@ -124,7 +124,7 @@ upstream only gets slower under extra load), and neither are tiler ingests.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `RETRIEVER_BASE_URL` | no | `http://retriever-vllm-virag:8000/v1` | Retriever endpoint. The `/v1` suffix is required. The retriever server runs in a separate stack, so the default container name only resolves if you attach both stacks to one Docker network; the shipped `deploy/service/.env.example` uses `http://host.docker.internal:48003/v1` instead. |
+| `RETRIEVER_BASE_URL` | no | `http://retriever-vllm-virag:8000/v1` | Retriever endpoint. The `/v1` suffix is required. The retriever server runs in a separate stack, so the default container name only resolves if you attach both stacks to one Docker network; the shipped `deploy/service/virag.env.example` uses `http://host.docker.internal:48004/v1` instead. |
 | `RETRIEVER_MODEL_NAME` | no | `retriever-model` | Retriever model name (must match `SERVED_MODEL_NAME` in `serve_retriever.sh`). |
 | `RETRIEVER_API_KEY` | no | `dummy` | Bearer key for the retriever server (must match `RETRIEVER_DEPLOY_API_KEY` in `deploy/retriever/.env`). |
 | `RETRIEVER_BATCH_SIZE` | no | `32` | Items per embedding request (≥ 1): always for texts, for images only when image batching is on. |
@@ -152,7 +152,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `RERANKER_BASE_URL` | no | *(none)* | Reranker server root, **without** `/v1` (e.g. `http://host.docker.internal:48007`); unset = no reranker. |
+| `RERANKER_BASE_URL` | no | *(none)* | Reranker server root, **without** `/v1` (e.g. `http://host.docker.internal:48005`); unset = no reranker. |
 | `RERANKER_MODEL_NAME` | no | `reranker-model` | Must match `SERVED_MODEL_NAME` in `serve_reranker.sh`; checked at startup via `/v1/models`. |
 | `RERANKER_API_KEY` | no | `dummy` | Bearer key (must match `RERANKER_DEPLOY_API_KEY` in `deploy/reranker/.env`). |
 | `RERANKER_API` | no | `score` | Wire format. `score` — vLLM's `/score`: scores only, in input order. `rerank` — the Cohere/Jina-style `/v1/rerank` (`query`, `documents`, `return_documents: false`) that SGLang and others implement too; vLLM serves it but echoes every image back, so use `score` against vLLM. |

@@ -1433,3 +1433,7 @@ vendor/*
 *.test-data*
 
 
+deploy/service/virag.env
+deploy/service/tiler.env
+deploy/service/configs/valkey.conf
+deploy/service/configs/qdrant.yaml

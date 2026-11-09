@@ -259,8 +259,21 @@ class QdrantStore:
     # ------------------------------------------------------------------ #
     # collection lifecycle (alias-aware)
     # ------------------------------------------------------------------ #
+    @_unavailable_as_503
     async def create_collection(self):
-        physical = await self._resolve_or_create()
+        """The first call at startup: also where a wrong QDRANT_API_KEY shows."""
+        try:
+            physical = await self._resolve_or_create()
+
+        except grpc.RpcError as e:
+            if e.code() != grpc.StatusCode.UNAUTHENTICATED:  # type: ignore[attr-defined]
+                raise
+
+            raise ApiError(
+                status_code=503,
+                message="Qdrant rejects QDRANT_API_KEY: set the service.api_key of its qdrant.yaml",
+                details={"grpc_status": "UNAUTHENTICATED"},
+            ) from e
 
         await self._validate(physical)
         await self._ensure_indexes(physical)

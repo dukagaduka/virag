@@ -46,9 +46,9 @@ class VLMClient(OpenAIService):
 
 
     async def model_card(self) -> dict:
-        """The upstream's `/models` entry of `model_name` — the only model a chat is
-        answered with, whatever its `model` field says. A minimal card stands in when the
-        upstream lists no such entry or does not answer."""
+        """The upstream's `/models` entry of `model_name` — the model virag is set up
+        for. A minimal card stands in when the upstream lists no such entry or does not
+        answer."""
         try:
             response = await self._request("GET", self.models_route, action="the model list")
             models = self._json(response, action="the model list", parse=lambda data: data["data"])

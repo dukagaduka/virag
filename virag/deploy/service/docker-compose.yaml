@@ -1,3 +1,11 @@
+# Three files configure the stack, each copied from its .example and filled in:
+#   .env               compose itself: images, names, published hosts/ports, volumes
+#   virag.env          virag (and the keys it holds for every backend)
+#   tiler.env          doc-tiler
+# plus configs/valkey.conf and configs/qdrant.yaml, which carry the Valkey password and
+# the Qdrant API key. A secret shared by two services is written in both places, and
+# virag refuses to start, naming the key, when its copy does not match.
+
 services:
   virag:
     build:
@@ -16,7 +24,7 @@ services:
       - no-new-privileges:true
 
     env_file:
-      - path: .env
+      - path: virag.env
         required: true
 
     # The retriever runs in a separate stack; virag reaches it via the host
@@ -53,7 +61,8 @@ services:
     image: ${TILER_DEPLOY_IMAGE}
     container_name: ${TILER_DEPLOY_CONTAINER_NAME}
 
-    ports: 
+    # Published for tools on the host; virag reaches the tiler inside the network.
+    ports:
       - "${TILER_DEPLOY_HOST}:${TILER_DEPLOY_PORT}:8080"
     volumes:
       - ${TILER_DEPLOY_VOLUME_PATH}:/data
@@ -64,8 +73,8 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    env_file: 
-      - path: .env
+    env_file:
+      - path: tiler.env
         required: true
 
     healthcheck:
@@ -83,19 +92,17 @@ services:
     image: ${QDRANT_DEPLOY_IMAGE}
     container_name: ${QDRANT_DEPLOY_CONTAINER_NAME}
 
-    # REST (6333) serves the /qdrant proxy and host debugging; virag's data path uses
-    # gRPC (6334) inside the network — the second mapping is for host-side gRPC tools.
+    # Published for tools on the host (REST 6333 also serves the dashboard, gRPC 6334);
+    # virag's data path is gRPC inside the network. The API key comes from qdrant.yaml,
+    # merged over the image's defaults.
     ports:
       - ${QDRANT_DEPLOY_HOST}:${QDRANT_DEPLOY_PORT}:6333
       - ${QDRANT_DEPLOY_HOST}:${QDRANT_DEPLOY_GRPC_PORT}:6334
     volumes:
       - ${QDRANT_DEPLOY_VOLUME_PATH}:/qdrant/storage
+      - ./configs/qdrant.yaml:/qdrant/config/production.yaml:ro
 
     restart: unless-stopped
-
-    env_file:
-      - path: .env
-        required: true
 
     # No healthcheck: the qdrant image has no curl/wget/bash to probe with. Consumers
     # gate on service_started and retry their own connection.
@@ -109,18 +116,21 @@ services:
     container_name: ${VALKEY_DEPLOY_CONTAINER_NAME}
 
     # Coordination of virag processes only (leases, writers, the revision lock); no
-    # port is published — virag reaches it inside the network. AOF keeps a journal of
-    # an in-flight revision across a short Valkey restart.
-    command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    # port is published — virag reaches it inside the network. valkey.conf holds the
+    # password (requirepass) and AOF, which keeps a journal of an in-flight revision
+    # across a short Valkey restart.
+    command: ["valkey-server", "/usr/local/etc/valkey/valkey.conf"]
     volumes:
+      - ./configs/valkey.conf:/usr/local/etc/valkey/valkey.conf:ro
       - ${VALKEY_DEPLOY_VOLUME_PATH}:/data
 
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
 
+    # Liveness without the password: an answer, PONG or NOAUTH, means the server is up.
     healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
+      test: ["CMD-SHELL", "valkey-cli ping 2>&1 | grep -qE 'PONG|NOAUTH'"]
       interval: 10s
       timeout: 3s
       retries: 3

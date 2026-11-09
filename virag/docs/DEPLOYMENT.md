@@ -21,10 +21,15 @@ docker compose up -d
 
 # 2. virag + tiler + Qdrant + Valkey
 cd ../service
-cp .env.example .env     # set the API keys, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE,
-                         # RETRIEVER_BASE_URL, paths
+cp .env.example .env                                  # images, ports, volume paths
+cp virag.env.example virag.env                        # keys, VLM_*, RETRIEVER_*, QDRANT_VECTOR_SIZE, …
+cp tiler.env.example tiler.env                        # TILER_API_KEY, geometry, pools
+cp configs/valkey.example.conf configs/valkey.conf    # requirepass
+cp configs/qdrant.example.yaml configs/qdrant.yaml    # service.api_key
+# replace every `dummy` with its own `openssl rand -hex 32` (see "Secrets" below)
 docker compose up --build
-curl -s localhost:${VIRAG_DEPLOY_PORT:-48000}/ready | jq
+curl -s localhost:48000/ready | jq
+curl -s localhost:48000/v1/models -H "Authorization: Bearer $VIRAG_API_KEY" | jq
 ```
 
 The `service/` stack (`deploy/service/docker-compose.yaml`) is four services on one bridge
@@ -42,12 +47,12 @@ separate stack in `deploy/retriever/` that virag reaches over `RETRIEVER_BASE_UR
 
 The two stacks do not share a Docker network. virag reaches the retriever server through
 the host: set `RETRIEVER_BASE_URL=http://host.docker.internal:<RETRIEVER_DEPLOY_PORT>/v1`
-(`48003` in the example). On Linux `host.docker.internal` is not defined by default, so the
+(`48004` in the example). On Linux `host.docker.internal` is not defined by default, so the
 `virag` service declares `extra_hosts: ["host.docker.internal:host-gateway"]` in
 `deploy/service/docker-compose.yaml`. If the retriever server runs on another machine, point
 `RETRIEVER_BASE_URL` at its address instead.
 
-In `deploy/service/.env` also set `RETRIEVER_MODEL_NAME` to `SERVED_MODEL_NAME` in
+In `deploy/service/virag.env` also set `RETRIEVER_MODEL_NAME` to `SERVED_MODEL_NAME` in
 `serve_retriever.sh` and `RETRIEVER_API_KEY` to `RETRIEVER_DEPLOY_API_KEY` in
 `deploy/retriever/.env`; virag checks at startup that the server advertises that model and
 refuses to boot otherwise.
@@ -72,30 +77,56 @@ the retriever endpoint) pass — this also covers the long vLLM model load.
 
 ## Configuration
 
-Variables live in three places:
+Each container reads only its own file; all of them live in `deploy/service/` and are
+copied from a tracked `.example` (the copies are git-ignored):
 
-- **Application settings** read by virag at startup — `VIRAG_*` (including the reconcile
-  knobs `VIRAG_SELF_HEAL` / `VIRAG_RECONCILE_INTERVAL_SEC` / `VIRAG_PENDING_TTL_SEC`),
-  `QDRANT_*` (including the upsert-batching `QDRANT_CHUNK_SIZE` / `QDRANT_MAX_BATCH_CHUNKS`),
-  `VALKEY_*`, `RETRIEVER_*`, `TILER_*`, `VLM_*`. See
-  [CONFIG.md](CONFIG.md). Required: `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`,
-  `VLM_MODEL_NAME`, `VALKEY_URL`.
-- **Compose/orchestration variables** — the `*_DEPLOY_*` image tags, host bind
-  addresses/ports, and volume paths. Read by Compose, not by `Settings.from_env()`.
-  `deploy/service/.env` (from [`.env.example`](../deploy/service/.env.example)) holds the
-  application settings above together with the service-stack deploy variables;
-  `deploy/retriever/.env` (from [`.env.example`](../deploy/retriever/.env.example)) holds
-  the retriever deploy variables, among them the server's bearer key
-  `RETRIEVER_DEPLOY_API_KEY` (passed in as `VLLM_API_KEY`; the healthcheck sends it too).
-- **vLLM serving parameters** — *not* in `.env`. They are written out, with a comment per
-  parameter, directly in `deploy/retriever/serve_retriever.sh`. The tracked
-  [`serve_retriever.example.sh`](../deploy/retriever/serve_retriever.example.sh) holds
-  baseline values; copy it to `serve_retriever.sh` (git-ignored) and tune it for your
-  GPU. Keep `SERVED_MODEL_NAME` there in sync with virag's `RETRIEVER_MODEL_NAME`.
+| File | Read by | Holds |
+|---|---|---|
+| `.env` | Compose only | `*_DEPLOY_*`: images, container names, published hosts/ports, volume paths. No container sees it. |
+| `virag.env` | virag | `VIRAG_*`, `QDRANT_*`, `VALKEY_*`, `RETRIEVER_*`, `RERANKER_*`, `TILER_*` (how virag reaches the tiler), `VLM_*` — see [CONFIG.md](CONFIG.md). Required: `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME`, `VALKEY_URL`. |
+| `tiler.env` | doc-tiler | the tiler's own `TILER_*` (key, geometry, pixel tier, pools, sweeper) — see doc-tiler's CONFIG.md. |
+| `configs/valkey.conf` | Valkey | `requirepass`, AOF. |
+| `configs/qdrant.yaml` | Qdrant | `service.api_key`, merged over the image's defaults. |
 
-Set virag's `VIRAG_API_KEY` and `VIRAG_ADMIN_API_KEY`, and give `TILER_API_KEY`,
-`QDRANT_API_KEY` and the Valkey password the same values their services have. See
+`TILER_*` means two things, and the split keeps them apart: in `virag.env` it is the
+client side (`TILER_BASE_URL`, timeouts, `TILER_API_KEY` to present), in `tiler.env` the
+server side.
+
+The retriever and reranker stacks keep their own `.env` (`deploy/retriever/.env`,
+`deploy/reranker/.env`), with the server's bearer key `RETRIEVER_DEPLOY_API_KEY` /
+`RERANKER_DEPLOY_API_KEY` (passed in as `VLLM_API_KEY`; the healthcheck sends it too).
+vLLM serving parameters are *not* in `.env`: they are written out, with a comment per
+parameter, in `serve_retriever.sh` / `serve_reranker.sh` (copied from the tracked
+`.example.sh`, git-ignored). Keep `SERVED_MODEL_NAME` there in sync with virag's
+`RETRIEVER_MODEL_NAME` / `RERANKER_MODEL_NAME`. The scripts print the full `vllm serve`
+command at start with the key masked.
+
+### Secrets
+
+Every `dummy` in the examples is a secret to replace (`openssl rand -hex 32`). A secret
+shared by two services is written in both places:
+
+| Secret | In the service | In `virag.env` |
+|---|---|---|
+| virag's user key | — | `VIRAG_API_KEY` (clients use it; OWUI's `VIRAG_API_KEY` valve) |
+| virag's admin key | — | `VIRAG_ADMIN_API_KEY` (`misc/enroll_dir.py --api-key`) |
+| tiler key | `TILER_API_KEY` in `tiler.env` | `TILER_API_KEY` |
+| Qdrant key | `service.api_key` in `configs/qdrant.yaml` | `QDRANT_API_KEY` |
+| Valkey password | `requirepass` in `configs/valkey.conf` | `VALKEY_URL=redis://:<password>@valkey-virag:6379/0` |
+| retriever key | `RETRIEVER_DEPLOY_API_KEY` in `deploy/retriever/.env` | `RETRIEVER_API_KEY` |
+| reranker key | `RERANKER_DEPLOY_API_KEY` in `deploy/reranker/.env` | `RERANKER_API_KEY` |
+
+A copy that does not match stops virag at startup with a message naming the key. See
 [SECURITY.md](SECURITY.md).
+
+### Ports
+
+Published by default (`.env`): virag `48000` on `0.0.0.0` — it guards itself with its keys,
+and other containers on the host (e.g. Open WebUI) reach it via `host.docker.internal`,
+which is not loopback; the tiler `48001` and Qdrant `48002` (REST, dashboard) / `48003`
+(gRPC) on `127.0.0.1`, for tools on the host, each behind its own key. Valkey publishes no
+port. The retriever and reranker stacks default to `48004` and `48005`. Put TLS (a reverse
+proxy) in front of virag wherever its port is reachable beyond a trusted network.
 
 ## Tiler metadata schema
 

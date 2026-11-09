@@ -262,8 +262,14 @@ echo "uvicorn log level:       $UVICORN_LOG_LEVEL"
 echo "OpenAI endpoint:         /v1/rerank (also /score)"
 echo "metrics:                 /metrics"
 echo
+# The key never reaches the log: its value is masked in the printed command.
+SHOWN=("${ARGS[@]}")
+for i in "${!SHOWN[@]}"; do
+  [[ "${SHOWN[$i]}" == "--api-key" ]] && SHOWN[$((i + 1))]="***"
+done
+
 echo "full command:"
-printf ' %q' vllm serve "${ARGS[@]}"
+printf ' %q' vllm serve "${SHOWN[@]}"
 echo
 echo
 
