@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import Request
@@ -10,6 +11,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .responses import OrjsonResponse
 
+log = logging.getLogger("tiler.errors")
+
 
 class ApiError(Exception):
     """Domain error carrying the wire status + machine-readable code."""
@@ -17,6 +20,7 @@ class ApiError(Exception):
     # Wire status -> the default machine-readable `code` (used for framework errors).
     STATUS_CODES = {
         400: "BAD_REQUEST",
+        401: "UNAUTHORIZED",
         403: "FORBIDDEN",
         404: "NOT_FOUND",
         405: "METHOD_NOT_ALLOWED",
@@ -63,6 +67,11 @@ class ApiError(Exception):
 def bad_request(msg: str, code: str = "BAD_REQUEST", **details: Any) -> ApiError:
     """Build a 400 error."""
     return ApiError(400, code, msg, details or None)
+
+
+def unauthorized(msg: str, code: str = "UNAUTHORIZED", **details: Any) -> ApiError:
+    """Build a 401 error with the Bearer challenge."""
+    return ApiError(401, code, msg, details or None, headers={"WWW-Authenticate": "Bearer"})
 
 
 def forbidden(msg: str, code: str = "FORBIDDEN", **details: Any) -> ApiError:
@@ -150,17 +159,15 @@ def install_error_handlers(app: Any) -> None:
         )
 
     @app.exception_handler(Exception)
-    async def _unhandled(_: Request, exc: Exception) -> OrjsonResponse:
+    async def _unhandled(request: Request, exc: Exception) -> OrjsonResponse:
         """Turn any uncaught exception into a 500 instead of crashing the worker."""
-        # Catch-all so no render failure can take down the worker.
+        # Catch-all so no render failure can take down the worker. The traceback goes
+        # to the log only: exception text can carry paths, URLs or document content.
+        log.exception("unhandled error on %s %s", request.method, request.url.path, exc_info=exc)
+
         return OrjsonResponse(
             status_code=500,
-            content={
-                "error": {
-                    "code": "INTERNAL_ERROR",
-                    "message": f"{type(exc).__name__}: {exc}",
-                }
-            },
+            content={"error": {"code": "INTERNAL_ERROR", "message": "Internal error; see the tiler log."}},
         )
 
 

@@ -1,4 +1,8 @@
-"""Operational endpoints: schema, health, readiness, metrics."""
+"""Operational endpoints: schema, health, readiness, metrics, info.
+
+`router` holds the probes and metrics, open to orchestrators and Prometheus;
+`keyed_router` holds what needs TILER_API_KEY (schema, info).
+"""
 
 from __future__ import annotations
 
@@ -13,9 +17,10 @@ from ..responses import OrjsonResponse
 from .deps import service
 
 router = APIRouter()
+keyed_router = APIRouter()
 
 
-@router.get(
+@keyed_router.get(
     "/schema/metadata",
     response_model=MetadataSchemaModel,
     summary="Return the operator-declared metadata schema (which keys are searchable).",
@@ -54,7 +59,7 @@ async def metrics_endpoint() -> Response:
     return Response(content=payload, media_type=content_type)
 
 
-@router.get("/info", summary="Effective geometry, render_version and cache stats.")
+@keyed_router.get("/info", summary="Effective geometry, render_version and cache stats.")
 async def info(request: Request) -> dict[str, Any]:
     """Report effective geometry, render_version, revision gate, policy, pools and cache stats."""
     svc = service(request)
@@ -63,7 +68,7 @@ async def info(request: Request) -> dict[str, Any]:
         "version": __version__,
         "geometry": svc.settings.geometry,
         "render_version": svc.settings.render_version,
-        "secret_hash": svc.settings.secret_hash,
+        "volume_id": svc.volume_id,
         "pixel_tier": svc.settings.pixel_tier,
         "revision": svc.revision.status,
         "policy": {

@@ -30,14 +30,6 @@ class GeometryMismatch(RuntimeError):
         self.message = message
 
 
-class SecretMismatch(GeometryMismatch):
-    """Fatal: the volume was bound to a different TILER_DB_SECRET (or none).
-
-    Subclasses GeometryMismatch so the same startup catch sites treat it as fatal.
-    The secret is bound at init like geometry and immutable for the volume's life.
-    """
-
-
 class OutdatedVolume(GeometryMismatch):
     """Fatal: the volume predates columns the current schema needs.
 
@@ -70,9 +62,10 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
     render_version = settings.render_version
 
     if row is None:
-        meta = await store.init_service_meta(geometry, render_version, settings.secret_hash)
+        meta = await store.init_service_meta(geometry, render_version)
         log.info(
-            "initialised fresh volume: W=%d H=%d OVERLAP=%d MIN=%d render_version=%s",
+            "initialised fresh volume %s: W=%d H=%d OVERLAP=%d MIN=%d render_version=%s",
+            meta.volume_id,
             geometry["tile_width"],
             geometry["tile_height"],
             geometry["tile_overlap"],
@@ -100,16 +93,6 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
         log.critical(message)
 
         raise GeometryMismatch(message)
-
-    if row.secret_hash != settings.secret_hash:
-        message = (
-            "FATAL: volume bound to a different TILER_DB_SECRET (or none) than the "
-            "current env. Refusing to start. Restore the original secret, or point "
-            "TILER_DB_PATH/TILER_BLOB_DIR at a fresh volume."
-        )
-        log.critical(message)
-
-        raise SecretMismatch(message)
 
     if row.render_version != render_version:
         # Pixel tier: no serving until the stored docs are revised to the new version.

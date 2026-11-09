@@ -18,7 +18,7 @@ from .api import ops as ops_api
 from .api import revision as revision_api
 from .api import search as search_api
 from .api import tiles as tiles_api
-from .api.deps import require_serving
+from .api.deps import require_api_key, require_serving
 from .config import ConfigError, Settings, load_settings
 from .errors import install_error_handlers
 from .meta.schema import MetadataSchema, SchemaError, index_statements, load_schema
@@ -56,7 +56,7 @@ async def bootstrap(settings: Settings, schema: MetadataSchema) -> TilerService:
     try:
         await svc.store.create_tables()
         # Hard geometry gate: refuse to start against a volume built with different geometry.
-        await guard.enforce(svc.store, settings)
+        svc.volume_id = (await guard.enforce(svc.store, settings)).volume_id
 
     except BaseException:
         await svc.store.close()
@@ -119,6 +119,9 @@ async def lifespan(app: FastAPI):
     app.state.service = svc
     app.state.settings = settings
 
+    if not settings.api_key:
+        log.warning("TILER_API_KEY is empty: every route is open to anyone who reaches the port")
+
     sweeper = asyncio.create_task(_run_sweeper(svc, settings))
 
     try:
@@ -166,15 +169,18 @@ def create_app() -> FastAPI:
     )
     install_error_handlers(app)
 
-    # Data routes are gated by the revision; ops and /revision itself always answer.
-    serving = [Depends(require_serving)]
+    # Every route needs TILER_API_KEY but the probes and metrics; data routes are also
+    # gated by the revision, while ops and /revision itself always answer.
+    keyed = [Depends(require_api_key)]
+    serving = [*keyed, Depends(require_serving)]
 
     app.include_router(ingest_api.router, tags=["tiles"], dependencies=serving)
     app.include_router(tiles_api.router, tags=["tiles"], dependencies=serving)
     app.include_router(docs_api.router, tags=["docs"], dependencies=serving)
     app.include_router(metadata_api.router, tags=["metadata"], dependencies=serving)
     app.include_router(search_api.router, tags=["docs"], dependencies=serving)
-    app.include_router(revision_api.router, tags=["revision"])
+    app.include_router(revision_api.router, tags=["revision"], dependencies=keyed)
+    app.include_router(ops_api.keyed_router, tags=["ops"], dependencies=keyed)
     app.include_router(ops_api.router, tags=["ops"])
 
     return app

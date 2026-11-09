@@ -63,6 +63,7 @@ class TilerService:
         self._bulk_browsers = asyncio.Semaphore(settings.bulk_browsers)
         self.revision = Revision(self)
         self.started_at = time.time()
+        self.volume_id = ""  # set by bootstrap from service_meta
         # doc_ids with a streaming ingest in flight — the sweeper must not reap these.
         self._inflight: set[str] = set()
 

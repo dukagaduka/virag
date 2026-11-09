@@ -92,8 +92,8 @@ class Settings(BaseSettings):
     # pinned Playwright bundle's revision).
     chromium_revision_override: str = Field("", validation_alias="TILER_CHROMIUM_REVISION", repr=False)
 
-    # --- binding secret (optional; empty = an explicit, unbindable slot) ---
-    db_secret: str = Field("", repr=False)
+    # Bearer key for every route but liveness, readiness and metrics; empty = open.
+    api_key: str = Field("", repr=False)
 
 
     @model_validator(mode="after")
@@ -242,14 +242,6 @@ class Settings(BaseSettings):
         payload = orjson.dumps(tiers, option=orjson.OPT_SORT_KEYS)
 
         return hashlib.sha256(payload).hexdigest()[:16]
-
-
-    @property
-    def secret_hash(self) -> str:
-        """sha256 of TILER_DB_SECRET, or '' when unset — an explicit empty binding
-        slot, bound to the volume for life (like geometry). A consumer (virag) uses
-        it to refuse an unrelated store; the tiler itself stays usable standalone."""
-        return hashlib.sha256(self.db_secret.encode()).hexdigest() if self.db_secret else ""
 
 
     @staticmethod

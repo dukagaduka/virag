@@ -1,35 +1,33 @@
 # Security
 
-Three independent controls: the **binding secret** (pairs a volume with one consumer),
-**SSRF protection** (URL ingest can't be turned into a request forgery), and the
-**non-root container** hardening. Deployment mechanics for the last one live in
-[DEPLOYMENT.md](DEPLOYMENT.md); this page is the threat model and the guarantees.
+Three independent controls: the **API key** (only the holder of `TILER_API_KEY`
+reads or writes documents), **SSRF protection** (URL ingest can't be turned into a
+request forgery), and the **non-root container** hardening. Deployment mechanics for the
+last one live in [DEPLOYMENT.md](DEPLOYMENT.md); this page is the threat model and the
+guarantees.
 
 ---
 
-## 1. Binding secret
+## 1. API key
 
-`render_version` tells you two volumes were *configured* the same way; it cannot tell
-you they are the *same instance*. The binding secret closes that gap so a consumer (e.g.
-the RAG gateway and its vector DB) will only talk to the exact Tiler volume it was
-provisioned against — a mismatched but identically-configured Tiler is refused.
+Every route requires `Authorization: Bearer <TILER_API_KEY>` except the probes and the
+metrics: `GET /healthz`, `GET /readyz` and `GET /metrics` stay open for orchestrators
+and Prometheus (metrics carry low-cardinality counters only — no doc ids, names or
+content). A missing or wrong key answers `401 UNAUTHORIZED` with `WWW-Authenticate:
+Bearer`; keys are compared in constant time. The key is `repr`-suppressed in config so it
+never lands in a log line or a stack trace. Swagger UI (`/docs`) has an **Authorize**
+button for it.
 
-**Mechanism.** `TILER_DB_SECRET` is hashed once — `secret_hash =
-sha256(TILER_DB_SECRET)`, or `""` when unset — and stored in `service_meta.secret_hash`
-on first init. Thereafter it behaves exactly like the geometry guard:
+An empty `TILER_API_KEY` leaves every route open, with a startup `WARNING` — acceptable
+only on a network nobody untrusted can reach.
 
-- **Set before first init.** The value is immutable per volume. Booting an existing
-  volume with a different `TILER_DB_SECRET` is a **fatal startup error** — the process
-  refuses to serve.
-- **Empty is an explicit, unbindable slot.** An empty secret is stored as `""`; a volume
-  initialised without one can never be bound later without a fresh volume. This is
-  deliberate: "no secret" is a decision, not a default to be silently upgraded.
-- **Exposure.** `secret_hash` (never the secret itself) is reported on `GET /info`, so a
-  consumer can assert the pairing at connect time.
+### Volume id (not a secret)
 
-The same `TILER_DB_SECRET` is shared by the Tiler, its vector DB, and the gateway — one
-source of truth. It is `repr`-suppressed in config so it never lands in a log line or a
-stack trace.
+On first init the volume gets a random `volume_id`, stored in `service_meta` for life and
+reported on `GET /info`. `render_version` tells you two volumes were *configured* the
+same way; `volume_id` tells you they are the *same volume*, so a consumer (e.g. the RAG
+gateway and its vector DB) can refuse a fresh or another volume behind the same URL. It
+identifies, it does not authenticate — that is the API key's job.
 
 ## 2. SSRF protection (URL input)
 
@@ -45,10 +43,12 @@ subresource requests all pass through it.
 Policy:
 
 - Allow only `http` / `https`.
-- Reject if any resolved IP is in a private/loopback/link-local range:
-  `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`
-  (including `169.254.169.254`, the cloud metadata endpoint), `::1`, `fc00::/7`,
-  `fe80::/10`.
+- Reject if any resolved IP is not globally routable (`not ip.is_global`) or is
+  multicast: loopback, RFC 1918, link-local `169.254.0.0/16` (the cloud metadata
+  endpoint `169.254.169.254`), CGNAT `100.64.0.0/10` (Alibaba Cloud metadata
+  `100.100.100.200`), benchmarking, reserved, `::1`, `fc00::/7`, `fe80::/10`, … IPv4
+  embedded in IPv6 (v4-mapped `::ffff:0:0/96`, 6to4 `2002::/16`, NAT64 `64:ff9b::/96`)
+  is unwrapped and checked as IPv4.
 - Re-validate across redirects; enforce size and time limits.
 - Blocked target → `403`, counted in `tiler_ssrf_blocked_total`.
 
@@ -64,13 +64,15 @@ network where fetching internal hosts is the point.
   non-root uid + `no-new-privileges` are what contain it, so keep both.
 - All 5xx from rendering are caught, so a hostile or malformed document can't crash a
   worker or the event loop; oversized uploads are rejected with `413` before rendering.
+- An unexpected error answers a generic `500 INTERNAL_ERROR`; the exception text (which
+  may carry paths, URLs or document content) and its traceback go to the log only.
 
 ---
 
 ## Operator checklist
 
-- [ ] `TILER_DB_SECRET` set to a strong value **before** the volume's first boot (and
-      the same value configured on the consumer/vector DB).
+- [ ] `TILER_API_KEY` set to a strong random value (e.g. `openssl rand -hex 32`), the
+      same value configured on the consumer.
 - [ ] `TILER_URL_ALLOW_PRIVATE=false` in any deployment reachable from untrusted input.
 - [ ] `TILER_ALLOW_DELETE=false` unless deletion is genuinely required.
 - [ ] `TILER_MAX_DOC_BYTES` sized to your inputs (default 64 MiB).

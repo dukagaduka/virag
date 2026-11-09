@@ -16,6 +16,11 @@ info:
 servers:
   - url: http://localhost:8000
 
+# Every route needs `Authorization: Bearer <TILER_API_KEY>` (empty key = open) except
+# /healthz, /readyz and /metrics, which override it with `security: []`.
+security:
+  - bearerAuth: []
+
 paths:
   /tile:
     post:
@@ -338,7 +343,7 @@ paths:
                   version:        { type: string }
                   geometry:       { type: object, additionalProperties: { type: integer } }
                   render_version: { type: string }
-                  secret_hash:    { type: string }
+                  volume_id:      { type: string, description: Random id given to the volume at init; identifies it for life. Not a secret. }
                   pixel_tier:     { type: object, additionalProperties: true }
                   revision:       { $ref: '#/components/schemas/RevisionStatus' }
                   policy:         { type: object, additionalProperties: true }
@@ -348,11 +353,13 @@ paths:
 
   /healthz:
     get:
+      security: []
       operationId: healthz
       summary: Liveness (the container HEALTHCHECK; stays 200 through a revision).
       responses: { '200': { description: OK. } }
   /readyz:
     get:
+      security: []
       operationId: readyz
       summary: Readiness (DB, blob dir, Chromium pool, revision gate).
       responses:
@@ -360,11 +367,18 @@ paths:
         '503': { description: Not ready — including while a revision is pending or running (checks.revision). }
   /metrics:
     get:
+      security: []
       operationId: metrics
       summary: Prometheus metrics.
       responses: { '200': { description: Prometheus text exposition., content: { text/plain: { schema: { type: string } } } } }
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: TILER_API_KEY.
+
   schemas:
     DocType:
       type: string
@@ -571,7 +585,7 @@ components:
             code:
               type: string
               description: >
-                Machine-readable error code. Non-exhaustive vocabulary:
+                Machine-readable error code. Non-exhaustive vocabulary: UNAUTHORIZED,
                 UNKNOWN_DOC_TYPE, AMBIGUOUS_INPUT, MISSING_URL, MISSING_FILE,
                 PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA, SSRF_BLOCKED, UNKNOWN_DOC,
                 DOC_INCOMPLETE, MISSING_BLOB, UNKNOWN_TILE, TILE_OUT_OF_RANGE, RANGE_NOT_SATISFIABLE,

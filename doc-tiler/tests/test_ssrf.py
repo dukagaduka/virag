@@ -25,9 +25,15 @@ BLOCKED_IPS = [
     "::ffff:127.0.0.1",  # v4-mapped loopback
     "::ffff:169.254.169.254",
     "224.0.0.1",
+    "100.64.0.1",  # CGNAT
+    "100.100.100.200",  # Alibaba Cloud metadata (inside CGNAT)
+    "64:ff9b::a9fe:a9fe",  # NAT64 of 169.254.169.254
+    "64:ff9b::7f00:1",  # NAT64 of 127.0.0.1
+    "2002:7f00:1::",  # 6to4 of 127.0.0.1
+    "198.18.0.1",  # benchmarking
 ]
 
-ALLOWED_IPS = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"]
+ALLOWED_IPS = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111", "64:ff9b::808:808"]
 
 
 @pytest.mark.parametrize("ip", BLOCKED_IPS)

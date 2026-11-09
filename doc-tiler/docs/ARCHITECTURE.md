@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS service_meta (
     tile_overlap    INTEGER NOT NULL,
     min_tile_height INTEGER NOT NULL,
     render_version  TEXT    NOT NULL,   -- geometry + pixel tier
-    secret_hash     TEXT    NOT NULL DEFAULT '',  -- binding secret (see SECURITY.md)
+    volume_id       TEXT    NOT NULL,   -- random at init; identifies the volume
     initialized_at  INTEGER NOT NULL
 );
 
@@ -323,9 +323,9 @@ re-ingest. The guard runs both in `lifespan` and standalone as `python -m
 tiler.preflight`, which the container entrypoint runs before uvicorn so a mismatched
 volume produces one clear log line instead of a generic ASGI startup failure.
 
-The `secret_hash` column carries the **binding secret** that pairs this volume with a
-specific consumer/vector-DB; its guard behaves like the geometry guard (immutable per
-volume, fatal on mismatch). See [SECURITY.md](SECURITY.md).
+The `volume_id` column is a random id given to the volume at init and reported on
+`GET /info`, so a consumer can tell this volume from a fresh or another one behind the
+same URL. It is not a secret. See [SECURITY.md](SECURITY.md).
 
 ### `render_version`: bound to the volume, resolved by revision
 
@@ -472,7 +472,7 @@ tiler/
   service.py         # core: ingest, regeneration, the three-layer pool wiring, bulk slots
   revision.py        # serving gate + the job that brings stored docs to the current render_version
   config.py          # env + render_version + geometry/pixel tiers
-  guard.py           # startup geometry + binding-secret guard (service_meta)
+  guard.py           # startup geometry guard (service_meta)
   preflight.py       # standalone startup validation (runs before uvicorn)
   media.py  metrics.py  errors.py  models.py  responses.py  # mime sniff, Prometheus, error envelope, pydantic, orjson response
   api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  revision.py  ops.py

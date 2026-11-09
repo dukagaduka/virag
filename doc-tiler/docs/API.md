@@ -8,6 +8,11 @@ a schema can't convey.
 
 Base URL in examples: `http://localhost:8080`.
 
+**Authentication.** Every route requires `Authorization: Bearer <TILER_API_KEY>`
+except `GET /healthz`, `GET /readyz` and `GET /metrics`; a missing or wrong key answers
+`401 UNAUTHORIZED`. An empty `TILER_API_KEY` leaves everything open. The examples below
+omit the header — add `-H "Authorization: Bearer $TILER_API_KEY"` to each.
+
 ---
 
 ## Documents
@@ -172,7 +177,7 @@ curl -s -X POST localhost:8080/docs/search -H 'content-type: application/json' \
 | Endpoint | Purpose |
 |---|---|
 | `GET /schema/metadata` | The operator-declared metadata schema (which keys are searchable). |
-| `GET /info` | Effective geometry, `render_version`, pixel tier, revision status (`revision.serving`), policies, pool + cache stats, doc count. |
+| `GET /info` | Effective geometry, `render_version`, `volume_id`, pixel tier, revision status (`revision.serving`), policies, pool + cache stats, doc count. |
 | `GET /healthz` | Liveness — touches nothing, stays fast under load; the container `HEALTHCHECK`. |
 | `GET /readyz` | Readiness — checks DB, blob dir, Chromium pool and the revision gate; `503` when not ready (`checks.revision`, `checks.quarantined`). |
 | `GET /revision` | Revision status (see above). |
@@ -187,6 +192,7 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 | Code | When |
 |---|---|
 | `400` | Unknown `doc_type`, `tile_num` out of range, undeclared filter key, unsupported op, numeric op on a text field, bad cursor. |
+| `401` | Missing or wrong `TILER_API_KEY` (`UNAUTHORIZED`). |
 | `403` | SSRF policy block. |
 | `404` | Unknown `doc_id` (including `store=false` docs); `GET /get_tile` on an incomplete doc (`DOC_INCOMPLETE`). |
 | `405` | `DELETE` with `TILER_ALLOW_DELETE=false`. |
@@ -200,7 +206,7 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 | `503` | Data routes while a revision is pending or running (`NOT_READY`, with `Retry-After`). |
 | `504` | Render timeout. |
 
-**Startup** is separate: a geometry- or binding-secret mismatch makes the process exit
+**Startup** is separate: a geometry mismatch makes the process exit
 non-zero before serving anything (see [ARCHITECTURE.md](ARCHITECTURE.md) and
 [SECURITY.md](SECURITY.md)); a `render_version` change keeps it up but not serving until
 the revision is done. All 5xx from rendering are caught so one bad document never

@@ -106,11 +106,11 @@ storage. See [ARCHITECTURE.md](ARCHITECTURE.md) ("Incomplete-ingest sweeper").
 | `TILER_METADATA_SCHEMA_PATH` | `/config/metadata_schema.yaml` | Declared indexed-metadata schema (below). |
 | `TILER_LOG_LEVEL` | `INFO` | Logging level. |
 
-## Binding secret
+## API key
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TILER_DB_SECRET` | `""` | Brands this volume so only the matching consumer/vector-DB pair connects. Set **before first init** (immutable per volume, like geometry); empty = unbindable slot. See [SECURITY.md](SECURITY.md). |
+| `TILER_API_KEY` | `""` | Bearer key every route requires but `/healthz`, `/readyz` and `/metrics`. Empty = open (startup `WARNING`). See [SECURITY.md](SECURITY.md). |
 
 ---
 

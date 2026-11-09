@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import hmac
 from typing import Any
 
 import orjson
-from fastapi import Request, UploadFile
+from fastapi import Request, Security, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from ..errors import not_found, not_ready, too_large, unprocessable
+from ..errors import not_found, not_ready, too_large, unauthorized, unprocessable
 from ..hashing import is_doc_id
 from ..service import TilerService
 
 _CHUNK = 1 << 20
 
+# auto_error=False: a missing header answers our own 401 envelope, not FastAPI's 403.
+_BEARER = HTTPBearer(auto_error=False, description="TILER_API_KEY")
+
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"description": "Bad request."},
+    401: {"description": "Missing or invalid API key (TILER_API_KEY)."},
     403: {"description": "Blocked (e.g. SSRF)."},
     404: {"description": "Not found."},
     409: {"description": "Render non-determinism, or a revision already running."},
@@ -31,6 +37,21 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 def service(request: Request) -> TilerService:
     """Return the TilerService held on the app state."""
     return request.app.state.service
+
+
+def require_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Security(_BEARER),
+) -> None:
+    """Router dependency: a request must carry `Authorization: Bearer <TILER_API_KEY>`;
+    an empty TILER_API_KEY leaves the routes open."""
+    expected = service(request).settings.api_key
+
+    if not expected:
+        return
+
+    if credentials is None or not hmac.compare_digest(credentials.credentials.encode(), expected.encode()):
+        raise unauthorized("missing or invalid API key")
 
 
 def require_serving(request: Request) -> None:

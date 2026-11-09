@@ -10,7 +10,7 @@ mounted config file for the metadata schema. Everything below is driven from
 
 ```bash
 cd deploy
-cp .env.example .env          # set TILER_DB_SECRET and any geometry/pixel overrides
+cp .env.example .env          # set TILER_API_KEY and any geometry/pixel overrides
 docker compose up --build     # builds the runtime image, starts the service
 curl -s localhost:8080/readyz | jq
 ```
@@ -41,7 +41,7 @@ docker build --target test    -t tiler-test:3.2.0 .
 
 Startup is wrapped in `tini` (PID 1, reaps Chromium's zombie renderers) →
 `docker/entrypoint.sh`, which runs writability checks and the `python -m tiler.preflight`
-geometry/secret guard **before** `exec`'ing uvicorn, so a misconfigured volume produces
+geometry guard **before** `exec`'ing uvicorn, so a misconfigured volume produces
 one clear log line instead of a generic ASGI startup failure.
 
 ### Layers and what is pinned
@@ -106,10 +106,10 @@ All mutable state lives under `/data` (`TILER_DB_PATH`, `TILER_BLOB_DIR`,
 `TILER_TMP_DIR`), backed by one volume. The metadata schema is mounted read-only at
 `/config/metadata_schema.yaml`.
 
-**Geometry and the binding secret are immutable per volume.** Booting an existing volume
-with a different geometry — or a different `TILER_DB_SECRET` — is a fatal startup error
-(see [ARCHITECTURE.md](ARCHITECTURE.md) and [SECURITY.md](SECURITY.md)). To change
-either, deploy against a fresh volume and re-ingest.
+**Geometry is immutable per volume.** Booting an existing volume with a different
+geometry is a fatal startup error (see [ARCHITECTURE.md](ARCHITECTURE.md)). To change
+it, deploy against a fresh volume and re-ingest; the fresh volume gets a new
+`volume_id`, so a bound consumer refuses it until it is re-bound.
 
 **Reclaiming crashed streaming ingests.** `POST /tile/stream` persists a doc incrementally
 and leaves it incomplete if the stream dies. Set `TILER_INCOMPLETE_TTL_SEC` (default `0` =

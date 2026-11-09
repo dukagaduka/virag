@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 ALLOWED_SCHEMES = {"http", "https"}
 DEFAULT_PORTS = {"http": 80, "https": 443}
+NAT64_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")  # RFC 6052 well-known prefix
 
 
 class BlockedTarget(Exception):
@@ -27,7 +28,8 @@ class Target:
 
 
 def ip_is_blocked(raw: str) -> bool:
-    """Reject loopback / private / link-local / reserved / multicast destinations."""
+    """Reject every destination that is not globally routable (loopback, private,
+    CGNAT, link-local, reserved, …) and multicast."""
     try:
         ip = ipaddress.ip_address(raw)
 
@@ -35,21 +37,16 @@ def ip_is_blocked(raw: str) -> bool:
         return True
 
     if isinstance(ip, ipaddress.IPv6Address):
-        # Unwrap v4-mapped/compatible forms so ::ffff:127.0.0.1 cannot slip through.
+        # Unwrap v4-mapped, 6to4 and NAT64 forms so ::ffff:127.0.0.1 or
+        # 64:ff9b::a9fe:a9fe cannot slip through as "global" IPv6.
         if ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
-        elif getattr(ip, "sixtofour", None) is not None:
+        elif ip.sixtofour is not None:
             ip = ip.sixtofour
+        elif ip in NAT64_PREFIX:
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
 
-    return bool(
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-        or (isinstance(ip, ipaddress.IPv6Address) and ip.is_site_local)
-    )
+    return not ip.is_global or ip.is_multicast
 
 
 def _resolve(host: str, port: int) -> list[str]:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -37,7 +38,7 @@ DDL = (
         tile_overlap    INTEGER NOT NULL,
         min_tile_height INTEGER NOT NULL,
         render_version  TEXT    NOT NULL,
-        secret_hash     TEXT    NOT NULL DEFAULT '',
+        volume_id       TEXT    NOT NULL,
         initialized_at  INTEGER NOT NULL
     )
     """,
@@ -102,7 +103,7 @@ class SearchError(ValueError):
 
 @dataclass(frozen=True)
 class ServiceMeta:
-    """The singleton service-config row: geometry plus render version."""
+    """The singleton service-config row: geometry, render version and the volume's id."""
 
     tile_width: int
     tile_height: int
@@ -110,7 +111,7 @@ class ServiceMeta:
     min_tile_height: int
     render_version: str
     initialized_at: int
-    secret_hash: str = ""
+    volume_id: str
 
 
 @dataclass(frozen=True)
@@ -274,11 +275,11 @@ def build_search_query(
 class MetaStore:
     """Async wrapper over the SQLite database backing docs, tiles, and search."""
 
-    # Columns that older volumes lacked (binding secret, streaming ingest, PDF strip
+    # Columns that older volumes lacked (volume id, streaming ingest, PDF strip
     # slicing). They are in DDL for fresh volumes; an old volume without them is not
     # migrated — the guard refuses it at startup instead.
     REQUIRED_COLUMNS = {
-        "service_meta": ("secret_hash",),
+        "service_meta": ("volume_id",),
         "docs": ("complete", "page_heights"),
     }
 
@@ -399,7 +400,7 @@ class MetaStore:
             min_tile_height=row["min_tile_height"],
             render_version=row["render_version"],
             initialized_at=row["initialized_at"],
-            secret_hash=row["secret_hash"],
+            volume_id=row["volume_id"],
         )
 
 
@@ -407,29 +408,31 @@ class MetaStore:
         self,
         geometry: dict[str, int],
         render_version: str,
-        secret_hash: str = "",
     ) -> ServiceMeta:
-        """Insert the singleton service-config row for a fresh database."""
+        """Insert the singleton service-config row for a fresh database, giving the
+        volume a random id for life: a consumer (virag) binds to it, so a fresh or
+        another volume behind the same URL is never taken for this one."""
         now = int(time.time())
+        volume_id = uuid.uuid4().hex
 
         async with self._lock:
             await self.db.execute(
                 "INSERT INTO service_meta (id, tile_width, tile_height, tile_overlap, "
-                "min_tile_height, render_version, secret_hash, initialized_at) VALUES (1,?,?,?,?,?,?,?)",
+                "min_tile_height, render_version, volume_id, initialized_at) VALUES (1,?,?,?,?,?,?,?)",
                 (
                     geometry["tile_width"],
                     geometry["tile_height"],
                     geometry["tile_overlap"],
                     geometry["min_tile_height"],
                     render_version,
-                    secret_hash,
+                    volume_id,
                     now,
                 ),
             )
             await self.db.commit()
 
         return ServiceMeta(
-            render_version=render_version, initialized_at=now, secret_hash=secret_hash, **geometry
+            render_version=render_version, initialized_at=now, volume_id=volume_id, **geometry
         )
 
 

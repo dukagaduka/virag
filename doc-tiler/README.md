@@ -17,7 +17,7 @@ is the contract the embedding stage stores as its payload to later call `/get_ti
 
 ```bash
 cd deploy
-cp .env.example .env          # set TILER_DB_SECRET, adjust geometry/pixel if needed
+cp .env.example .env          # set TILER_API_KEY, adjust geometry/pixel if needed
 docker compose up --build
 curl -s localhost:8080/readyz | jq
 
@@ -47,7 +47,7 @@ Interactive API docs: <http://localhost:8080/docs>. Runtime introspection (geome
 | [docs/METRICS.md](docs/METRICS.md) | Prometheus metrics at `/metrics`, alerts. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Concurrency model, storage, geometry, guard, determinism — the rationale. |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Image, Compose, volume, non-root runtime, scaling. |
-| [docs/SECURITY.md](docs/SECURITY.md) | Binding secret, SSRF protection, container hardening. |
+| [docs/SECURITY.md](docs/SECURITY.md) | API key, volume id, SSRF protection, container hardening. |
 
 ## Design invariants
 
@@ -72,7 +72,7 @@ tiler/            the service package
   service.py      core: ingest, regeneration, the three-layer pool wiring, bulk slots
   revision.py     serving gate + re-render of docs from another render_version
   config.py       env, geometry/pixel tiers, render_version
-  guard.py        startup geometry + binding-secret guard
+  guard.py        startup geometry guard
   api/            ingest, tiles, docs, metadata, search, revision, ops
   render/         geometry (forward+reverse), render (PDF/PIL), browser (Chromium), types
   store/          blobs (content-addressed FS), meta (SQLite), cache (async LRU)

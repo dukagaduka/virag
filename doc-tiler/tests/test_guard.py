@@ -117,3 +117,17 @@ async def test_render_version_is_serializer_independent(overrides):
     tiers = {"geometry": s.geometry, "pixel": s.pixel_tier, **({"pdf": s.pdf_tier} if s.pdf_slice else {})}
     legacy = json.dumps(tiers, sort_keys=True, separators=(",", ":"))
     assert s.render_version == hashlib.sha256(legacy.encode()).hexdigest()[:16]
+
+
+async def test_volume_id_is_stable_for_the_volume_and_unique_across_volumes(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    env = base_env(tmp_path / "a")
+
+    async with running_app(env) as (client, svc):
+        first = (await client.get("/info")).json()["volume_id"]
+        assert first == svc.volume_id and len(first) == 32
+    async with running_app(env) as (client, _):
+        assert (await client.get("/info")).json()["volume_id"] == first
+    async with running_app(base_env(tmp_path / "b")) as (client, _):
+        assert (await client.get("/info")).json()["volume_id"] != first
