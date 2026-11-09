@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 
 from virag.clients.qdrant_store import QdrantStore
@@ -20,54 +19,43 @@ REQUIRED_METADATA_FIELDS = {
 
 
 class BindingError(RuntimeError):
-    """Fatal: the Tiler and Qdrant are not the bound, matching pair for this virag."""
+    """Fatal: the Qdrant collection belongs to another tiler volume than this tiler's."""
 
 
-def secret_hash(secret: str) -> str:
-    """sha256 of the binding secret, or '' when unset (an empty, unbound slot)."""
-    return hashlib.sha256(secret.encode()).hexdigest() if secret else ""
+async def enforce_binding(store: QdrantStore, tiler: TilerService) -> str:
+    """Refuse to run unless the Qdrant collection was embedded from this tiler's volume.
 
-
-async def enforce_binding(
-    store: QdrantStore,
-    tiler: TilerService,
-    expected_secret_hash: str,
-) -> str:
-    """Refuse to run unless virag, the Tiler and the Qdrant collection share one secret.
-
-    Fatal (BindingError) on any secret mismatch. A fresh (unbound) collection is
-    bound to the secret + tiler render_version on first run; a render_version that
+    The tiler gives each volume a random `volume_id` at init. A fresh (unbound)
+    collection is bound to it, with the tiler render_version, on first run; another id
+    later is fatal (BindingError) — a fresh or another volume behind TILER_BASE_URL would
+    otherwise make every point look orphaned to reconcile. A render_version that
     differs later is not fatal (RevisionManager.revise_if_stale). Returns the tiler
     render_version.
     """
     info = await tiler.get_info()
-    tiler_secret = info.get("secret_hash", "")
+    volume_id = info.get("volume_id")
     tiler_rv = info.get("render_version")
 
-    if tiler_secret != expected_secret_hash:
-        message = (
-            "tiler secret does not match TILER_DB_SECRET — the tiler is not bound to "
-            "this virag (or was initialised without the secret)"
-        )
+    if not volume_id:
+        message = "the tiler reports no volume_id; it is older than this virag"
         log.critical("FATAL: %s", message)
 
         raise BindingError(message)
 
     meta = await store.get_collection_metadata()
-    stored_secret = meta.get("secret_hash")
+    bound_volume_id = meta.get("tiler_volume_id")
 
-    if stored_secret is None:
-        await store.set_collection_metadata(
-            {"secret_hash": expected_secret_hash, "render_version": tiler_rv}
-        )
-        log.info("bound qdrant collection to the secret + render_version=%s", tiler_rv)
+    if bound_volume_id is None:
+        await store.set_collection_metadata({"tiler_volume_id": volume_id, "render_version": tiler_rv})
+        log.info("bound qdrant collection to tiler volume %s, render_version=%s", volume_id, tiler_rv)
 
         return tiler_rv
 
-    if stored_secret != expected_secret_hash:
+    if bound_volume_id != volume_id:
         message = (
-            "qdrant collection secret does not match TILER_DB_SECRET — the collection "
-            "belongs to a different virag/tiler pair"
+            f"qdrant collection was embedded from tiler volume {bound_volume_id}, but the "
+            f"tiler at TILER_BASE_URL serves volume {volume_id}: restore that volume, or "
+            f"drop the collection and re-enroll"
         )
         log.critical("FATAL: %s", message)
 

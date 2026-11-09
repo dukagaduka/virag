@@ -4,6 +4,7 @@ import logging
 import re
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -62,8 +63,13 @@ class QdrantStore:
     RETRY_SERVICES = ("qdrant.Points",)
     RETRY_COLLECTION_METHODS = ("Get", "List", "CollectionExists", "ListAliases", "ListCollectionAliases", "Update")
 
-    # Statuses meaning "Qdrant is unreachable right now" — surfaced as a 503.
-    UNAVAILABLE_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+    # Statuses meaning "Qdrant is unusable right now" — surfaced as a 503. A rejected
+    # QDRANT_API_KEY is one: the details name UNAUTHENTICATED.
+    UNAVAILABLE_CODES = (
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.UNAUTHENTICATED,
+    )
 
     # doc_ids per filtered delete request — one MatchAny filter instead of N requests.
     DELETE_DOCS_CHUNK = 256
@@ -89,6 +95,7 @@ class QdrantStore:
         vector_size: int,
         *,
         grpc_port: int,
+        api_key: str,
         timeout: int,
         max_retries: int,
         backoff_base: float,
@@ -113,17 +120,23 @@ class QdrantStore:
         self.max_batch_chunks = max_batch_chunks
 
         # gRPC: one multiplexed HTTP/2 channel — no pool of idle HTTP/1.1 connections to
-        # race the server's keep-alive — and retries done by the channel itself.
-        self.qdrant = AsyncQdrantClient(
-            url=self.base_url,
-            prefer_grpc=True,
-            grpc_port=grpc_port,
-            timeout=timeout,
-            grpc_options={
-                "grpc.enable_retries": 1,
-                "grpc.service_config": self._service_config(max_retries, backoff_base, backoff_cap),
-            },
-        )
+        # race the server's keep-alive — and retries done by the channel itself. The key
+        # travels in plain text inside the compose network by design; the client's
+        # warning about it would only repeat that on every start.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Api key is used with an insecure connection")
+
+            self.qdrant = AsyncQdrantClient(
+                url=self.base_url,
+                prefer_grpc=True,
+                grpc_port=grpc_port,
+                api_key=api_key or None,
+                timeout=timeout,
+                grpc_options={
+                    "grpc.enable_retries": 1,
+                    "grpc.service_config": self._service_config(max_retries, backoff_base, backoff_cap),
+                },
+            )
 
 
     @classmethod
@@ -133,6 +146,7 @@ class QdrantStore:
             collection_name=qs.collection_name,
             vector_size=qs.vector_size,
             grpc_port=qs.grpc_port,
+            api_key=qs.api_key,
             timeout=qs.timeout_sec,
             max_retries=qs.max_retries,
             backoff_base=hs.backoff_base_sec,

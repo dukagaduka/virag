@@ -49,7 +49,7 @@ def _run_job(manager, start) -> dict:
 
 def test_revision_builds_swaps_and_syncs_journal():
     store, tiler = FakeStore(), FakeTiler()
-    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    store.metadata = {"tiler_volume_id": "vol-test", "render_version": "rv-old"}
     tiler.docs = [_doc("a", 2), _doc("b", 1, complete=False), _doc("q", 1) | {"quarantined": True}, _doc("fresh", 1)]
     manager = _manager(store, tiler)
 
@@ -71,7 +71,7 @@ def test_revision_builds_swaps_and_syncs_journal():
     assert status["synced"] == 1
     assert store.swapped_to == "c__v2"
     assert store.previous_name == "c__v1"                               # retained for rollback
-    assert store.metadata == {"secret_hash": "", "render_version": "rv-test"}   # bound to the tiler's
+    assert store.metadata == {"tiler_volume_id": "vol-test", "render_version": "rv-test"}   # bound to the tiler's
     assert all(u["collection"] == "c__v2" for u in store.upserts)
     assert ("fresh", "c__v2") in zip(store.deletes, store.delete_collections)   # re-synced after swap
     assert tiler.metadata_patches == []                                 # revision never touches markers
@@ -90,7 +90,7 @@ def test_revision_releases_the_job_and_publishes_its_outcome():
 
 
 def test_revision_is_refused_while_the_tiler_is_not_serving():
-    tiler = FakeTiler(info={"secret_hash": "", "render_version": "rv-test",
+    tiler = FakeTiler(info={"volume_id": "vol-test", "render_version": "rv-test",
                             "revision": {"state": "running", "serving": False}})
     manager = _manager(FakeStore(), tiler)
 
@@ -104,7 +104,7 @@ def test_revision_is_refused_while_the_tiler_is_not_serving():
 
 def test_startup_mismatch_is_only_logged_by_default(caplog):
     store = FakeStore()
-    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    store.metadata = {"tiler_volume_id": "vol-test", "render_version": "rv-old"}
     manager = _manager(store, FakeTiler())
 
     asyncio.run(manager.revise_if_stale(auto=False))
@@ -115,7 +115,7 @@ def test_startup_mismatch_is_only_logged_by_default(caplog):
 
 def test_startup_mismatch_starts_the_revision_when_enabled():
     store, tiler = FakeStore(), FakeTiler()
-    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    store.metadata = {"tiler_volume_id": "vol-test", "render_version": "rv-old"}
     tiler.docs = [_doc("a", 1)]
     manager = _manager(store, tiler)
 
@@ -127,7 +127,7 @@ def test_startup_mismatch_starts_the_revision_when_enabled():
 
 def test_startup_mismatch_leaves_a_revision_running_elsewhere_alone():
     store, tiler = FakeStore(), FakeTiler()
-    store.metadata = {"secret_hash": "", "render_version": "rv-old"}
+    store.metadata = {"tiler_volume_id": "vol-test", "render_version": "rv-old"}
     other = make_coordinator(store)
     manager = _manager(store, tiler, make_coordinator(store, valkey=other.valkey))
 
@@ -142,7 +142,7 @@ def test_startup_mismatch_leaves_a_revision_running_elsewhere_alone():
 
 def test_startup_without_mismatch_starts_nothing():
     store = FakeStore()
-    store.metadata = {"secret_hash": "", "render_version": "rv-test"}
+    store.metadata = {"tiler_volume_id": "vol-test", "render_version": "rv-test"}
     manager = _manager(store, FakeTiler())
 
     asyncio.run(manager.revise_if_stale(auto=True))

@@ -83,12 +83,13 @@ class HttpSettings(_Section):
 
 class QdrantStoreSettings(_Section):
     """Qdrant: the data path speaks gRPC to the host of `base_url`; REST (the URL's port)
-    still serves the /qdrant proxy and the client's version check."""
+    serves the client's version check."""
 
     model_config = SettingsConfigDict(env_prefix="QDRANT_")
 
     base_url: str = "http://qdrant-service:6333"
     grpc_port: int = Field(6334, ge=1, le=65535)
+    api_key: str = Field("", repr=False)        # Qdrant's service.api_key; empty = none
     timeout_sec: int = Field(60, ge=1)          # per-call deadline
     max_retries: int = Field(3, ge=0, le=4)     # gRPC caps a call at 5 attempts in total
     collection_name: str = "store-collection"   # the serving alias
@@ -157,6 +158,7 @@ class TilerSettings(_UpstreamSettings):
     model_config = SettingsConfigDict(env_prefix="TILER_")
 
     base_url: str = "http://tiler-virag:8080"
+    api_key: str = Field("", repr=False)        # the tiler's TILER_API_KEY; empty = none
     timeout_sec: int = Field(120, ge=1)         # for the tile stream: the max gap between events
     max_concurrency: int = Field(32, ge=0)      # bulk tile regeneration only; chat RAG bypasses it
 
@@ -204,11 +206,9 @@ class CoordinationSettings(_Section):
 class Settings(_Section):
     model_config = SettingsConfigDict(env_prefix="VIRAG_")
 
-    host: str = "127.0.0.1"
-    port: int = Field(8080, ge=1, le=65535)
-    # Single binding secret shared with the tiler (and stamped on the Qdrant collection);
-    # read from TILER_DB_SECRET so all three agree on one value.
-    db_secret: str = Field("", validation_alias="TILER_DB_SECRET")
+    # Bearer keys of virag's own clients; an empty key leaves its routes open.
+    api_key: str = Field("", repr=False)        # /v1/*: what a client uses as its "LLM key"
+    admin_api_key: str = Field("", repr=False)  # /enroll, /revision*; also valid on /v1/*
 
     rag_settings: RagSettings = Field(default_factory=RagSettings)
     http_settings: HttpSettings = Field(default_factory=HttpSettings)

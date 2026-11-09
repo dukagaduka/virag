@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 import httpx2
@@ -8,6 +9,9 @@ from virag.clients.http_service import OpenAIService
 from virag.errors import ApiError
 from virag.settings import HttpSettings, VLMSettings
 from virag.utils import error_body
+
+
+log = logging.getLogger(__name__)
 
 
 class VLMClient(OpenAIService):
@@ -39,6 +43,25 @@ class VLMClient(OpenAIService):
     async def check_connection(self) -> None:
         await super().check_connection()
         await self._probe_vision()
+
+
+    async def model_card(self) -> dict:
+        """The upstream's `/models` entry of `model_name` — the only model a chat is
+        answered with, whatever its `model` field says. A minimal card stands in when the
+        upstream lists no such entry or does not answer."""
+        try:
+            response = await self._request("GET", self.models_route, action="the model list")
+            models = self._json(response, action="the model list", parse=lambda data: data["data"])
+
+        except ApiError as e:
+            log.warning("model list: upstream failed, answering with %s alone: %s", self.model_name, e.message)
+            models = []
+
+        for model in models:
+            if isinstance(model, dict) and model.get("id") == self.model_name:
+                return model
+
+        return {"id": self.model_name, "object": "model", "created": 0, "owned_by": "virag"}
 
 
     async def _probe_vision(self) -> None:

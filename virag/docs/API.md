@@ -10,7 +10,13 @@ A **live, always-accurate** OpenAPI document is served by the app itself:
 - Raw spec: `GET /openapi.json`
 
 This page explains the semantics that a schema can't — especially the `rag` trigger and
-how sources are returned. Base URL in examples: `http://localhost:8080`.
+how sources are returned. Base URL in examples: `http://localhost:48000`.
+
+**Authentication.** `/v1/*` needs `Authorization: Bearer <VIRAG_API_KEY>` (or the admin
+key); `/enroll` and `/revision*` need `Authorization: Bearer <VIRAG_ADMIN_API_KEY>`.
+`/health` and `/ready` are open; an empty key leaves its routes open. The examples below
+omit the header — add `-H "Authorization: Bearer $VIRAG_API_KEY"` (or the admin key). An
+OpenAI SDK takes `VIRAG_API_KEY` as its `api_key`. See [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -216,19 +222,12 @@ than the tiler renders now is refused too: chat would answer `RENDER_VERSION_MIS
 
 ---
 
-## Passthrough proxy
+## `GET /v1/models`
 
-Reach the backend services through the gateway. Each prefix is stripped and the rest of
-the path (plus query string) is forwarded upstream, streaming the response.
-
-| Route | Upstream | Notes |
-|---|---|---|
-| `ANY /tiler/{path}` | doc-tiler | e.g. `GET /tiler/get_tile?doc_id=…&tile_num=0`. |
-| `ANY /retriever/{path}` | retriever server | `Authorization` injected from `RETRIEVER_API_KEY`. |
-| `ANY /qdrant/{path}` | Qdrant | e.g. `GET /qdrant/collections`. |
-| `ANY /v1/{path}` | VLM | Every `/v1/*` **except** `/v1/chat/completions`; `Authorization` injected from `VLM_API_KEY`. |
-
-An unreachable upstream returns `502`.
+The OpenAI model list, with exactly one model: the upstream VLM's own entry for
+`VLM_MODEL_NAME` (virag answers every chat with that model, whatever the request's
+`model` says). When the upstream lists no such entry or does not answer, a minimal
+`{"id": VLM_MODEL_NAME, "object": "model", …}` stands in. No other `/v1/*` route exists.
 
 ---
 
@@ -251,6 +250,8 @@ Every error uses one shape:
 
 | Status | `code` | Typical cause |
 |---|---|---|
+| `401` | `UNAUTHORIZED` | Missing or wrong `VIRAG_API_KEY` / `VIRAG_ADMIN_API_KEY` (with `WWW-Authenticate: Bearer`). |
+| `403` | `FORBIDDEN` | The user key on an admin route (`/enroll`, `/revision*`). |
 | `409` | `RENDER_VERSION_MISMATCH` | A retrieved tile is rendered by another `render_version` than it was embedded from — rebuild with `POST /revision`. |
 | `422` | `UNPROCESSABLE` | Bad request body/JSON, invalid `rag` field, RAG on with no query text, bad `metadata`. |
 | `502` | `UPSTREAM_FAILURE` | A backend (VLM, tiler, retriever, Qdrant) could not be reached. |
@@ -258,4 +259,4 @@ Every error uses one shape:
 | `500` | `INTERNAL_ERROR` | Unexpected server error. |
 
 Backend services can surface their own statuses (e.g. the tiler's `409`/`413`) through
-the proxy and enroll paths; those pass through with the originating service's meaning.
+the enroll path; those pass through with the originating service's meaning.

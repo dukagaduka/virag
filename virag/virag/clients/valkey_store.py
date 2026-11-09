@@ -5,6 +5,7 @@ from typing import Any, Iterable, TypeAlias
 
 import orjson
 import redis.asyncio as redis
+from redis.exceptions import AuthenticationError as RedisAuthenticationError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
@@ -71,8 +72,17 @@ class ValkeyStore:
 
     @_unavailable_as_503
     async def check_connection(self) -> None:
-        """Reachable, and new enough for the conditional commands."""
-        await self.redis.ping()
+        """Reachable, the password in VALKEY_URL accepted, and new enough for the
+        conditional commands."""
+        try:
+            await self.redis.ping()
+
+        except RedisAuthenticationError as e:
+            raise ApiError(
+                status_code=503,
+                message="Valkey rejects the password in VALKEY_URL: set the requirepass of its valkey.conf",
+                details={"error": repr(e)},
+            ) from e
 
         version = (await self.redis.info("server")).get("valkey_version")
         parsed = tuple(int(part) for part in str(version).split(".")[:2]) if version else None

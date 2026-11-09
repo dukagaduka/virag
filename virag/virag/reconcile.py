@@ -9,8 +9,9 @@ Runs at startup and (optionally) on an interval, in the one process leading it
      older than the TTL is a crashed/partial enroll; drop its partial points.
 
 The TTL gate (`virag_started_at < now - pending_ttl_sec`) skips in-flight enrolls,
-whose `virag_started_at` is ~now. Because the tiler is bound to this virag by secret,
-every tiler doc carries virag metadata, so there are no foreign docs to misjudge.
+whose `virag_started_at` is ~now. Because the collection is bound to the tiler's volume
+and only virag holds TILER_API_KEY, every tiler doc carries virag metadata, so there are
+no foreign docs to misjudge.
 
 Also home of the flat tile-stream re-embed (`reembed_docs`, `sync_docs`) shared by
 self-heal, revision and rollback.

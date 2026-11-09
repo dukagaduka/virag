@@ -1,71 +1,59 @@
-"""binding: secret hashing and the fatal virag/tiler/qdrant secret binding."""
+"""binding: the Qdrant collection is bound to the tiler volume it was embedded from."""
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 
 import pytest
 
-from virag.binding import BindingError, enforce_binding, enforce_metadata_schema, secret_hash
+from virag.binding import BindingError, enforce_binding, enforce_metadata_schema
 
 from conftest import FakeStore, FakeTiler
 
 
-def test_secret_hash_empty():
-    assert secret_hash("") == ""
-
-
-def test_secret_hash_value():
-    assert secret_hash("abc") == hashlib.sha256(b"abc").hexdigest()
-
-
 def test_fresh_collection_is_bound():
-    expected = secret_hash("shared")
     store = FakeStore()                                     # metadata None → unbound
-    tiler = FakeTiler(info={"secret_hash": expected, "render_version": "rv-9"})
+    tiler = FakeTiler(info={"volume_id": "vol-1", "render_version": "rv-9"})
 
-    rv = asyncio.run(enforce_binding(store, tiler, expected))
+    rv = asyncio.run(enforce_binding(store, tiler))
 
     assert rv == "rv-9"
-    assert store.metadata == {"secret_hash": expected, "render_version": "rv-9"}
+    assert store.metadata == {"tiler_volume_id": "vol-1", "render_version": "rv-9"}
 
 
-def test_already_bound_matching_secret_ok():
-    expected = secret_hash("shared")
+def test_already_bound_same_volume_ok():
     store = FakeStore()
-    store.metadata = {"secret_hash": expected, "render_version": "rv-9"}
-    tiler = FakeTiler(info={"secret_hash": expected, "render_version": "rv-9"})
+    store.metadata = {"tiler_volume_id": "vol-1", "render_version": "rv-9"}
+    tiler = FakeTiler(info={"volume_id": "vol-1", "render_version": "rv-9"})
 
-    rv = asyncio.run(enforce_binding(store, tiler, expected))
-    assert rv == "rv-9"
+    assert asyncio.run(enforce_binding(store, tiler)) == "rv-9"
 
 
-def test_tiler_secret_mismatch_is_fatal():
+def test_another_volume_is_fatal():
+    # e.g. the tiler came back on a fresh, empty volume: reconcile would take every point for an orphan
     store = FakeStore()
-    tiler = FakeTiler(info={"secret_hash": secret_hash("other"), "render_version": "rv"})
+    store.metadata = {"tiler_volume_id": "vol-1", "render_version": "rv"}
+    tiler = FakeTiler(info={"volume_id": "vol-2", "render_version": "rv"})
+
+    with pytest.raises(BindingError, match="vol-1.*vol-2"):
+        asyncio.run(enforce_binding(store, tiler))
+
+
+def test_tiler_without_volume_id_is_fatal():
+    store = FakeStore()
+    tiler = FakeTiler(info={"render_version": "rv"})
 
     with pytest.raises(BindingError):
-        asyncio.run(enforce_binding(store, tiler, secret_hash("shared")))
-
-
-def test_collection_secret_mismatch_is_fatal():
-    expected = secret_hash("shared")
-    store = FakeStore()
-    store.metadata = {"secret_hash": secret_hash("someone-else"), "render_version": "rv"}
-    tiler = FakeTiler(info={"secret_hash": expected, "render_version": "rv"})
-
-    with pytest.raises(BindingError):
-        asyncio.run(enforce_binding(store, tiler, expected))
+        asyncio.run(enforce_binding(store, tiler))
+    assert store.metadata is None                           # nothing bound
 
 
 def test_render_version_drift_is_not_fatal():
-    expected = secret_hash("shared")
     store = FakeStore()
-    store.metadata = {"secret_hash": expected, "render_version": "rv-OLD"}
-    tiler = FakeTiler(info={"secret_hash": expected, "render_version": "rv-NEW"})
+    store.metadata = {"tiler_volume_id": "vol-1", "render_version": "rv-OLD"}
+    tiler = FakeTiler(info={"volume_id": "vol-1", "render_version": "rv-NEW"})
 
-    rv = asyncio.run(enforce_binding(store, tiler, expected))
+    rv = asyncio.run(enforce_binding(store, tiler))
     assert rv == "rv-NEW"        # not fatal: chat answers RENDER_VERSION_MISMATCH until a revision
     assert store.metadata["render_version"] == "rv-OLD"     # binding never rewrites it
 

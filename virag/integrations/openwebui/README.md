@@ -55,7 +55,7 @@ That's it — open a new chat and the two `virag (…)` models are in the select
 | Valve | Default | Meaning |
 |---|---|---|
 | `VIRAG_BASE_URL` | `http://virag:8080` | Gateway base URL, no trailing slash. |
-| `VIRAG_API_KEY` | *(empty)* | Optional bearer token if the gateway is protected. |
+| `VIRAG_API_KEY` | *(empty)* | virag's `VIRAG_API_KEY`; leave empty only if virag runs with it empty. |
 | `MODEL` | `my-vlm` | Upstream VLM name virag forwards to. |
 | `TOP_K` | `0` | Candidate tiles to take from Qdrant (virag's `rag.top_k`); `0` = virag's `RETRIEVER_TOP_K`. Without a reranker every candidate reaches the model — each tile is a page image ≈ a few hundred vision tokens, so keep it modest: more tiles = a bigger, slower request and a longer prefill. |
 | `RETRIEVER_THRESHOLD` | `0.25` | Minimum Qdrant score of a candidate (virag's `rag.retriever_threshold`); negative = virag's `RETRIEVER_THRESHOLD`. |
@@ -100,9 +100,10 @@ preview carries `name`, `doc_id`, `tile_num`, `score` and, for a reranked tile,
 Citations render **text**, so the chip shows tile metadata rather than the image itself —
 enough to see *which* document and page the model was grounded on.
 
-> **Want the tile as an actual image?** Fetch it through virag's proxy —
-> `GET /tiler/get_tile?doc_id=…&tile_num=…` — and inline it via an `image` event or a
-> markdown image in the stream. That's a deliberate extension beyond this minimal plugin.
+> **Want the tile as an actual image?** virag does not serve tiles; fetch it from the
+> tiler — `GET /get_tile?doc_id=…&tile_num=…` with `TILER_API_KEY` — and inline it via an
+> `image` event or a markdown image in the stream. That's a deliberate extension beyond
+> this minimal plugin.
 
 ## Troubleshooting
 

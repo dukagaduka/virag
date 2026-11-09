@@ -27,10 +27,9 @@ checks the version at startup.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `VIRAG_HOST` | no | `127.0.0.1` | Host in `Settings`. In the container the bind address comes from the `uvicorn` CLI (`--host 0.0.0.0`); see [DEPLOYMENT.md](DEPLOYMENT.md). |
-| `VIRAG_PORT` | no | `8080` | Port (1–65535), same note as above. |
+| `VIRAG_API_KEY` | no | `""` | Bearer key for `/v1/*`; clients use it as if it were the LLM's key. Empty = open (a startup `WARNING`). See [SECURITY.md](SECURITY.md). |
+| `VIRAG_ADMIN_API_KEY` | no | `""` | Bearer key for `/enroll` and `/revision*` (and `/v1/*` too). Empty = open (a startup `WARNING`). |
 | `LOG_LEVEL` | no | `INFO` | Logging level (read in `configure_logging`). |
-| `TILER_DB_SECRET` | no | `""` | The single binding secret shared by virag, the tiler and the Qdrant collection. Empty = an explicit, unbound slot. See [SECURITY.md](SECURITY.md). |
 
 ## RAG defaults
 
@@ -80,7 +79,7 @@ leases, the writers registry, the revision job and the reconcile lead. See
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `VALKEY_URL` | **yes** | — | `redis://[:password@]host:port/db`. A password here is a secret. |
+| `VALKEY_URL` | **yes** | — | `redis://[:password@]host:port/db`. The password is Valkey's `requirepass` and a secret; a wrong one fails startup (`Valkey rejects the password in VALKEY_URL`). |
 | `VALKEY_PREFIX` | no | `virag` | Prefix of every key. Deployments sharing one Valkey need distinct prefixes (or databases). |
 | `VALKEY_TIMEOUT_SEC` | no | `2` | Connect and per-command deadline (> 0); past it the call is a `503`. |
 | `VALKEY_MAX_CONNECTIONS` | no | `64` | Connection pool size (≥ 1). |
@@ -94,8 +93,9 @@ N times as much.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `QDRANT_BASE_URL` | no | `http://qdrant-service:6333` | Qdrant host and REST port. virag's data path uses gRPC on this host (`QDRANT_GRPC_PORT`); REST serves the `/qdrant` proxy and the client's version check. |
+| `QDRANT_BASE_URL` | no | `http://qdrant-service:6333` | Qdrant host and REST port. virag's data path uses gRPC on this host (`QDRANT_GRPC_PORT`); REST serves the client's version check. |
 | `QDRANT_GRPC_PORT` | no | `6334` | Qdrant gRPC port. |
+| `QDRANT_API_KEY` | no | `""` | Qdrant's `service.api_key`; empty = no key sent. A wrong one fails startup with `grpc_status: UNAUTHENTICATED`. |
 | `QDRANT_TIMEOUT_SEC` | no | `60` | Per-call gRPC deadline (≥ 1). |
 | `QDRANT_MAX_RETRIES` | no | `3` | Replays on `UNAVAILABLE` (0–4; gRPC caps a call at 5 attempts), with the shared `HTTP_RETRY_BACKOFF_*` backoff. Only idempotent calls: every point op and the collection reads/metadata update — never create/delete/alias changes. A still-unreachable Qdrant surfaces as `503`. |
 | `QDRANT_COLLECTION_NAME` | no | `store-collection` | Collection to enroll into / query. |
@@ -113,8 +113,7 @@ serves through it while the physical collection it points to is versioned (`__v1
 Every upstream client (retriever, tiler, VLM) holds one long-lived pooled connection
 per upstream and replays transient failures — connection errors and `429`/`502`/`503`/`504`
 replies — with full-jitter exponential backoff. Read timeouts are never replayed (a slow
-upstream only gets slower under extra load), and neither are tiler ingests or the
-passthrough proxies.
+upstream only gets slower under extra load), and neither are tiler ingests.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
@@ -127,7 +126,7 @@ passthrough proxies.
 |---|---|---|---|
 | `RETRIEVER_BASE_URL` | no | `http://retriever-vllm-virag:8000/v1` | Retriever endpoint. The `/v1` suffix is required. The retriever server runs in a separate stack, so the default container name only resolves if you attach both stacks to one Docker network; the shipped `deploy/service/.env.example` uses `http://host.docker.internal:48003/v1` instead. |
 | `RETRIEVER_MODEL_NAME` | no | `retriever-model` | Retriever model name (must match `SERVED_MODEL_NAME` in `serve_retriever.sh`). |
-| `RETRIEVER_API_KEY` | no | `dummy` | Bearer key for the retriever server (must match `RETRIEVER_DEPLOY_API_KEY` in `deploy/retriever/.env`; also injected on the `/retriever` proxy). |
+| `RETRIEVER_API_KEY` | no | `dummy` | Bearer key for the retriever server (must match `RETRIEVER_DEPLOY_API_KEY` in `deploy/retriever/.env`). |
 | `RETRIEVER_BATCH_SIZE` | no | `32` | Items per embedding request (≥ 1): always for texts, for images only when image batching is on. |
 | `RETRIEVER_MAX_CONCURRENCY` | no | `32` | Max concurrent **bulk** requests — enroll, self-heal, revision (≥ 0; `0` = unlimited; must be ≤ `RETRIEVER_MAX_CONNECTIONS`). Chat queries bypass it, so keep it below the pool size to leave them headroom. |
 | `RETRIEVER_BULK_PRIORITY` | no | `0` | `0` = never send `priority` (portable to any OpenAI-compatible API). `> 0` tags bulk requests with this vLLM priority (lower = served earlier; queries stay at the default `0`), so the server schedules chat queries ahead of queued bulk work. Requires the retriever to run with `--scheduling-policy priority`; verified at startup. |
@@ -171,6 +170,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `TILER_BASE_URL` | no | `http://tiler-virag:8080` | doc-tiler endpoint. |
+| `TILER_API_KEY` | no | `""` | The tiler's own `TILER_API_KEY`, sent as a bearer token; empty = none. A wrong one fails startup (`the tiler rejects TILER_API_KEY`). |
 | `TILER_TIMEOUT_SEC` | no | `120` | Per-read deadline (≥ 1): for the tile stream, the max gap between events, not the whole render. |
 | `TILER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `TILER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the tiler (≥ 1). |
@@ -183,7 +183,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 |---|---|---|---|
 | `VLM_BASE_URL` | **yes** | — | Vision model endpoint. The `/v1` suffix is required. |
 | `VLM_MODEL_NAME` | **yes** | — | Model name; used for the startup vision probe. Callers still pass their own `model` in the request body (passed through). |
-| `VLM_API_KEY` | no | `dummy` | Bearer key for the VLM (injected on chat completions and the `/v1` proxy). |
+| `VLM_API_KEY` | no | `dummy` | Bearer key for the VLM (sent with chat completions and the `/v1/models` lookup). |
 | `VLM_TIMEOUT_SEC` | no | `480` | Per-read deadline on the VLM stream (max silence between chunks; covers a long prefill/TTFT on big pixel-RAG prompts), not total generation time (≥ 1). |
 | `VLM_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `VLM_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the VLM (≥ 1); must be ≥ `VLM_MAX_CONCURRENCY`. |
@@ -192,13 +192,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 
 ---
 
-## Binding secret note
-
-`TILER_DB_SECRET` is intentionally the **same** variable name used by doc-tiler and
-carried on the Qdrant collection — one value, three consumers. It must be set (to the
-identical value) on all of them *before* first init, and is immutable per volume/
-collection thereafter. See [SECURITY.md](SECURITY.md) for the binding contract and
-[DEPLOYMENT.md](DEPLOYMENT.md) for where it is wired in Compose.
+## Deploy variables
 
 For the Compose-only orchestration variables (`*_DEPLOY_*` image tags, host ports,
 volume paths), see [`deploy/service/.env.example`](../deploy/service/.env.example) and

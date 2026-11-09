@@ -19,14 +19,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from qdrant_client.models import Distance
 
-from virag.api import chat_completions as chat_api
-from virag.api import enroll as enroll_api
-from virag.api import ops as ops_api
-from virag.api import proxy as proxy_api
 from virag.clients.reranker_client import RerankerClient
 from virag.clients.tiler_client import Tile, TileResult, TilerService
 from virag.coordination import Coordinator
 from virag.errors import ApiError, install_error_handlers
+from virag.main import include_routers
 from virag.settings import (
     RetrieverSettings,
     EnrollSettings,
@@ -313,7 +310,7 @@ class FakeTiler:
 
     def __init__(self, result: TileResult | None = None, info: dict | None = None):
         self._result = result
-        self._info = info or {"secret_hash": "", "render_version": "rv-test"}
+        self._info = info or {"volume_id": "vol-test", "render_version": "rv-test"}
         self.get_tile_calls: list[tuple] = []
         self.existing: set[str] = set()
         self.metadata_patches: list[tuple] = []
@@ -430,9 +427,8 @@ def _json_bytes(obj) -> bytes:
 def make_settings(**overrides) -> Settings:
     rag = overrides.pop("rag_settings", RagSettings(framing_text="FRAME"))
     return Settings(
-        host="127.0.0.1",
-        port=8080,
-        db_secret=overrides.pop("db_secret", ""),
+        api_key=overrides.pop("api_key", ""),
+        admin_api_key=overrides.pop("admin_api_key", ""),
         rag_settings=rag,
         http_settings=HttpSettings(backoff_base_sec=0, backoff_cap_sec=0),
         qdrant_settings=QdrantStoreSettings(
@@ -473,10 +469,7 @@ def build_app(*, settings=None, store=None, coordinator=None, retriever=None, re
     without a coordinator gets one of its own; no reranker means it is off."""
     app = FastAPI()
     install_error_handlers(app)
-    app.include_router(ops_api.router)
-    app.include_router(enroll_api.router)
-    app.include_router(chat_api.router)
-    app.include_router(proxy_api.router)
+    include_routers(app)
 
     app.state.settings = settings if settings is not None else make_settings()
     if store is not None:

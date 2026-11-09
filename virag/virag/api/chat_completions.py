@@ -159,9 +159,15 @@ async def _fetch_tiles(tiler, hits) -> list[tuple]:
 
             return None
 
-        # Integrity: the regenerated tile must be the exact bytes enrolled in Qdrant.
+        # Integrity: the regenerated tile must be the exact bytes enrolled in Qdrant; a
+        # point without a hash cannot be checked, so it is not trusted either.
         expected_hash = hit.payload.get("image_hash")
-        if expected_hash is not None and hashlib.sha256(data).hexdigest() != expected_hash:
+        if expected_hash is None:
+            log.warning("integrity: tile (doc_id=%s tile_num=%s) has no image_hash in qdrant; skipping", doc_id, tile_num)
+
+            return None
+
+        if hashlib.sha256(data).hexdigest() != expected_hash:
             log.warning(
                 "integrity: tile (doc_id=%s tile_num=%s) hash mismatch (qdrant=%s); skipping",
                 doc_id, tile_num, expected_hash,

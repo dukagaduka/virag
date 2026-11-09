@@ -106,6 +106,23 @@ def test_rag_integrity_mismatch_skips_tile(make_client):
     assert r.json()["sources"] == []
 
 
+def test_rag_tile_without_hash_is_skipped(make_client):
+    # a point that carries no image_hash cannot be checked, so it is not trusted
+    hashless = FakeHit(score=0.9, payload={"doc_id": "doc-a", "tile_num": 0, "metadata": {"name": "A"}})
+    vlm = FakeVLM()
+    client = make_client(vlm=vlm, store=FakeStore(hits=[hashless]),
+                         retriever=FakeRetriever(), tiler=FakeTiler())
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "q"}],
+        "rag": {"include_sources": True},
+    })
+
+    assert r.status_code == 200
+    assert vlm.complete_bodies[0]["messages"][-1]["content"] == "q"
+    assert r.json()["sources"] == []
+
+
 def test_rag_render_version_mismatch_fails_the_request(make_client):
     # embedded from rv-old, while the tiler now renders rv-test
     stale = hit_for("doc-a", 0)

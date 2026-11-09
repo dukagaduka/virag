@@ -21,19 +21,15 @@ opts into retrieval per request.
 
 ## 1. Request routing
 
-Routers are registered in a deliberate order (`main.py`), because two of them both
-match `/v1/*`:
+Routers are mounted in `include_routers` (`main.py`), each with the key it needs (§5):
 
-1. `ops` — `/health`, `/ready`.
-2. `enroll` — `POST /enroll`.
-3. `chat_completions` — `POST /v1/chat/completions` (the RAG entry point).
-4. `proxy` — catch-all reverse proxy: `/tiler/*`, `/retriever/*`, `/qdrant/*`, and
-   `/v1/*`.
+1. `ops` — `/health`, `/ready` (open).
+2. `enroll` — `POST /enroll` (admin key).
+3. `revision` — `/revision`, `/revision/rollback` (admin key).
+4. `chat_completions` — `POST /v1/chat/completions`, the RAG entry point (user key).
+5. `models` — `GET /v1/models`: the upstream VLM's entry for `VLM_MODEL_NAME` (user key).
 
-Because `chat_completions` is registered **before** the `/v1/{path:path}` wildcard,
-`/v1/chat/completions` is handled by the RAG-aware router and every *other* `/v1/*`
-call (models, completions, embeddings, …) falls through to the passthrough proxy. See
-[API.md](API.md) for the surface.
+There is no passthrough: any other path is a `404`. See [API.md](API.md) for the surface.
 
 ## 2. The RAG trigger
 
@@ -72,7 +68,8 @@ When RAG is on, `_run_rag` runs before the upstream call:
    the payload's fails the whole request with `409 RENDER_VERSION_MISMATCH` (the first
    one cancels the other fetches): the collection is stale, and answering without its
    tiles would hide that. Otherwise the regenerated tile's sha256 must match the
-   `image_hash`; a mismatch is logged and the tile **skipped**. This is what guarantees
+   `image_hash`; a mismatch — or a point without `image_hash` — is logged and the tile
+   **skipped**. This is what guarantees
    the model sees the exact bytes that were embedded, not a drifted re-render.
 6. **Rerank** (only with `RERANKER_BASE_URL` set). The surviving tiles — the very bytes
    just fetched, no second render — are scored against the query text by the reranker
@@ -108,22 +105,15 @@ reranker scored.
   [DONE]` sentinel — mirroring how the `usage` chunk is delivered. If `[DONE]` never
   appears, the sources chunk is appended at the end.
 
-## 5. Passthrough proxy
+## 5. Authentication
 
-Everything that isn't RAG is a thin reverse proxy (`_reverse_proxy`, streaming via
-`httpx2` `aiter_raw` over each upstream's shared pooled client, never retried):
-
-| Prefix | Upstream | Auth injected |
-|---|---|---|
-| `/tiler/*` | doc-tiler | — |
-| `/retriever/*` | retriever server | `Authorization: Bearer <RETRIEVER_API_KEY>` |
-| `/qdrant/*` | Qdrant | — |
-| `/v1/*` (except chat/completions) | VLM | `Authorization: Bearer <VLM_API_KEY>` |
-
-Hop-by-hop headers (RFC 7230) and `Host`/`Content-Length` are stripped in both
-directions; the query string is preserved; an unreachable upstream is a `502`. This
-lets an operator reach the whole backend through the one gateway (e.g. enroll via the
-tiler, inspect the Qdrant collection) without exposing each service separately.
+virag's own clients present a bearer key (`api/auth.py`, a router dependency):
+`VIRAG_API_KEY` for `/v1/*`, `VIRAG_ADMIN_API_KEY` for `/enroll` and `/revision*` (and
+`/v1/*` too). A missing or wrong key is a `401`, the user key on an admin route a `403`;
+an empty key leaves its routes open (a startup `WARNING`). virag in turn holds every
+backend's key — `VLM_API_KEY`, `RETRIEVER_API_KEY`, `RERANKER_API_KEY`, `TILER_API_KEY`,
+`QDRANT_API_KEY`, the password in `VALKEY_URL` — and never hands one out. See
+[SECURITY.md](SECURITY.md).
 
 ## 6. Clients
 
@@ -169,14 +159,15 @@ the rules that span virag processes live in the Coordinator (§10).
 `lifespan` wires everything and refuses to serve a half-working system:
 
 - Build all five clients from `Settings.from_env()`.
-- `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler, VLM
-  and Valkey. **Every dependency is fatal** — the service is useless without any one of
+- `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler (which
+  also proves `TILER_API_KEY`), VLM and Valkey. **Every dependency is fatal** — the service is useless without any one of
   them, so a failed check aborts startup. The retriever's vector size must also equal
   `QDRANT_VECTOR_SIZE`. Two processes starting on one empty Qdrant both try to create
   `<name>__v1`; the one that loses adopts the other's.
-- **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): virag, the tiler,
-  and the Qdrant collection must share one secret hash, or startup fails. A fresh
-  collection is bound on first run (secret + the tiler's `render_version`).
+- **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): the Qdrant
+  collection must have been embedded from the tiler's volume (its `volume_id`), or
+  startup fails. A fresh collection is bound on first run (`tiler_volume_id` + the
+  tiler's `render_version`).
 - **Metadata-schema guard** (`enforce_metadata_schema`) — reconcile searches the tiler's
   indexed metadata, so the tiler must declare the three fields virag depends on:
   `name` (text), `virag_started_at` (number), `virag_enrolled_at` (number). A missing or
@@ -373,7 +364,7 @@ keeps the leases and the journal.
 virag/
   main.py            # app, lifespan (clients, dependency checks, binding, lease, reconcile, render_version check), router order
   settings.py        # pydantic-settings sections: every env var, its default and bounds
-  binding.py         # the TILER_DB_SECRET triple-binding + tiler metadata-schema guard
+  binding.py         # the collection ↔ tiler volume binding + tiler metadata-schema guard
   coordination.py    # Coordinator: leases, writers + journal, drain, the revision job lock, the reconcile lead
   reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and the shared re-embed stream
   revision.py        # RevisionManager: background revision / rollback job, journal sync
@@ -384,7 +375,8 @@ virag/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
     enroll.py            # /enroll: streaming tile → embed → upsert
     revision.py          # /revision (start, status) and /revision/rollback
-    proxy.py             # reverse proxy for /tiler, /retriever, /qdrant, /v1/*
+    models.py            # /v1/models: the VLM's entry for VLM_MODEL_NAME
+    auth.py              # VIRAG_API_KEY / VIRAG_ADMIN_API_KEY router dependencies
     ops.py               # /health, /ready
   clients/
     retriever_client.py  reranker_client.py  qdrant_store.py  valkey_store.py  tiler_client.py  vlm_client.py

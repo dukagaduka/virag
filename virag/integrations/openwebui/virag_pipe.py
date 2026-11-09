@@ -27,7 +27,7 @@ class Pipe:
         )
         VIRAG_API_KEY: str = Field(
             default="",
-            description="Optional bearer token, if the gateway is protected.",
+            description="virag's VIRAG_API_KEY; empty only if virag runs with it empty.",
         )
         MODEL: str = Field(
             default="my-vlm",

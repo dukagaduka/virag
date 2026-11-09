@@ -1,85 +1,91 @@
 # Security
 
-Four things worth understanding before exposing virag: the **binding secret** (which
-guarantees virag only ever talks to *its* tiler and *its* Qdrant collection), the
-**tile-integrity check** (the model only ever sees the exact bytes that were embedded),
-how **upstream credentials** are handled on the proxy, and the **non-root** container.
+Four things worth understanding before exposing virag: **virag's own keys** (who may
+chat, who may enroll), the **keys virag holds** for its backends (its clients never see
+them), the **volume binding** (virag only ever serves a collection embedded from *its*
+tiler volume), and the **tile-integrity check** (the model only ever sees the exact bytes
+that were embedded). Plus the **non-root** container.
 
 ---
 
-## 1. The binding secret
+## 1. virag's own keys
 
-A pixel-RAG answer is only meaningful if three things line up: the Qdrant vectors, the
-tiler that can regenerate the tiles those vectors came from, and virag orchestrating
-them. `render_version` proves two components were *configured* the same way; it cannot
-prove they are the *same instance*. The binding secret closes that gap.
+Both are sent as `Authorization: Bearer <key>` and compared in constant time; Swagger UI
+(`GET /docs`) has an **Authorize** button for them.
 
-**Mechanism** (`binding.py`, enforced at startup in `lifespan`). `TILER_DB_SECRET` is
-hashed once — `secret_hash = sha256(TILER_DB_SECRET)`, or `""` when unset — and must
-agree across all three:
+| Key | Opens |
+|---|---|
+| `VIRAG_API_KEY` | `/v1/chat/completions`, `/v1/models` — a client uses it as if it were the LLM's key. |
+| `VIRAG_ADMIN_API_KEY` | `/enroll`, `/revision`, `/revision/rollback` — and `/v1/*` too. |
 
-1. The **tiler** reports its `secret_hash` on `GET /info`. If it doesn't equal virag's,
-   startup fails (`BindingError`) — the tiler is not bound to this virag (or was
-   initialised without the secret).
-2. The **Qdrant collection** carries a `secret_hash` in its collection metadata. On a
-   fresh (unbound) collection, virag stamps it with the secret + the tiler's
-   `render_version` on first run. On an already-bound collection, a mismatch is
-   fatal — the collection belongs to a different virag/tiler pair.
-3. `render_version` **drift** (collection bound to one version, tiler now reports
-   another) is a **warning**, not fatal: stored `image_hash` values may no longer
-   reproduce, which the integrity check (below) will then catch per tile.
+- A missing or wrong key answers `401 UNAUTHORIZED` (`WWW-Authenticate: Bearer`); the
+  user key on an admin route answers `403 FORBIDDEN`.
+- `GET /health` and `GET /ready` stay open for orchestrators and balancers.
+- **An empty key leaves its routes open**, logged as a `WARNING` at every start.
+  Acceptable only where nobody untrusted reaches the port.
+- virag has no other routes: the old `/qdrant`, `/tiler`, `/retriever` and `/v1/*`
+  passthroughs are gone. Whoever needs a backend directly reaches it on its own port,
+  with its own key.
 
-**Operational rules:**
+## 2. Keys virag holds
 
-- One value, three consumers. Set `TILER_DB_SECRET` to the *identical* value on virag,
-  the tiler, and (implicitly, via first-run stamping) the Qdrant collection — **before**
-  first init. It is immutable per volume/collection thereafter.
-- **Empty is an explicit, unbound slot.** An unset secret hashes to `""` and is stored
-  as such; a stack initialised without one can't be bound later without a fresh
-  collection/volume. "No secret" is a deliberate posture, not a default to silently
-  upgrade.
+virag authenticates to every backend itself; none of these keys ever leaves virag.
+
+| Backend | Key | Must equal |
+|---|---|---|
+| VLM | `VLM_API_KEY` | the VLM's key |
+| retriever | `RETRIEVER_API_KEY` | `RETRIEVER_DEPLOY_API_KEY` of `deploy/retriever` |
+| reranker | `RERANKER_API_KEY` | `RERANKER_DEPLOY_API_KEY` of `deploy/reranker` |
+| tiler | `TILER_API_KEY` | the tiler's `TILER_API_KEY` |
+| Qdrant | `QDRANT_API_KEY` | Qdrant's `service.api_key` |
+| Valkey | the password in `VALKEY_URL` (`redis://:<password>@host:6379/0`) | Valkey's `requirepass` |
+
+A copy that does not match fails the startup check of that backend with a message
+naming the key (`the tiler rejects TILER_API_KEY`, `grpc_status: UNAUTHENTICATED` for
+Qdrant, `Valkey rejects the password in VALKEY_URL`). An empty `TILER_API_KEY` /
+`QDRANT_API_KEY` sends no key.
+
+vLLM's `--api-key` guards `/v1/*` only. A reranker's `/score` and `/rerank` answer
+without the key, so the key alone does not lock the reranker down: keep its port private
+to virag.
+
+## 3. The volume binding
+
+A pixel-RAG answer is only meaningful if the Qdrant vectors and the tiler that
+regenerates their tiles belong together. `render_version` proves two components were
+*configured* the same way; it cannot prove they are the *same instance*.
+
+**Mechanism** (`binding.py`, enforced at startup in `lifespan`). The tiler gives each
+volume a random `volume_id` at init and reports it on `GET /info`.
+
+1. A **fresh (unbound) collection** is stamped with the tiler's `volume_id` (as
+   `tiler_volume_id`) and its `render_version` on first run.
+2. On an already-bound collection, another `volume_id` is **fatal** (`BindingError`):
+   the tiler at `TILER_BASE_URL` serves another volume. Most importantly a tiler that
+   came back on a fresh, empty volume is refused — otherwise reconcile would take every
+   point for an orphan of a deleted document and delete it.
+3. `render_version` **drift** (collection embedded from one version, the tiler renders
+   another) is not fatal at startup: chat answers `409 RENDER_VERSION_MISMATCH` until
+   the collection is rebuilt with `POST /revision` (or at startup with
+   `VIRAG_REVISION_ON_RENDER_MISMATCH=true`).
+
+The `volume_id` is not a secret — it identifies, the keys above authenticate. To start
+over on a fresh tiler volume, drop the Qdrant collection too and re-enroll.
 
 virag also enforces the **`Qdrant ⊆ Tiler` invariant**: every Qdrant point is backed by
 a tiler tile. Reconcile (at startup and on an interval) deletes any Qdrant `doc_id` the
 tiler no longer has or has quarantined, so a query never returns a hit whose tile the
-tiler can't regenerate — and the integrity check below guarantees the bytes still match. (This
-replaces the older best-effort `doc_id` overlap warning.) See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the reconcile passes.
+tiler can't regenerate. See [ARCHITECTURE.md](ARCHITECTURE.md) for the reconcile passes.
 
-## 2. Tile-integrity check
+## 4. Tile-integrity check
 
 At enroll time, each tile's `image_hash` (sha256 of its JPEG bytes) is stored in the
 Qdrant payload alongside the vector. At query time, virag regenerates each retrieved
-tile from the tiler and recomputes its hash; if it doesn't match the stored value, the
-tile is **dropped** (logged as `integrity: … hash mismatch`) and never reaches the
-model. So a pixel-tier drift on the tiler (a Chromium/JPEG/DPI change) degrades to
-"fewer tiles", never "the model was shown different bytes than were embedded".
+tile from the tiler and recomputes its hash; a tile whose hash does not match — or whose
+point carries no `image_hash` at all — is **dropped** (logged as `integrity: …`) and
+never reaches the model.
 
-## 3. Upstream credentials on the proxy
-
-The reverse proxy injects bearer credentials so backends can stay locked down behind the
-gateway:
-
-- `/retriever/*` and calls to the retriever server → `Authorization: Bearer <RETRIEVER_API_KEY>`.
-- calls to the reranker server → `Authorization: Bearer <RERANKER_API_KEY>` (no proxy route).
-- `/v1/*` (passthrough) and chat-completions → `Authorization: Bearer <VLM_API_KEY>`.
-- `/tiler/*` and `/qdrant/*` → no auth injected.
-
-Notes:
-
-- These keys live in the environment (`RETRIEVER_API_KEY`, `RERANKER_API_KEY`,
-  `VLM_API_KEY`) and default to `dummy`; set real values in any deployment where the
-  backends enforce auth.
-- vLLM's `--api-key` guards `/v1/*` only. A reranker's `/score` and `/rerank` answer
-  without the key, so the key alone does not lock the reranker down: keep its port
-  private to virag.
-- virag itself does **not** authenticate its own callers — it is designed to sit behind
-  your own gateway/network policy. Don't expose it directly to untrusted clients.
-- Hop-by-hop headers (RFC 7230) and `Host`/`Content-Length` are stripped in both
-  directions; the client's own `Authorization`, if any, is replaced (not merged) on the
-  auth-injecting routes.
-
-## 4. Non-root container
+## 5. Non-root container
 
 - Runs as uid/gid **10001**; nothing runs as root (`Dockerfile`).
 - Stateless — no volumes to get ownership wrong; all persistent state is in the
@@ -91,15 +97,11 @@ Notes:
 
 ## Operator checklist
 
-- [ ] `TILER_DB_SECRET` set to a strong value, identical on virag and the tiler, before
-      the stack's first boot.
+- [ ] `VIRAG_API_KEY` and `VIRAG_ADMIN_API_KEY` set to strong random values
+      (`openssl rand -hex 32`), different from each other.
+- [ ] `TILER_API_KEY`, `QDRANT_API_KEY` and the Valkey password set, each identical on
+      virag and on its backend.
 - [ ] Real `VLM_API_KEY` / `RETRIEVER_API_KEY` / `RERANKER_API_KEY` if the upstreams enforce auth.
 - [ ] Reranker port reachable by virag only: its `/score` is not covered by the vLLM key.
-- [ ] virag reachable only from a trusted gateway/network — it has no built-in
-      client authentication.
-- [ ] Backends (tiler, Qdrant, retriever) not separately exposed if the proxy routes
-      are meant to be the only path to them.
-- [ ] Valkey reachable by virag only (the Compose service publishes no port). Whoever
-      writes to it can take the revision job or stop a process by deleting its lease. A
-      password in `VALKEY_URL` (`redis://:<password>@host:6379/0`) is a secret like the
-      API keys.
+- [ ] TLS in front of virag (a reverse proxy) wherever its port is reachable beyond a
+      trusted network: the keys travel as bearer tokens.

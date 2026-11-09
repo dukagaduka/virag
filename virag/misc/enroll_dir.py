@@ -8,7 +8,7 @@ that name in retrieval sources and re-enrolling the same file overwrites its own
 tiles instead of duplicating them.
 
 Nothing here imports from the virag package — it only speaks the HTTP API, so it
-runs anywhere ``requests`` (and, optionally, ``tqdm``) are installed.
+runs anywhere ``requests`` and ``tqdm`` are installed.
 
 Recognised inputs (by extension):
 
@@ -16,8 +16,12 @@ Recognised inputs (by extension):
   * .mhtml, .mht                 -> doc_type=MHTML
   * .png .jpg .jpeg .webp .gif .bmp .tif .tiff  -> doc_type=IMG
 
+/enroll needs VIRAG_ADMIN_API_KEY (unless virag runs with it empty): pass it with
+``--api-key`` or export it, the script reads it from the environment.
+
 Usage:
-    python misc/enroll_dir.py DIR --endpoint http://localhost:8080
+    export VIRAG_ADMIN_API_KEY=...
+    python misc/enroll_dir.py DIR --endpoint http://localhost:48000
     python misc/enroll_dir.py DIR -e http://host:8080 --recursive
     python misc/enroll_dir.py DIR -e http://host:8080 \
         --metadata '{"project":"atlas","year":2026}' --force
@@ -25,14 +29,14 @@ Usage:
 Extra ``--metadata`` (a JSON object) is merged into every document's metadata;
 the per-file ``name`` always wins. See ``--help`` for the full flag list.
 
-Requires the ``requests`` package; ``tqdm`` is used for the progress bar if
-present and silently skipped otherwise.
+Requires the ``requests`` and ``tqdm`` packages.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,17 +48,14 @@ except ImportError:  # pragma: no cover
 
 try:
     from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    sys.exit("this script needs the 'tqdm' package (pip install tqdm)")
 
-    def _log(msg: str) -> None:
-        """Print without corrupting the progress bar."""
-        tqdm.write(msg)
 
-except ImportError:  # tqdm is optional — fall back to a plain iterator + print
-    def tqdm(iterable, **_):  # type: ignore
-        return iterable
+def _log(msg: str) -> None:
+    """Print without corrupting the progress bar."""
+    tqdm.write(msg)
 
-    def _log(msg: str) -> None:
-        print(msg)
 
 # Extension -> (doc_type, mime). Everything image-like is IMG; virag/tiler
 # validates the bytes against the declared type on enroll.
@@ -112,7 +113,15 @@ def discover(input_dir: Path, recursive: bool) -> list[Item]:
 # --------------------------------------------------------------------------- #
 # Enroll
 # --------------------------------------------------------------------------- #
-def enroll(endpoint: str, item: Item, base_meta: dict, *, force: bool) -> tuple[bool, str]:
+def enroll(
+    endpoint: str,
+    item: Item,
+    base_meta: dict,
+    *,
+    force: bool,
+    headers: dict,
+    timeout: float,
+) -> tuple[bool, str]:
     """POST one file to /enroll. Returns (ok, one-line summary for logging)."""
     metadata = {**base_meta, "name": item.name}
     data = {"doc_type": item.doc_type, "metadata": json.dumps(metadata, ensure_ascii=False)}
@@ -125,11 +134,15 @@ def enroll(endpoint: str, item: Item, base_meta: dict, *, force: bool) -> tuple[
             params=params,
             data=data,
             files=files,
-            timeout=600,
+            headers=headers,
+            timeout=timeout,
         )
 
     except requests.RequestException as exc:
         return False, f"request failed: {exc}"
+
+    if resp.status_code in (401, 403):
+        return False, f"HTTP {resp.status_code}: pass VIRAG_ADMIN_API_KEY with --api-key or the env variable"
 
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code} {resp.text[:200]}"
@@ -155,7 +168,7 @@ def main() -> int:
     ap.add_argument("directory", type=Path, help="directory to scan for documents")
     ap.add_argument(
         "-e", "--endpoint",
-        default="http://localhost:8080",
+        default="http://localhost:48000",
         help="virag base URL (default: %(default)s)",
     )
     ap.add_argument(
@@ -169,6 +182,17 @@ def main() -> int:
         help='extra metadata merged into every doc, as a JSON object (name always wins)',
     )
     ap.add_argument(
+        "--api-key",
+        default=os.environ.get("VIRAG_ADMIN_API_KEY", ""),
+        help="virag's VIRAG_ADMIN_API_KEY (default: the env variable of that name)",
+    )
+    ap.add_argument(
+        "--timeout",
+        type=float,
+        default=1800,
+        help="seconds to wait for one document's enroll (default: %(default)s)",
+    )
+    ap.add_argument(
         "--force",
         action="store_true",
         help="re-tile documents that already exist",
@@ -176,6 +200,7 @@ def main() -> int:
     args = ap.parse_args()
 
     endpoint = args.endpoint.rstrip("/")
+    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
 
     if not args.directory.is_dir():
         return f"not a directory: {args.directory}"
@@ -204,7 +229,14 @@ def main() -> int:
     failures: list[str] = []
 
     for item in tqdm(items, desc="enroll", unit="doc"):
-        succeeded, summary = enroll(endpoint, item, base_meta, force=args.force)
+        succeeded, summary = enroll(
+            endpoint,
+            item,
+            base_meta,
+            force=args.force,
+            headers=headers,
+            timeout=args.timeout,
+        )
 
         if succeeded:
             ok += 1

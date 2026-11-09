@@ -11,6 +11,7 @@ class ApiError(Exception):
     # Wire status -> the machine-readable `code` in the error envelope.
     STATUS_CODES = {
         400: "BAD_REQUEST",
+        401: "UNAUTHORIZED",
         403: "FORBIDDEN",
         404: "NOT_FOUND",
         405: "METHOD_NOT_ALLOWED",
@@ -32,6 +33,7 @@ class ApiError(Exception):
         message: str,
         details: dict[str, Any] | None = None,
         code: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
 
         super().__init__(message)
@@ -40,6 +42,7 @@ class ApiError(Exception):
         self.code = code or self.STATUS_CODES[status_code]
         self.message = message
         self.details = details
+        self.headers = headers
 
 
     def body(self) -> dict[str, Any]:
@@ -56,7 +59,7 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ApiError)
     async def _handle_api_error(request: Request, exc: ApiError) -> OrjsonResponse:
-        return OrjsonResponse(status_code=exc.status_code, content=exc.body())
+        return OrjsonResponse(status_code=exc.status_code, content=exc.body(), headers=exc.headers)
 
     @app.exception_handler(Exception)
     async def _handle_unexpected(request: Request, exc: Exception) -> OrjsonResponse:

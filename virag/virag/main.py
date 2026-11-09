@@ -4,7 +4,7 @@ import os
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from virag.settings import Settings, SettingsError
 from virag.errors import ApiError, install_error_handlers
@@ -15,17 +15,17 @@ from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerService
 from virag.clients.valkey_store import ValkeyStore
 from virag.clients.vlm_client import VLMClient
-from virag.binding import enforce_binding, enforce_metadata_schema, secret_hash
+from virag.binding import enforce_binding, enforce_metadata_schema
 from virag.coordination import Coordinator
 from virag.reconcile import reconcile, run_periodic
 from virag.revision import RevisionManager
 from virag.utils import cancel
 from virag.api import enroll as enroll_api
 from virag.api import chat_completions as chat_completions_api
-from virag.api import proxy as proxy_api
-from virag.api.proxy import QdrantProxyService
+from virag.api import models as models_api
 from virag.api import ops as ops_api
 from virag.api import revision as revision_api
+from virag.api.auth import require_admin_key, require_api_key
 
 
 log = logging.getLogger("virag")
@@ -80,6 +80,15 @@ async def _check_reranker(reranker: RerankerClient | None, settings: Settings) -
         )
 
 
+def _warn_open_routes(settings: Settings) -> None:
+    """An empty key leaves its routes open to anyone who reaches the port."""
+    if not settings.api_key:
+        log.warning("VIRAG_API_KEY is empty: /v1/* is open")
+
+    if not settings.admin_api_key:
+        log.warning("VIRAG_ADMIN_API_KEY is empty: /enroll and /revision are open")
+
+
 def _require_vector_size(dimension: int | None, vector_size: int) -> None:
     """The retriever's vectors must fit the collection, or the first upsert fails."""
     if dimension != vector_size:
@@ -121,11 +130,10 @@ async def lifespan(app: FastAPI):
         vlm = VLMClient.from_settings(settings.vlm_settings, settings.http_settings)
         stack.push_async_callback(vlm.close)
 
-        qdrant_http = QdrantProxyService.from_settings(settings.qdrant_settings, settings.http_settings)
-        stack.push_async_callback(qdrant_http.close)
+        _warn_open_routes(settings)
 
         # Every dependency is essential; a failed check refuses startup.
-        await store.create_collection()
+        await _require_dependency("qdrant", store.create_collection())
         await _require_dependency("retriever", retriever.check_connection())
         _require_vector_size(retriever.dimension, settings.qdrant_settings.vector_size)
         await _require_dependency("tiler", tiler.check_connection())
@@ -133,8 +141,8 @@ async def lifespan(app: FastAPI):
         await _require_dependency("valkey", valkey.check_connection())
         await _check_reranker(reranker, settings)
 
-        # Refuse to serve an unrelated Tiler/Qdrant pair; bind a fresh collection.
-        render_version = await enforce_binding(store, tiler, secret_hash(settings.db_secret))
+        # Refuse a collection embedded from another tiler volume; bind a fresh one.
+        render_version = await enforce_binding(store, tiler)
         # Reconcile depends on these indexed metadata fields being declared in the tiler.
         await enforce_metadata_schema(tiler)
 
@@ -178,7 +186,6 @@ async def lifespan(app: FastAPI):
         app.state.reranker = reranker
         app.state.tiler = tiler
         app.state.vlm = vlm
-        app.state.qdrant_http = qdrant_http
         app.state.revision = revision
 
         log.info(
@@ -210,14 +217,21 @@ def create_app() -> FastAPI:
         default_response_class=OrjsonResponse,
     )
     install_error_handlers(app)
-
-    app.include_router(ops_api.router, tags=["ops"])
-    app.include_router(enroll_api.router, tags=["enroll"])
-    app.include_router(revision_api.router, tags=["revision"])
-    app.include_router(chat_completions_api.router, tags=["v1"])
-    app.include_router(proxy_api.router, tags=["proxy"])
+    include_routers(app)
 
     return app
+
+
+def include_routers(app: FastAPI) -> None:
+    """Mount every router with its key; /health and /ready stay open for orchestrators."""
+    admin = [Depends(require_admin_key)]
+    user = [Depends(require_api_key)]
+
+    app.include_router(ops_api.router, tags=["ops"])
+    app.include_router(enroll_api.router, tags=["enroll"], dependencies=admin)
+    app.include_router(revision_api.router, tags=["revision"], dependencies=admin)
+    app.include_router(chat_completions_api.router, tags=["v1"], dependencies=user)
+    app.include_router(models_api.router, tags=["v1"], dependencies=user)
 
 
 app = create_app()

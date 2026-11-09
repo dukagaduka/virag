@@ -21,7 +21,7 @@ def _base_env(monkeypatch):
 _ALL_KEYS = {
     "VIRAG_SELF_HEAL", "VIRAG_RECONCILE_INTERVAL_SEC", "VIRAG_PENDING_TTL_SEC",
     "QDRANT_GRPC_PORT", "QDRANT_TIMEOUT_SEC", "QDRANT_MAX_RETRIES", "QDRANT_CHUNK_SIZE", "QDRANT_MAX_BATCH_CHUNKS",
-    "VIRAG_HOST", "VIRAG_PORT", "TILER_DB_SECRET", "RETRIEVER_TOP_K", "RETRIEVER_THRESHOLD",
+    "VIRAG_API_KEY", "VIRAG_ADMIN_API_KEY", "TILER_API_KEY", "QDRANT_API_KEY", "RETRIEVER_TOP_K", "RETRIEVER_THRESHOLD",
     "VIRAG_FRAMING_TEXT", "QDRANT_BASE_URL", "QDRANT_COLLECTION_NAME", "QDRANT_VECTOR_SIZE",
     "QDRANT_DISTANCE_TYPE", "RETRIEVER_BASE_URL", "RETRIEVER_MODEL_NAME", "RETRIEVER_API_KEY",
     "RETRIEVER_BATCH_SIZE", "RETRIEVER_MAX_CONCURRENCY", "RETRIEVER_BULK_PRIORITY",
@@ -42,9 +42,10 @@ def test_defaults(monkeypatch):
     _base_env(monkeypatch)
     s = Settings.from_env()
 
-    assert s.host == "127.0.0.1"
-    assert s.port == 8080
-    assert s.db_secret == ""
+    assert s.api_key == ""
+    assert s.admin_api_key == ""
+    assert s.tiler_settings.api_key == ""
+    assert s.qdrant_settings.api_key == ""
     assert s.retriever_settings.top_k == 5
     assert s.retriever_settings.threshold is None
     assert s.rag_settings.framing_text == _DEFAULT_FRAMING_TEXT
@@ -58,14 +59,6 @@ def test_defaults(monkeypatch):
 def test_required_vars(monkeypatch, missing):
     _base_env(monkeypatch)
     monkeypatch.delenv(missing, raising=False)
-
-    with pytest.raises(SettingsError):
-        Settings.from_env()
-
-
-def test_port_bounds(monkeypatch):
-    _base_env(monkeypatch)
-    monkeypatch.setenv("VIRAG_PORT", "70000")
 
     with pytest.raises(SettingsError):
         Settings.from_env()
@@ -119,10 +112,17 @@ def test_bad_distance_type(monkeypatch):
         Settings.from_env()
 
 
-def test_db_secret_from_tiler_env(monkeypatch):
+def test_keys_from_env_and_kept_out_of_repr(monkeypatch):
     _base_env(monkeypatch)
-    monkeypatch.setenv("TILER_DB_SECRET", "s3cret")
-    assert Settings.from_env().db_secret == "s3cret"
+    for name in ("VIRAG_API_KEY", "VIRAG_ADMIN_API_KEY", "TILER_API_KEY", "QDRANT_API_KEY"):
+        monkeypatch.setenv(name, f"secret-{name}")
+
+    s = Settings.from_env()
+
+    assert (s.api_key, s.admin_api_key) == ("secret-VIRAG_API_KEY", "secret-VIRAG_ADMIN_API_KEY")
+    assert s.tiler_settings.api_key == "secret-TILER_API_KEY"
+    assert s.qdrant_settings.api_key == "secret-QDRANT_API_KEY"
+    assert "secret-" not in repr(s)
 
 
 def test_http_transport_defaults(monkeypatch):

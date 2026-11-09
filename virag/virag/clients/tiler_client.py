@@ -64,10 +64,15 @@ class TilerService(HttpService):
     def __init__(
         self,
         base_url: str,
+        api_key: str = "",
         **http_options,
     ):
 
-        super().__init__(base_url, **http_options)
+        super().__init__(
+            base_url,
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
+            **http_options,
+        )
 
 
     @property
@@ -117,6 +122,7 @@ class TilerService(HttpService):
     def from_settings(cls, ts: TilerSettings, hs: HttpSettings) -> TilerService:
         return cls(
             base_url=ts.base_url,
+            api_key=ts.api_key,
             timeout=ts.timeout_sec,
             max_concurrency=ts.max_concurrency,
             connect_timeout=ts.connect_timeout_sec,
@@ -139,6 +145,16 @@ class TilerService(HttpService):
     async def check_connection(self) -> None:
         # /readyz: a tiler still revising its corpus is no tiler yet — virag refuses to start.
         await self._request("GET", self.readyz_route, action="the check")
+
+        # /readyz is open; /info is the cheapest route that tells whether the key is right.
+        response = await self._request("GET", self.info_route, action="the key check", passthrough_statuses=(401,))
+
+        if response.status_code == 401:
+            raise ApiError(
+                status_code=503,
+                message="the tiler rejects TILER_API_KEY: set the tiler's own value",
+                details={"upstream_status": 401},
+            )
 
 
     async def tile(
@@ -262,7 +278,7 @@ class TilerService(HttpService):
 
 
     async def get_info(self) -> dict:
-        """Fetch the tiler's runtime info (render_version, secret_hash, …) for binding."""
+        """Fetch the tiler's runtime info (render_version, volume_id, …) for binding."""
         response = await self._request("GET", self.info_route, action="the info fetch")
 
         return self._json(response, action="the info fetch")

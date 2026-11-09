@@ -21,7 +21,7 @@ docker compose up -d
 
 # 2. virag + tiler + Qdrant + Valkey
 cd ../service
-cp .env.example .env     # set TILER_DB_SECRET, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE,
+cp .env.example .env     # set the API keys, VLM_BASE_URL, VLM_MODEL_NAME, QDRANT_VECTOR_SIZE,
                          # RETRIEVER_BASE_URL, paths
 docker compose up --build
 curl -s localhost:${VIRAG_DEPLOY_PORT:-48000}/ready | jq
@@ -77,7 +77,7 @@ Variables live in three places:
 - **Application settings** read by virag at startup — `VIRAG_*` (including the reconcile
   knobs `VIRAG_SELF_HEAL` / `VIRAG_RECONCILE_INTERVAL_SEC` / `VIRAG_PENDING_TTL_SEC`),
   `QDRANT_*` (including the upsert-batching `QDRANT_CHUNK_SIZE` / `QDRANT_MAX_BATCH_CHUNKS`),
-  `VALKEY_*`, `RETRIEVER_*`, `TILER_*`, `VLM_*`, `TILER_DB_SECRET`. See
+  `VALKEY_*`, `RETRIEVER_*`, `TILER_*`, `VLM_*`. See
   [CONFIG.md](CONFIG.md). Required: `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`,
   `VLM_MODEL_NAME`, `VALKEY_URL`.
 - **Compose/orchestration variables** — the `*_DEPLOY_*` image tags, host bind
@@ -93,8 +93,8 @@ Variables live in three places:
   baseline values; copy it to `serve_retriever.sh` (git-ignored) and tune it for your
   GPU. Keep `SERVED_MODEL_NAME` there in sync with virag's `RETRIEVER_MODEL_NAME`.
 
-Set `TILER_DB_SECRET` to the **same** value it has on the tiler and (implicitly) the
-Qdrant collection — one secret, three consumers — *before* first boot. See
+Set virag's `VIRAG_API_KEY` and `VIRAG_ADMIN_API_KEY`, and give `TILER_API_KEY`,
+`QDRANT_API_KEY` and the Valkey password the same values their services have. See
 [SECURITY.md](SECURITY.md).
 
 ## Tiler metadata schema
@@ -168,7 +168,7 @@ The vLLM retriever server can take minutes to load a model; the tiler build (Chr
 can be slow too. Because `virag` retries until its fatal dependency checks pass, bring
 the stack up together and let it settle — `/ready` flips to `200` once the retriever, the
 tiler, the VLM and Valkey all answer and the tiler↔Qdrant binding is satisfied. For the tiler's
-own build (pinned Chromium layer, geometry/secret guard) see
+own build (pinned Chromium layer, geometry guard) see
 [`../../doc-tiler/docs/DEPLOYMENT.md`](../../doc-tiler/docs/DEPLOYMENT.md).
 
 ## Upgrading the tiler's renderer
