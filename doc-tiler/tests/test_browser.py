@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 
 import pytest
-from conftest import base_env, mhtml_form, running_app
+from conftest import base_env, ingest_tiles, mhtml_form, running_app
 
 HTML = """<!doctype html><html><head><meta charset="utf-8"><title>t</title>
 <style>
@@ -61,7 +61,7 @@ def browser_env(tmp_path):
 async def test_mhtml_round_trip_identity(browser_env, tmp_path):
     async with running_app(browser_env) as (client, svc):
         blob = await capture_fixture(svc, tmp_path, rows=20)
-        manifest = (await client.post("/tile", **mhtml_form(blob))).json()
+        manifest = await ingest_tiles(client, mhtml_form(blob))
 
         assert manifest["doc_type"] == "MHTML"
         assert manifest["page_height"] > 1024
@@ -81,10 +81,8 @@ async def test_mhtml_render_is_deterministic(browser_env, tmp_path):
     """Same archive, same pinned Chromium → identical hashes."""
     async with running_app(browser_env) as (client, svc):
         blob = await capture_fixture(svc, tmp_path, rows=12)
-        first = (await client.post("/tile", **mhtml_form(blob))).json()
-        second = (
-            await client.post("/tile", params={"force": "true"}, **mhtml_form(blob))
-        ).json()
+        first = await ingest_tiles(client, mhtml_form(blob))
+        second = await ingest_tiles(client, mhtml_form(blob), force="true")
         assert [t["image_hash"] for t in first["tiles"]] == [
             t["image_hash"] for t in second["tiles"]
         ]
@@ -95,7 +93,7 @@ async def test_sequential_strips_reuse_one_full_page_render(browser_env, tmp_pat
     """The page cache means N strips cost one browser render."""
     async with running_app(browser_env) as (client, svc):
         blob = await capture_fixture(svc, tmp_path, rows=20)
-        manifest = (await client.post("/tile", **mhtml_form(blob))).json()
+        manifest = await ingest_tiles(client, mhtml_form(blob))
         await svc.tile_cache.clear()
         await svc.page_cache.clear()
 
@@ -118,7 +116,7 @@ async def test_tall_page_uses_the_clip_path(tmp_path):
     )
     async with running_app(env) as (client, svc):
         blob = await capture_fixture(svc, tmp_path, rows=14)
-        manifest = (await client.post("/tile", **mhtml_form(blob))).json()
+        manifest = await ingest_tiles(client, mhtml_form(blob))
         assert manifest["page_height"] > 1024
         assert manifest["tile_count"] >= 2
 
@@ -168,11 +166,9 @@ async def test_url_ingest_end_to_end(tmp_path):
     )
     try:
         async with running_app(env) as (client, svc):
-            r = await client.post(
-                "/tile", data={"doc_type": "URL", "url": f"http://127.0.0.1:{port}/page"}
+            manifest = await ingest_tiles(
+                client, {"data": {"doc_type": "URL", "url": f"http://127.0.0.1:{port}/page"}}
             )
-            assert r.status_code == 200, r.text
-            manifest = r.json()
             assert manifest["doc_type"] == "MHTML"  # URL is stored as MHTML
             assert manifest["source_url"] == f"http://127.0.0.1:{port}/page"
             assert manifest["tile_count"] >= 1

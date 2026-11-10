@@ -25,16 +25,15 @@ paths:
   /tile:
     post:
       operationId: ingestDocument
-      summary: Ingest a document, tile it, optionally store it, and return the tiles.
+      summary: Ingest a document into the store; the tiles are served by /get_tile.
       description: >
-        Renders at the fixed geometry and returns the tile manifest (with base64 tile
-        bytes when include_bytes=true). store=true persists the original + metadata so
-        tiles are regenerable via /get_tile. store=false persists nothing (pure
-        transform); include_bytes is then forced true and metadata is ignored.
+        Renders at the fixed geometry and stores the original, one row per tile (height,
+        image_hash) and the metadata. Tiles are not returned: /get_tile regenerates any
+        of them, and /tile/stream is the same ingest that also streams them. Idempotent
+        on doc_id = sha256(blob): identical bytes of an already-complete doc return at
+        once with result=idempotent (unless force).
       parameters:
-        - { name: store,         in: query, required: false, schema: { type: boolean, default: true },  description: Persist the original + metadata so tiles are regenerable later. }
-        - { name: include_bytes, in: query, required: false, schema: { type: boolean, default: true },  description: Include base64 JPEG bytes per tile. Forced true when store=false. }
-        - { name: force,         in: query, required: false, schema: { type: boolean, default: false }, description: Re-render even if this doc_id already exists. }
+        - { name: force, in: query, required: false, schema: { type: boolean, default: false }, description: Re-render even if this doc_id already exists. }
       requestBody:
         required: true
         content:
@@ -57,16 +56,16 @@ paths:
                   description: >
                     JSON object serialized as a string. Declared keys (see
                     /schema/metadata) become searchable; other keys are stored but not
-                    searchable. Ignored when store=false.
+                    searchable.
             encoding:
               document: { contentType: application/octet-stream }
       responses:
         '503': { $ref: '#/components/responses/NotReady' }
         '200':
-          description: Tiling result.
+          description: The stored doc's identity and layout.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/IngestManifest' }
+              schema: { $ref: '#/components/schemas/IngestResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '413': { $ref: '#/components/responses/TooLarge' }
@@ -80,8 +79,8 @@ paths:
       operationId: ingestDocumentStream
       summary: Ingest a document and stream its tiles as NDJSON, then a `committed` event.
       description: >
-        Same form fields as /tile, but always stores and always includes tile bytes
-        (no store/include_bytes params). The response is newline-delimited JSON
+        The /tile ingest (same form fields and force flag) that also streams every tile
+        it renders. The response is newline-delimited JSON
         (application/x-ndjson), one event object per line, streamed as tiles render: a
         `begin` event first (identity, so a client can build point ids before tiles
         arrive), a `tile` event per tile (for PDFs, streamed group-by-group as each group
@@ -385,33 +384,17 @@ components:
       description: Declared document type. A stored doc is never URL (a URL ingest is stored as MHTML).
       enum: [PDF, URL, MHTML, IMG]
 
-    TileMeta:
+    IngestResult:
       type: object
-      required: [tile_num, width, height, image_hash]
-      properties:
-        tile_num:   { type: integer, minimum: 0 }
-        width:      { type: integer, description: Always TILE_WIDTH (875). }
-        height:     { type: integer, description: Actual tile height in px. }
-        image_hash: { type: string, description: sha256 of the JPEG bytes. }
-        data:
-          type: string
-          format: byte
-          description: Base64 JPEG bytes. Present iff include_bytes=true.
-
-    IngestManifest:
-      type: object
-      required: [doc_id, doc_type, render_version, stored, page_height, tile_count, tiles]
+      required: [doc_id, doc_type, render_version, page_height, tile_count, result]
       properties:
         doc_id:         { type: string, description: sha256(blob) hex. }
         doc_type:       { $ref: '#/components/schemas/DocType' }
         source_url:     { type: [string, "null"], format: uri }
         render_version: { type: string }
-        stored:         { type: boolean }
         page_height:    { type: integer, description: Full-page height for web/mhtml/img; 0 for PDF. }
         tile_count:     { type: integer }
-        tiles:
-          type: array
-          items: { $ref: '#/components/schemas/TileMeta' }
+        result:         { type: string, enum: [rendered, idempotent], description: idempotent when identical bytes were already stored. }
 
     DocSummary:
       type: object
@@ -468,7 +451,7 @@ components:
 
     StreamCommitted:
       type: object
-      required: [event, doc_id, doc_type, render_version, page_height, tile_count]
+      required: [event, doc_id, doc_type, render_version, page_height, tile_count, result]
       properties:
         event:          { type: string, enum: [committed] }
         doc_id:         { type: string }
@@ -477,6 +460,7 @@ components:
         render_version: { type: string }
         page_height:    { type: integer, description: Full-page height for web/mhtml/img; 0 for PDF. }
         tile_count:     { type: integer }
+        result:         { type: string, enum: [rendered, idempotent], description: As in IngestResult. }
 
     StreamError:
       type: object

@@ -4,7 +4,7 @@
 Point it at a directory of source documents and it will, purely through the HTTP
 API:
 
-  1. INGEST  — POST every file to /tile, saving each returned tile to disk.
+  1. INGEST  — POST every file to /tile/stream, saving each streamed tile to disk.
   2. SEARCH  — pull the documents back via /docs/search (list-all plus a few
                indexed filters) to exercise metadata search end to end.
   3. VERIFY  — regenerate every tile via /get_tile and check its bytes hash to
@@ -15,7 +15,9 @@ URL per line) is ingested as doc_type=URL. Nothing here is specific to a given
 document set — any directory with the right file formats works.
 
 Usage:
-    python misc/smoke_run.py [--input DIR] [--out DIR] [--base-url URL]
+    python misc/smoke_run.py [--input DIR] [--out DIR] [--base-url URL] [--api-key KEY]
+
+The key defaults to the TILER_API_KEY environment variable.
 
 Requires the `requests` package on the host running the script.
 """
@@ -26,6 +28,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +38,8 @@ try:
     import requests
 except ImportError:  # pragma: no cover
     sys.exit("this script needs the 'requests' package (pip install requests)")
+
+SESSION = requests.Session()  # main() adds the Authorization header
 
 # Extension -> (doc_type, mime). Everything image-like is IMG; the service
 # validates the bytes against the declared type on ingest.
@@ -118,8 +123,7 @@ def discover(input_dir: Path) -> list[Item]:
 # Phase 1 — ingest
 # --------------------------------------------------------------------------- #
 def ingest(base_url: str, item: Item, out_root: Path) -> Record | None:
-    """POST one item to /tile, then write every returned tile to disk."""
-    params = {"store": "true", "include_bytes": "true"}
+    """POST one item to /tile/stream, then write every streamed tile to disk."""
     data = {"doc_type": item.doc_type, "metadata": json.dumps(item.metadata)}
     files = None
     if item.doc_type == "URL":
@@ -128,15 +132,24 @@ def ingest(base_url: str, item: Item, out_root: Path) -> Record | None:
         files = {"document": (item.path.name, item.path.read_bytes(), item.mime)}
 
     try:
-        resp = requests.post(f"{base_url}/tile", params=params, data=data, files=files, timeout=300)
+        resp = SESSION.post(f"{base_url}/tile/stream", data=data, files=files, timeout=300)
     except requests.RequestException as exc:
         print(f"  ! {item.name}: request failed: {exc}")
         return None
     if resp.status_code != 200:
-        print(f"  ! {item.name}: /tile -> {resp.status_code} {resp.text[:200]}")
+        print(f"  ! {item.name}: /tile/stream -> {resp.status_code} {resp.text[:200]}")
         return None
 
-    manifest = resp.json()
+    events = [json.loads(line) for line in resp.content.splitlines() if line.strip()]
+
+    if not events or events[-1]["event"] != "committed":
+        print(f"  ! {item.name}: /tile/stream ended with {events[-1] if events else 'nothing'}")
+        return None
+
+    manifest = {
+        **{k: v for k, v in events[-1].items() if k != "event"},
+        "tiles": [e for e in events if e["event"] == "tile"],
+    }
     out_dir = out_root / item.name
     out_dir.mkdir(parents=True, exist_ok=True)
     for tile in manifest["tiles"]:
@@ -163,7 +176,7 @@ def _search(base_url: str, filters: list[dict] | None) -> list[dict]:
             body["filters"] = filters
         if cursor:
             body["cursor"] = cursor
-        resp = requests.post(f"{base_url}/docs/search", json=body, timeout=60)
+        resp = SESSION.post(f"{base_url}/docs/search", json=body, timeout=60)
         resp.raise_for_status()
         page = resp.json()
         items.extend(page["items"])
@@ -203,7 +216,7 @@ def verify_phase(base_url: str, records: list[Record]) -> tuple[int, int]:
         mism = []
         for tile in r.tiles:
             n = tile["tile_num"]
-            resp = requests.get(
+            resp = SESSION.get(
                 f"{base_url}/get_tile",
                 params={"doc_id": r.doc_id, "tile_num": n, "verify": "true"},
                 timeout=120,
@@ -232,12 +245,16 @@ def main() -> int:
     ap.add_argument("--input", type=Path, default=Path("artifacts/inputs"), help="source documents dir")
     ap.add_argument("--out", type=Path, default=Path("artifacts/tiles"), help="where tiles are written")
     ap.add_argument("--base-url", default="http://localhost:8077", help="running Tiler base URL")
+    ap.add_argument("--api-key", default=os.environ.get("TILER_API_KEY", ""), help="TILER_API_KEY")
     args = ap.parse_args()
+
+    if args.api_key:
+        SESSION.headers["Authorization"] = f"Bearer {args.api_key}"
 
     if not args.input.is_dir():
         return f"input dir not found: {args.input}"
     try:
-        requests.get(f"{args.base_url}/readyz", timeout=10).raise_for_status()
+        SESSION.get(f"{args.base_url}/readyz", timeout=10).raise_for_status()
     except requests.RequestException as exc:
         return f"service not ready at {args.base_url}: {exc}"
 

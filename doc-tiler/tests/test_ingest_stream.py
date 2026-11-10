@@ -67,6 +67,7 @@ async def test_stream_emits_tiles_then_committed(client, sample_pdf):
 
     c = committed[0]
     assert c["tile_count"] == 3
+    assert c["result"] == "rendered"
     assert c["doc_id"] == hashlib.sha256(sample_pdf).hexdigest()
 
     for t in tiles:
@@ -87,6 +88,8 @@ async def test_stream_idempotent_replay_does_not_re_render(client, sample_pdf):
     committed = [e for e in second if e["event"] == "committed"][0]
 
     assert committed["tile_count"] == 3
+    assert committed["result"] == "idempotent"
+    assert len([e for e in second if e["event"] == "tile"]) == 3       # tiles are replayed
     assert _render_count(client.service, "PDF", "ingest") == before   # replay from store
 
 

@@ -278,16 +278,6 @@ async def test_metadata_endpoints_404(client):
     assert (await client.patch(f"/doc/{missing}/metadata", json={})).status_code == 404
 
 
-async def test_metadata_ignored_when_store_false(client):
-    r = await client.post(
-        "/tile",
-        params={"store": "false"},
-        **pdf_form(make_pdf(1), metadata=json.dumps({"year": "invalid-but-ignored"})),
-    )
-    assert r.status_code == 200
-    assert r.json()["stored"] is False
-
-
 async def _search_count(client, key: str, value) -> int:
     res = (await client.post("/docs/search", json={"filters": [{"key": key, "value": value}]})).json()
     return len(res["items"])

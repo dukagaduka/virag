@@ -1,11 +1,11 @@
-"""PDF ingest, round-trip identity, idempotency, store semantics."""
+"""PDF ingest, round-trip identity, idempotency."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
 
-from conftest import base_env, make_pdf, pdf_form, running_app
+from conftest import base_env, ingest_tiles, make_pdf, pdf_form, running_app
 
 
 async def test_pdf_sliced_round_trip_identity(tmp_path):
@@ -19,9 +19,7 @@ async def test_pdf_sliced_round_trip_identity(tmp_path):
         TILER_PDF_TILE_OVERLAP="100",
     )
     async with running_app(env) as (client, _service):
-        r = await client.post("/tile", **pdf_form(pdf))
-        assert r.status_code == 200, r.text
-        manifest = r.json()
+        manifest = await ingest_tiles(client, pdf_form(pdf))
 
         assert manifest["doc_type"] == "PDF"
         assert manifest["page_height"] == 0
@@ -44,13 +42,31 @@ async def test_pdf_sliced_round_trip_identity(tmp_path):
             assert hashlib.sha256(got.content).hexdigest() == tile["image_hash"]
 
 
-async def test_pdf_ingest_round_trip_identity(client, sample_pdf):
+async def test_tile_returns_the_summary_without_tiles(client, sample_pdf):
     r = await client.post("/tile", **pdf_form(sample_pdf))
     assert r.status_code == 200, r.text
-    manifest = r.json()
+
+    assert r.json() == {
+        "doc_id": hashlib.sha256(sample_pdf).hexdigest(),
+        "doc_type": "PDF",
+        "source_url": None,
+        "render_version": client.service.settings.render_version,
+        "page_height": 0,
+        "tile_count": 3,
+        "result": "rendered",
+    }
+
+    for tile_num in range(3):
+        got = await client.get(
+            "/get_tile", params={"doc_id": r.json()["doc_id"], "tile_num": tile_num}
+        )
+        assert got.status_code == 200, got.text
+
+
+async def test_pdf_ingest_round_trip_identity(client, sample_pdf):
+    manifest = await ingest_tiles(client, pdf_form(sample_pdf))
 
     assert manifest["doc_type"] == "PDF"
-    assert manifest["stored"] is True
     assert manifest["page_height"] == 0  # PDF: one tile per page, no full-page height
     assert manifest["tile_count"] == 3  # one tile per page
     assert manifest["doc_id"] == hashlib.sha256(sample_pdf).hexdigest()
@@ -75,21 +91,18 @@ async def test_pdf_ingest_round_trip_identity(client, sample_pdf):
 
 async def test_pdf_tile_height_is_proportional(client):
     # A4 at 595x842pt → 875 wide keeps the aspect ratio.
-    r = await client.post("/tile", **pdf_form(make_pdf(pages=1)))
-    tile = r.json()["tiles"][0]
+    tile = (await ingest_tiles(client, pdf_form(make_pdf(pages=1))))["tiles"][0]
     assert tile["width"] == 875
     assert abs(tile["height"] - round(875 * 842 / 595)) <= 2
 
 
 async def test_idempotent_ingest_does_not_re_render(client, sample_pdf):
     first = (await client.post("/tile", **pdf_form(sample_pdf))).json()
-    counter = client.service
-    before = _render_count(counter, "PDF", "ingest")
+    before = _render_count(client.service, "PDF", "ingest")
 
     second = (await client.post("/tile", **pdf_form(sample_pdf))).json()
-    assert second["doc_id"] == first["doc_id"]
-    assert [t["image_hash"] for t in second["tiles"]] == [t["image_hash"] for t in first["tiles"]]
-    assert _render_count(counter, "PDF", "ingest") == before  # idempotent: no re-render
+    assert second == {**first, "result": "idempotent"}
+    assert _render_count(client.service, "PDF", "ingest") == before  # idempotent: no re-render
 
 
 async def test_force_re_renders(client, sample_pdf):
@@ -98,30 +111,6 @@ async def test_force_re_renders(client, sample_pdf):
     r = await client.post("/tile", params={"force": "true"}, **pdf_form(sample_pdf))
     assert r.status_code == 200
     assert _render_count(client.service, "PDF", "ingest") == before + 1
-
-
-async def test_store_false_persists_nothing(client, sample_pdf):
-    r = await client.post(
-        "/tile", params={"store": "false", "include_bytes": "false"}, **pdf_form(sample_pdf)
-    )
-    manifest = r.json()
-    assert manifest["stored"] is False
-    # include_bytes is forced true when store=false.
-    assert all(t.get("data") for t in manifest["tiles"])
-
-    got = await client.get("/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": 0})
-    assert got.status_code == 404
-    assert got.json()["error"]["code"] == "UNKNOWN_DOC"
-
-    listed = (await client.post("/docs/search", json={})).json()
-    assert listed["items"] == []
-
-
-async def test_include_bytes_false_omits_data(client, sample_pdf):
-    r = await client.post("/tile", params={"include_bytes": "false"}, **pdf_form(sample_pdf))
-    manifest = r.json()
-    assert all(t.get("data") is None for t in manifest["tiles"])
-    assert manifest["tile_count"] == 3
 
 
 async def test_tile_num_out_of_range(client, sample_pdf):

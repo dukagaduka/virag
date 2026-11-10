@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
-INGESTS = Counter("tiler_ingest_total", "Ingest requests", ["doc_type", "stored", "result"])
+INGESTS = Counter("tiler_ingest_total", "Ingest requests", ["doc_type", "result"])
 RENDERS = Counter(
     "tiler_renders_total",
     "Document renders actually performed (a cache/idempotency hit does not count)",

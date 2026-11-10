@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
 
 import httpx2
 import orjson
@@ -10,49 +9,6 @@ from virag.clients.http_service import HttpService
 from virag.errors import ApiError
 from virag.settings import HttpSettings, TilerSettings
 from virag.utils import error_body
-
-
-@dataclass(slots=True)
-class Tile:
-    tile_num: int
-    width: int
-    height: int
-    image_hash: str
-    data: str | None = None   # base64 JPEG, present iff include_bytes=true
-
-
-@dataclass(slots=True)
-class TileResult:
-    doc_id: str
-    doc_type: str
-    source_url: str | None
-    render_version: str
-    stored: bool
-    page_height: int
-    tile_count: int
-    tiles: list[Tile]
-
-    @classmethod
-    def from_manifest(cls, data: dict) -> TileResult:
-        return cls(
-            doc_id=data["doc_id"],
-            doc_type=data["doc_type"],
-            source_url=data.get("source_url"),
-            render_version=data["render_version"],
-            stored=data["stored"],
-            page_height=data["page_height"],
-            tile_count=data["tile_count"],
-            tiles=[
-                Tile(
-                    tile_num=t["tile_num"],
-                    width=t["width"],
-                    height=t["height"],
-                    image_hash=t["image_hash"],
-                    data=t.get("data"),
-                )
-                for t in data["tiles"]
-            ],
-        )
 
 
 class TilerService(HttpService):
@@ -73,11 +29,6 @@ class TilerService(HttpService):
             headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
             **http_options,
         )
-
-
-    @property
-    def tile_route(self):
-        return f"{self.base_url}/tile"
 
 
     @property
@@ -155,38 +106,6 @@ class TilerService(HttpService):
                 message="the tiler rejects TILER_API_KEY: set the tiler's own value",
                 details={"upstream_status": 401},
             )
-
-
-    async def tile(
-        self,
-        doc_type: str,
-        *,
-        document: bytes | None = None,
-        url: str | None = None,
-        metadata: dict | None = None,
-        store: bool = True,
-        include_bytes: bool = True,
-        force: bool = False,
-    ) -> TileResult:
-
-        params = {
-            "store": store,
-            "include_bytes": include_bytes,
-            "force": force,
-        }
-
-        # An ingest is not replayed: a timed-out render may still be running upstream.
-        response = await self._request(
-            "POST",
-            self.tile_route,
-            action="the ingest",
-            retry=False,
-            params=params,
-            data=self._ingest_form(doc_type, url, metadata),
-            files=self._ingest_files(document),
-        )
-
-        return self._json(response, action="the ingest", parse=TileResult.from_manifest)
 
 
     async def tile_stream(

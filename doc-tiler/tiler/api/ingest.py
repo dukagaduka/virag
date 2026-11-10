@@ -1,4 +1,4 @@
-"""Ingest a document, tile it, and optionally store it."""
+"""Ingest a document into the store; the streaming variant also emits its tiles."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..errors import bad_request
-from ..models import DocType, IngestManifest
+from ..models import DocType, IngestResult
 from .deps import ERROR_RESPONSES, check_declared_size, parse_metadata_field, read_capped, service
 
 router = APIRouter()
@@ -38,9 +38,9 @@ def _validate_ingest_inputs(doc_type: str, document: UploadFile | None) -> DocTy
 
 @router.post(
     "/tile",
-    response_model=IngestManifest,
+    response_model=IngestResult,
     responses=ERROR_RESPONSES,
-    summary="Ingest a document, tile it, optionally store it, and return the tiles.",
+    summary="Ingest a document into the store; the tiles are served by /get_tile.",
     operation_id="ingestDocument",
 )
 async def ingest_document(
@@ -49,11 +49,9 @@ async def ingest_document(
     document: Annotated[UploadFile | None, File()] = None,
     url: Annotated[str | None, Form()] = None,
     metadata: Annotated[str | None, Form()] = None,
-    store: Annotated[bool, Query()] = True,
-    include_bytes: Annotated[bool, Query()] = True,
     force: Annotated[bool, Query()] = False,
-) -> IngestManifest:
-    """Ingest a document, tile it, optionally store it, and return the tiles."""
+) -> IngestResult:
+    """Ingest a document into the store and return its identity and tile count."""
     svc = service(request)
     doc_type = _validate_ingest_inputs(doc_type, document)
 
@@ -64,17 +62,15 @@ async def ingest_document(
     if document is not None and doc_type != DocType.URL:
         data = await read_capped(document, svc.settings.max_doc_bytes)
 
-    manifest = await svc.ingest(
+    result = await svc.ingest(
         doc_type=doc_type,
         data=data,
         url=url,
         metadata=parse_metadata_field(metadata),
-        store=store,
-        include_bytes=include_bytes,
         force=force,
     )
 
-    return IngestManifest(**manifest)
+    return IngestResult(**result)
 
 
 @router.post(
@@ -91,11 +87,10 @@ async def ingest_document_stream(
     metadata: Annotated[str | None, Form()] = None,
     force: Annotated[bool, Query()] = False,
 ) -> StreamingResponse:
-    """Stream a stored ingest tile-by-tile (NDJSON), terminated by a `committed` event.
+    """The `/tile` ingest, streamed tile by tile (NDJSON) and terminated by `committed`.
 
-    The doc is persisted incrementally and stays incomplete until the final tile, so a
-    broken stream leaves a swept-able partial. Errors surface as an in-stream `error`
-    event; the absence of `committed` means the ingest did not complete.
+    Errors surface as an in-stream `error` event; the absence of `committed` means the
+    ingest did not complete.
     """
     svc = service(request)
     doc_type = _validate_ingest_inputs(doc_type, document)

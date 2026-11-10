@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 
@@ -101,7 +102,7 @@ def make_png(width: int = 1000, height: int = 2600) -> bytes:
 
 
 def upload(doc_type: str, data: bytes, name: str, mime: str, **fields: str) -> dict:
-    """Kwargs for `client.post("/tile", **upload(...))`."""
+    """Kwargs for `client.post("/tile", **upload(...))` (or "/tile/stream")."""
     return {
         "files": {"document": (name, data, mime)},
         "data": {"doc_type": doc_type, **fields},
@@ -118,6 +119,20 @@ def png_form(data: bytes, name: str = "doc.png", **fields: str) -> dict:
 
 def mhtml_form(data: bytes, name: str = "doc.mhtml", **fields: str) -> dict:
     return upload("MHTML", data, name, "multipart/related", **fields)
+
+
+async def ingest_tiles(client, form: dict, **params: str) -> dict:
+    """Ingest via /tile/stream; return the `committed` fields plus `tiles` (with bytes)."""
+    r = await client.post("/tile/stream", params=params, **form)
+    assert r.status_code == 200, r.text
+
+    events = [json.loads(line) for line in r.content.splitlines() if line.strip()]
+    assert events[-1]["event"] == "committed", events[-1]
+
+    return {
+        **{k: v for k, v in events[-1].items() if k != "event"},
+        "tiles": [e for e in events if e["event"] == "tile"],
+    }
 
 
 @pytest.fixture

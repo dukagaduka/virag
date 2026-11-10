@@ -157,9 +157,8 @@ searchable by expression indexes created at startup, one per declared field (see
 
 The `complete` column **auto-migrates** on existing volumes: an `ALTER TABLE docs ADD
 COLUMN complete INTEGER NOT NULL DEFAULT 1` runs at startup, and pre-existing rows
-backfill to `complete=1` (they were written atomically). A non-streaming `POST /tile`
-always writes `complete=1` (atomic full write); a streaming ingest writes the row
-`complete=0` and flips it on the final tile (see §9).
+backfill to `complete=1` (they were written atomically). Both ingest routes write the
+row `complete=0` and flip it on the final tile (see §9).
 
 Everything storage-related sits behind `BlobStore` / `MetaStore` interfaces, keeping
 the FS→S3 and SQLite→Postgres swaps to a driver change.
@@ -384,8 +383,8 @@ content rasterizes. Ingest and regeneration call the *same* functions in
 
 ## 9. Idempotency, dedup, deletion
 
-- Idempotent ingest keyed by `doc_id = sha256(blob)`; identical bytes return the stored
-  manifest without re-render (unless `force`, or the doc is quarantined — then it is
+- Idempotent ingest keyed by `doc_id = sha256(blob)`; identical bytes answer
+  `result=idempotent` (the stream replays the stored tiles) without re-render (unless `force`, or the doc is quarantined — then it is
   re-rendered, lifting the quarantine).
 - Blob write skipped if the path exists.
 - URL caveat: re-fetching a changed URL yields a new `doc_id`; `source_url` is
@@ -395,10 +394,9 @@ content rasterizes. Ingest and regeneration call the *same* functions in
 
 ### Incomplete-doc lifecycle (streaming ingest)
 
-`POST /tile/stream` (see [API.md](API.md)) persists a doc **incrementally**: it writes the
-`docs` row as `complete=0`, appends `tiles` rows as they render, and flips the row to
-`complete=1` on the final tile. `POST /tile` (non-streaming) always writes `complete=1`
-(one atomic full write).
+Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipeline that
+persists a doc **incrementally**: it writes the `docs` row as `complete=0`, appends
+`tiles` rows as they render, and flips the row to `complete=1` on the final tile.
 
 - An **incomplete (`complete=0`) doc is not servable**: `GET /get_tile` on it returns
   `404` with error code `DOC_INCOMPLETE`.

@@ -21,8 +21,8 @@ cp .env.example .env          # set TILER_API_KEY, adjust geometry/pixel if need
 docker compose up --build
 curl -s localhost:8080/readyz | jq
 
-# ingest a PDF, store it, get the manifest without the base64 payload
-curl -s -X POST 'localhost:8080/tile?include_bytes=false' \
+# ingest a PDF: the answer is its doc_id and tile_count (/tile/stream also streams the tiles)
+curl -s -X POST localhost:8080/tile -H "Authorization: Bearer $TILER_API_KEY" \
      -F doc_type=PDF -F document=@paper.pdf \
      -F 'metadata={"project":"atlas","year":2024,"source":{"host":"arxiv.org"}}' | jq
 
@@ -94,7 +94,7 @@ docker compose --profile test run --rm tests              # full suite incl. MHT
 
 The suite covers round-trip identity per doc type, idempotency (asserted against the
 render counter), the forward/reverse geometry property over random heights and overlaps,
-`store=false`, expression-index usage via `EXPLAIN QUERY PLAN`, metadata CRUD with
+expression-index usage via `EXPLAIN QUERY PLAN`, metadata CRUD with
 immediate index visibility, cursor pagination, the fatal geometry guard, SSRF blocking,
 cache coalescing, `/healthz` latency under concurrent ingests, and MHTML re-render
 determinism.

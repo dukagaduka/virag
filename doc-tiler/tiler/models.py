@@ -21,27 +21,16 @@ class DocType(StrEnum):
 SearchOp = Literal["eq", "ne", "gt", "gte", "lt", "lte"]
 
 
-class TileMeta(BaseModel):
-    """One tile's metadata, with optional base64 JPEG bytes."""
-
-    tile_num: int
-    width: int
-    height: int
-    image_hash: str
-    data: str | None = None
-
-
-class IngestManifest(BaseModel):
-    """Result of an ingest: doc identity plus the produced tiles."""
+class IngestResult(BaseModel):
+    """Result of `/tile`: the stored doc's identity and layout, without its tiles."""
 
     doc_id: str
     doc_type: DocType
     source_url: str | None = None
     render_version: str
-    stored: bool
     page_height: int
     tile_count: int
-    tiles: list[TileMeta]
+    result: Literal["rendered", "idempotent"]
 
 
 class DocSummary(BaseModel):

@@ -17,10 +17,12 @@ omit the header — add `-H "Authorization: Bearer $TILER_API_KEY"` to each.
 
 ## Documents
 
-### `POST /tile` — ingest, tile, optionally store
+### `POST /tile` — ingest
 
-`multipart/form-data`. Renders a document at the fixed geometry and returns the tile
-manifest.
+`multipart/form-data`. Renders a document at the fixed geometry and stores it: the
+original blob, one row per tile (height, `image_hash`) and the metadata. Tiles
+themselves are not returned — `/get_tile` regenerates any of them; `POST /tile/stream`
+(below) is the same ingest that also streams the tiles as they render.
 
 Body fields:
 
@@ -31,42 +33,37 @@ Body fields:
 
 Query flags:
 
-- `store` (default `true`) — persist blob + rows + metadata so tiles are regenerable
-  via `/get_tile`. `store=false` is a **pure transform**: it slices and returns tiles,
-  writes nothing, ignores `metadata`, forces `include_bytes=true`, and a later
-  `/get_tile` for that `doc_id` will `404`.
-- `include_bytes` (default `true`) — include base64 JPEG bytes per tile.
 - `force` (default `false`) — re-render even if this `doc_id` already exists.
 
-**Idempotent** on `doc_id = sha256(blob)`: identical bytes return the stored manifest
-without re-rendering (unless `force`). The response is an `IngestManifest`: `doc_id,
-doc_type, source_url, render_version, stored, page_height, tile_count, tiles[]`, each
-tile `{tile_num, width, height, image_hash, data?}` (`data` = base64 JPEG when
-`include_bytes=true`).
+**Idempotent** on `doc_id = sha256(blob)`: identical bytes of an already-complete doc
+return at once without re-rendering (unless `force`). The response is an `IngestResult`:
+
+```json
+{"doc_id": "…", "doc_type": "PDF", "source_url": null, "render_version": "…",
+ "page_height": 0, "tile_count": 3, "result": "rendered"}
+```
+
+`result` is `rendered` or `idempotent`.
 
 ```bash
-curl -s -X POST 'localhost:8080/tile?include_bytes=false' \
+curl -s -X POST localhost:8080/tile -H "Authorization: Bearer $TILER_API_KEY" \
      -F doc_type=PDF -F document=@paper.pdf \
      -F 'metadata={"project":"atlas","year":2024,"source":{"host":"arxiv.org"}}' | jq
 ```
 
-> Base64 adds ~33% overhead; JSON+base64 is the canonical contract. A
-> `multipart/mixed` variant may be offered later via `Accept`.
-
 ### `POST /tile/stream` — streaming ingest (NDJSON)
 
-Same form fields as `POST /tile` (`doc_type`, `document`, `url`, `metadata`) and the same
-`force` query flag — but **no `store` / `include_bytes`**: it always stores and always
-includes tile bytes. Instead of one manifest it returns `application/x-ndjson`
-(newline-delimited JSON), one event object per line, streamed as tiles render:
+The `POST /tile` ingest — same form fields, same `force` flag — that also streams every
+tile it renders. It returns `application/x-ndjson` (newline-delimited JSON), one event
+object per line:
 
 - `{"event":"begin","doc_id","doc_type","source_url","render_version"}` — emitted first,
   so a client can build point ids before any tile arrives.
 - `{"event":"tile","tile_num","width","height","image_hash","data"}` — one per tile;
   `data` is base64 JPEG. For PDFs, tiles stream **group-by-group** as each group finishes
   rendering, so their order is **not guaranteed monotonic**.
-- `{"event":"committed","doc_id","doc_type","source_url","render_version","page_height","tile_count"}`
-  — terminal **success** event.
+- `{"event":"committed","doc_id","doc_type","source_url","render_version","page_height","tile_count","result"}`
+  — terminal **success** event; `result` is `rendered` or `idempotent`, as in `/tile`.
 - `{"event":"error","code","message"}` — terminal **failure** event.
 
 The doc is persisted **incrementally**: it stays incomplete (`complete=0`, see below)
@@ -77,10 +74,9 @@ failure is reported as an in-stream `error` event (the HTTP status is already `2
 **absence of a `committed` event** is the client's signal that the ingest did not complete.
 A stream that dies mid-way leaves a swept-able partial doc, never a servable half-doc.
 Idempotent like `/tile`: identical bytes of an already-**complete** doc replay the stored
-tiles as the same event stream without re-rendering (unless `force`); a quarantined doc
-is re-rendered instead, which lifts its quarantine.
-
-`POST /tile` (the single-manifest form above) is unchanged and remains available.
+tiles (regenerated, verified against their hashes) as the same event stream without
+re-rendering (unless `force`); a quarantined doc is re-rendered instead, which lifts its
+quarantine.
 
 ### Revision — `GET /revision`, `POST /revision`
 
@@ -194,7 +190,7 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 | `400` | Unknown `doc_type`, `tile_num` out of range, undeclared filter key, unsupported op, numeric op on a text field, bad cursor. |
 | `401` | Missing or wrong `TILER_API_KEY` (`UNAUTHORIZED`). |
 | `403` | SSRF policy block. |
-| `404` | Unknown `doc_id` (including `store=false` docs); `GET /get_tile` on an incomplete doc (`DOC_INCOMPLETE`). |
+| `404` | Unknown `doc_id`; `GET /get_tile` on an incomplete doc (`DOC_INCOMPLETE`). |
 | `405` | `DELETE` with `TILER_ALLOW_DELETE=false`. |
 | `409` | `image_hash` mismatch on regeneration (`RENDER_MISMATCH`); `POST /revision` while one runs (`REVISION_RUNNING`). |
 | `410` | `GET /get_tile` on a quarantined doc (`QUARANTINED`). |

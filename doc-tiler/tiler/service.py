@@ -300,107 +300,6 @@ class TilerService:
                 metrics.INFLIGHT.labels(layer="browser").dec()
 
 
-    # ------------------------------------------------------------------ #
-    # ingest
-    # ------------------------------------------------------------------ #
-    async def ingest(
-        self,
-        *,
-        doc_type: DocType,
-        data: bytes | None,
-        url: str | None,
-        metadata: dict[str, Any] | None,
-        store: bool,
-        include_bytes: bool,
-        force: bool,
-    ) -> dict[str, Any]:
-        """Ingest a document: render it to tiles and, unless store=false, persist it."""
-        if not store:
-            include_bytes = True  # store=false is a pure transform: nothing is written
-            metadata = None
-
-        source_url: str | None = None
-
-        if doc_type == DocType.URL:
-            if not url:
-                raise bad_request("url is required when doc_type=URL", "MISSING_URL")
-
-            blob = await self._capture_url(url)
-            effective_type = DocType.MHTML
-            source_url = url
-            mime = "multipart/related"
-
-        else:
-            if data is None:
-                raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
-
-            blob = data
-            effective_type = doc_type
-            mime = media.check_and_mime(doc_type, blob)
-
-        doc_id = sha256_hex(blob)
-
-        # Idempotency: identical bytes never re-render — but only a fully-written doc
-        # short-circuits; an incomplete (crashed/streaming) doc must be re-rendered.
-        if store and not force:
-            existing = await self.store.get_doc(doc_id)
-
-            if self._servable(existing):
-                metrics.INGESTS.labels(
-                    doc_type=effective_type, stored="true", result="idempotent"
-                ).inc()
-
-                return await self._manifest_from_store(existing, include_bytes)
-
-        if store and metadata is not None:
-            metadata = self.validate_metadata_payload(metadata)
-
-        rendered = await self.render_document(effective_type, blob, path="ingest", bulk=True)
-
-        if store:
-            # Blob first: a blob without a row is inert and dedups away, whereas a row
-            # without a blob would make /get_tile permanently fail.
-            rel = await self.blobs.put(doc_id, blob)
-
-            await self.store.upsert_doc(
-                doc_id=doc_id,
-                doc_type=effective_type,
-                blob_rel_path=rel,
-                source_url=source_url,
-                page_height=rendered.page_height,
-                tile_count=len(rendered.tiles),
-                mime_type=mime,
-                metadata=metadata,
-                render_version=self.settings.render_version,
-                tiles=rendered.tiles,
-                page_heights=rendered.page_heights,
-            )
-            await self._invalidate(doc_id)
-
-            metrics.DOCS.set(await self.store.count_docs())
-
-        metrics.INGESTS.labels(
-            doc_type=effective_type, stored=str(store).lower(), result="rendered"
-        ).inc()
-
-        return {
-            "doc_id": doc_id,
-            "doc_type": effective_type,
-            "source_url": source_url,
-            "render_version": self.settings.render_version,
-            "stored": store,
-            "page_height": rendered.page_height,
-            "tile_count": len(rendered.tiles),
-            "tiles": [
-                self._tile_meta(t.tile_num, t.height, t.image_hash, t.jpeg if include_bytes else None)
-                for t in rendered.tiles
-            ],
-        }
-
-
-    # ------------------------------------------------------------------ #
-    # streaming ingest
-    # ------------------------------------------------------------------ #
     async def _render_pdf_stream(
         self, blob: bytes
     ) -> AsyncIterator[tuple[list[RenderedTile], list[int]]]:
@@ -484,6 +383,32 @@ class TilerService:
             raise
 
 
+    # ------------------------------------------------------------------ #
+    # ingest
+    # ------------------------------------------------------------------ #
+    async def ingest(
+        self,
+        *,
+        doc_type: DocType,
+        data: bytes | None,
+        url: str | None,
+        metadata: dict[str, Any] | None,
+        force: bool,
+    ) -> dict[str, Any]:
+        """Ingest a document into the store and return its summary (no tile bytes).
+
+        Runs the same pipeline as `ingest_stream`, only without emitting the tiles: an
+        idempotent hit returns at once instead of replaying them, and a failure raises.
+        """
+        async for event in self._ingest(
+            doc_type=doc_type, data=data, url=url, metadata=metadata, force=force, replay=False
+        ):
+            if event["event"] == "committed":
+                return {key: value for key, value in event.items() if key != "event"}
+
+        raise RuntimeError("ingest finished without a committed event")  # pragma: no cover
+
+
     async def ingest_stream(
         self,
         *,
@@ -493,149 +418,194 @@ class TilerService:
         metadata: dict[str, Any] | None,
         force: bool,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream an ingest as NDJSON events: one per tile, then a terminal `committed`.
+        """Stream an ingest as NDJSON events: `begin`, one `tile` per tile, then `committed`.
 
-        Tiles are written to the store as they render (the doc stays `complete=0` until
-        the last one), so a stream that dies mid-way leaves a swept-able partial and
-        never a servable half-doc. A failure surfaces as an `error` event; the absence
-        of `committed` is the client's signal to roll back.
+        The response is already 200 when the first event leaves, so a failure surfaces as
+        an `error` event; the absence of `committed` is the client's signal to roll back.
         """
-        source_url: str | None = None
-
         try:
-            if doc_type == DocType.URL:
-                if not url:
-                    raise bad_request("url is required when doc_type=URL", "MISSING_URL")
+            async for event in self._ingest(
+                doc_type=doc_type, data=data, url=url, metadata=metadata, force=force, replay=True
+            ):
+                if event["event"] == "tile":
+                    tile: RenderedTile = event["tile"]
+                    event = {
+                        "event": "tile",
+                        **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg),
+                    }
 
-                blob = await self._capture_url(url)
-                effective_type = DocType.MHTML
-                source_url = url
-                mime = "multipart/related"
-
-            else:
-                if data is None:
-                    raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
-
-                blob = data
-                effective_type = doc_type
-                mime = media.check_and_mime(doc_type, blob)
-
-            doc_id = sha256_hex(blob)
-
-            existing = None if force else await self.store.get_doc(doc_id)
-
-            if self._servable(existing):
-                metrics.INGESTS.labels(
-                    doc_type=effective_type, stored="true", result="idempotent"
-                ).inc()
-
-                async for event in self._stream_from_store(existing):
-                    yield event
-
-                return
-
-            if metadata is not None:
-                metadata = self.validate_metadata_payload(metadata)
+                yield event
 
         except ApiError as exc:
             yield {"event": "error", "code": exc.code, "message": exc.message}
+
+        except Exception as exc:  # noqa: BLE001 - the stream is already 200; report in-band
+            log.exception("streaming ingest crashed")
+            yield {"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)}
+
+
+    async def _ingest(
+        self,
+        *,
+        doc_type: DocType,
+        data: bytes | None,
+        url: str | None,
+        metadata: dict[str, Any] | None,
+        force: bool,
+        replay: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """The ingest pipeline: `begin`, `tile` events carrying a `RenderedTile`, `committed`.
+
+        Tiles are written to the store as they render (the doc stays `complete=0` until
+        the last one), so an ingest that dies mid-way leaves a swept-able partial and
+        never a servable half-doc. An idempotent hit replays the stored tiles when
+        `replay` is set and goes straight to `committed` otherwise. Failures raise.
+        """
+        source_url: str | None = None
+
+        if doc_type == DocType.URL:
+            if not url:
+                raise bad_request("url is required when doc_type=URL", "MISSING_URL")
+
+            blob = await self._capture_url(url)
+            effective_type = DocType.MHTML
+            source_url = url
+            mime = "multipart/related"
+
+        else:
+            if data is None:
+                raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
+
+            blob = data
+            effective_type = doc_type
+            mime = media.check_and_mime(doc_type, blob)
+
+        doc_id = sha256_hex(blob)
+
+        # Idempotency: identical bytes never re-render, but only a fully-written doc
+        # short-circuits; an incomplete (crashed/streaming) doc must be re-rendered.
+        existing = None if force else await self.store.get_doc(doc_id)
+
+        if self._servable(existing):
+            metrics.INGESTS.labels(doc_type=effective_type, result="idempotent").inc()
+
+            async for event in self._replay_from_store(existing, replay):
+                yield event
+
             return
+
+        if metadata is not None:
+            metadata = self.validate_metadata_payload(metadata)
 
         self._inflight.add(doc_id)
 
         try:
-            rel = await self.blobs.put(doc_id, blob)
-
-            await self.store.begin_doc(
-                doc_id=doc_id,
-                doc_type=effective_type,
-                blob_rel_path=rel,
-                source_url=source_url,
-                page_height=0,
-                tile_count=0,
-                mime_type=mime,
-                metadata=metadata,
-                render_version=self.settings.render_version,
-            )
-
-            # Emit identity up front so the consumer can build point ids / mark pending
-            # before any tile arrives.
-            yield {
-                "event": "begin",
-                "doc_id": doc_id,
-                "doc_type": effective_type,
-                "source_url": source_url,
-                "render_version": self.settings.render_version,
-            }
-
-            count = 0
-            page_height = 0
-            page_heights_acc: list[int] = []
-
-            if effective_type == DocType.PDF:
-                started = time.perf_counter()
-
-                async for group, heights in self._render_pdf_stream(blob):
-                    page_heights_acc.extend(heights)
-
-                    await self.store.append_tiles(doc_id, group)
-
-                    for tile in group:
-                        count += 1
-                        yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg)}
-
-                metrics.RENDER_SECONDS.labels(doc_type=effective_type, path="ingest").observe(
-                    time.perf_counter() - started
-                )
-                metrics.RENDERS.labels(doc_type=effective_type, path="ingest").inc()
-                metrics.TILES.labels(doc_type=effective_type, path="ingest").inc(count)
-
-            else:
-                # IMG/MHTML render as a single unit (small); stream the transport only.
-                rendered = await self.render_document(effective_type, blob, path="ingest", bulk=True)
-                page_height = rendered.page_height
-
-                await self.store.append_tiles(doc_id, rendered.tiles)
-
-                for tile in rendered.tiles:
-                    count += 1
-                    yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, tile.jpeg)}
-
-            await self.store.finish_doc(
-                doc_id,
-                tile_count=count,
-                page_height=page_height,
-                page_heights=page_heights_acc or None,
-            )
-            await self._invalidate(doc_id)
-
-            metrics.DOCS.set(await self.store.count_docs())
-            metrics.INGESTS.labels(doc_type=effective_type, stored="true", result="rendered").inc()
-
-            yield {
-                "event": "committed",
-                "doc_id": doc_id,
-                "doc_type": effective_type,
-                "source_url": source_url,
-                "render_version": self.settings.render_version,
-                "page_height": page_height,
-                "tile_count": count,
-            }
+            async for event in self._render_into_store(
+                doc_id, effective_type, blob, source_url, mime, metadata
+            ):
+                yield event
 
         except ApiError as exc:
-            log.warning("streaming ingest failed for %s: %s", doc_id, exc.message)
-            yield {"event": "error", "code": exc.code, "message": exc.message}
-
-        except Exception as exc:  # noqa: BLE001 - the stream is already 200; report in-band
-            log.exception("streaming ingest crashed for %s", doc_id)
-            yield {"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)}
+            log.warning("ingest failed for %s: %s", doc_id, exc.message)
+            raise
 
         finally:
             self._inflight.discard(doc_id)
 
 
-    async def _stream_from_store(self, row: DocRow) -> AsyncIterator[dict[str, Any]]:
-        """Replay a fully-stored doc as the same NDJSON event stream (idempotent hit)."""
+    async def _render_into_store(
+        self,
+        doc_id: str,
+        effective_type: DocType,
+        blob: bytes,
+        source_url: str | None,
+        mime: str,
+        metadata: dict[str, Any] | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Render a new doc tile by tile into the store, ending with `committed`."""
+        rel = await self.blobs.put(doc_id, blob)
+
+        await self.store.begin_doc(
+            doc_id=doc_id,
+            doc_type=effective_type,
+            blob_rel_path=rel,
+            source_url=source_url,
+            page_height=0,
+            tile_count=0,
+            mime_type=mime,
+            metadata=metadata,
+            render_version=self.settings.render_version,
+        )
+
+        # Identity up front, so the consumer can build point ids / mark pending before
+        # any tile arrives.
+        yield {
+            "event": "begin",
+            "doc_id": doc_id,
+            "doc_type": effective_type,
+            "source_url": source_url,
+            "render_version": self.settings.render_version,
+        }
+
+        count = 0
+        page_height = 0
+        page_heights_acc: list[int] = []
+
+        if effective_type == DocType.PDF:
+            started = time.perf_counter()
+
+            async for group, heights in self._render_pdf_stream(blob):
+                page_heights_acc.extend(heights)
+
+                await self.store.append_tiles(doc_id, group)
+
+                for tile in group:
+                    count += 1
+                    yield {"event": "tile", "tile": tile}
+
+            metrics.RENDER_SECONDS.labels(doc_type=effective_type, path="ingest").observe(
+                time.perf_counter() - started
+            )
+            metrics.RENDERS.labels(doc_type=effective_type, path="ingest").inc()
+            metrics.TILES.labels(doc_type=effective_type, path="ingest").inc(count)
+
+        else:
+            # IMG/MHTML render as a single unit; only the transport is incremental.
+            rendered = await self.render_document(effective_type, blob, path="ingest", bulk=True)
+            page_height = rendered.page_height
+
+            await self.store.append_tiles(doc_id, rendered.tiles)
+
+            for tile in rendered.tiles:
+                count += 1
+                yield {"event": "tile", "tile": tile}
+
+        await self.store.finish_doc(
+            doc_id,
+            tile_count=count,
+            page_height=page_height,
+            page_heights=page_heights_acc or None,
+        )
+        await self._invalidate(doc_id)
+
+        metrics.DOCS.set(await self.store.count_docs())
+        metrics.INGESTS.labels(doc_type=effective_type, result="rendered").inc()
+
+        yield {
+            "event": "committed",
+            "doc_id": doc_id,
+            "doc_type": effective_type,
+            "source_url": source_url,
+            "render_version": self.settings.render_version,
+            "page_height": page_height,
+            "tile_count": count,
+            "result": "rendered",
+        }
+
+
+    async def _replay_from_store(self, row: DocRow, replay: bool) -> AsyncIterator[dict[str, Any]]:
+        """An idempotent hit: `begin`, the stored tiles regenerated (only when `replay`
+        is set), then `committed`."""
         yield {
             "event": "begin",
             "doc_id": row.doc_id,
@@ -644,9 +614,15 @@ class TilerService:
             "render_version": row.render_version,
         }
 
-        for tile in await self.store.get_tiles(row.doc_id):
-            jpeg, _, _ = await self.get_tile(row.doc_id, tile.tile_num, verify=True)
-            yield {"event": "tile", **self._tile_meta(tile.tile_num, tile.height, tile.image_hash, jpeg)}
+        if replay:
+            for tile in await self.store.get_tiles(row.doc_id):
+                jpeg, _, _ = await self.get_tile(row.doc_id, tile.tile_num, verify=True)
+                yield {
+                    "event": "tile",
+                    "tile": RenderedTile(
+                        tile_num=tile.tile_num, height=tile.height, jpeg=jpeg, image_hash=tile.image_hash
+                    ),
+                }
 
         yield {
             "event": "committed",
@@ -656,6 +632,7 @@ class TilerService:
             "render_version": row.render_version,
             "page_height": row.page_height,
             "tile_count": row.tile_count,
+            "result": "idempotent",
         }
 
 
@@ -760,31 +737,6 @@ class TilerService:
             meta["data"] = base64.b64encode(jpeg).decode("ascii")
 
         return meta
-
-
-    async def _manifest_from_store(self, row: DocRow, include_bytes: bool) -> dict[str, Any]:
-        """Rebuild an ingest manifest for an already-stored document."""
-        tiles = await self.store.get_tiles(row.doc_id)
-        out = []
-
-        for t in tiles:
-            jpeg = None
-
-            if include_bytes:
-                jpeg, _, _ = await self.get_tile(row.doc_id, t.tile_num, verify=True)
-
-            out.append(self._tile_meta(t.tile_num, t.height, t.image_hash, jpeg))
-
-        return {
-            "doc_id": row.doc_id,
-            "doc_type": row.doc_type,
-            "source_url": row.source_url,
-            "render_version": row.render_version,
-            "stored": True,
-            "page_height": row.page_height,
-            "tile_count": row.tile_count,
-            "tiles": out,
-        }
 
 
     # ------------------------------------------------------------------ #

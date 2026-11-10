@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from qdrant_client.models import Distance
 
 from virag.clients.reranker_client import RerankerClient
-from virag.clients.tiler_client import Tile, TileResult, TilerService
+from virag.clients.tiler_client import TilerService
 from virag.coordination import Coordinator
 from virag.errors import ApiError, install_error_handlers
 from virag.main import include_routers
@@ -303,6 +303,28 @@ def lease_key(coordinator: Coordinator) -> str:
     return f"procs:{coordinator.token}"
 
 
+@dataclass(slots=True)
+class Tile:
+    tile_num: int
+    width: int
+    height: int
+    image_hash: str
+    data: str
+
+
+@dataclass(slots=True)
+class TileResult:
+    """What FakeTiler.tile_stream emits: one doc's identity and its tiles."""
+
+    doc_id: str
+    doc_type: str
+    source_url: str | None
+    render_version: str
+    page_height: int
+    tile_count: int
+    tiles: list[Tile]
+
+
 class FakeTiler:
 
     RENDER_VERSION_MISMATCH = TilerService.RENDER_VERSION_MISMATCH
@@ -327,10 +349,6 @@ class FakeTiler:
         self.max_concurrency = 0
         self.fail_tiles: set[tuple] = set()
 
-    async def tile(self, doc_type, *, document=None, url=None, metadata=None,
-                   store=True, include_bytes=True, force=False):
-        return self._result
-
     async def tile_stream(self, doc_type, *, document=None, url=None, metadata=None, force=False):
         res = self._result
         yield {"event": "begin", "doc_id": res.doc_id, "doc_type": res.doc_type,
@@ -340,7 +358,7 @@ class FakeTiler:
                    "height": t.height, "image_hash": t.image_hash, "data": t.data}
         yield {"event": "committed", "doc_id": res.doc_id, "doc_type": res.doc_type,
                "source_url": res.source_url, "render_version": res.render_version,
-               "page_height": 0, "tile_count": res.tile_count}
+               "page_height": 0, "tile_count": res.tile_count, "result": "rendered"}
 
     async def get_tile(self, doc_id, tile_num, *, render_version=None, bulk=False) -> bytes:
         self.get_tile_calls.append((doc_id, tile_num))
@@ -500,7 +518,6 @@ def sample_tile_result(doc_id="doc-a", n_tiles=2, doc_type="PDF") -> TileResult:
         doc_type=doc_type,
         source_url=None,
         render_version="rv-test",
-        stored=True,
         page_height=0,
         tile_count=n_tiles,
         tiles=[

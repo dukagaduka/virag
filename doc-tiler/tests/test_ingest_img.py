@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import hashlib
 
-from conftest import base_env, make_png, png_form, running_app
+from conftest import base_env, ingest_tiles, make_png, png_form, running_app
 
 W, TH, MIN = 875, 1024, 28
 
 
 async def test_img_strip_geometry_and_round_trip(client):
     src = make_png(width=1000, height=2600)  # → 875 wide, 2275 tall
-    manifest = (await client.post("/tile", **png_form(src))).json()
+    manifest = await ingest_tiles(client, png_form(src))
 
     expected_h = round(2600 * W / 1000)
     assert manifest["doc_type"] == "IMG"
@@ -32,14 +32,14 @@ async def test_img_strip_geometry_and_round_trip(client):
 
 async def test_img_final_sliver_is_dropped(client):
     # 875 x (2048 + 10) → the 10px remainder is below MIN_TILE_HEIGHT.
-    manifest = (await client.post("/tile", **png_form(make_png(width=875, height=2058)))).json()
+    manifest = await ingest_tiles(client, png_form(make_png(width=875, height=2058)))
     assert manifest["page_height"] == 2058
     assert manifest["tile_count"] == 2
     assert [t["height"] for t in manifest["tiles"]] == [TH, TH]
 
 
 async def test_img_smaller_than_tile_width_is_upscaled(client):
-    manifest = (await client.post("/tile", **png_form(make_png(width=400, height=300)))).json()
+    manifest = await ingest_tiles(client, png_form(make_png(width=400, height=300)))
     assert manifest["tile_count"] == 1
     assert manifest["tiles"][0]["width"] == 875
     assert manifest["tiles"][0]["height"] == round(300 * 875 / 400)
@@ -48,7 +48,7 @@ async def test_img_smaller_than_tile_width_is_upscaled(client):
 async def test_overlap_changes_tile_count(tmp_path):
     src = make_png(width=875, height=4096)
     async with running_app(base_env(tmp_path, TILER_TILE_OVERLAP="100")) as (client, _):
-        manifest = (await client.post("/tile", **png_form(src))).json()
+        manifest = await ingest_tiles(client, png_form(src))
         # STEP = 924: offsets 0, 924, 1848, 2772, 3696(h=400)
         assert manifest["tile_count"] == 5
         assert [t["height"] for t in manifest["tiles"]] == [1024, 1024, 1024, 1024, 400]
