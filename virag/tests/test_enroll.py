@@ -49,7 +49,8 @@ def test_enroll_success(make_client):
     up = store.upserts[0]
     assert up["ids"] == [point_id("doc-a", 0), point_id("doc-a", 1)]     # deterministic ids
     assert len(retriever.image_calls[0]) == 2                                  # both tiles embedded
-    assert up["payloads"][0]["metadata"]["name"] == "Report A"
+    # A point carries what fetching and checking its tile takes, and no metadata.
+    assert set(up["payloads"][0]) == {"doc_id", "tile_num", "image_hash", "render_version"}
     assert up["payloads"][0]["image_hash"]                              # carried for integrity
 
 
@@ -76,7 +77,7 @@ def test_enroll_allow_missing_name_uses_doc_id(make_client):
     )
 
     assert r.status_code == 200
-    assert store.upserts[0]["payloads"][0]["metadata"]["name"] == "doc-a"
+    assert len(store.upserts) == 1
 
 
 def test_enroll_zero_tiles_enrolls_nothing(make_client):
@@ -121,6 +122,8 @@ def test_enroll_marks_pending_then_promotes(make_client):
     # first patch marks pending (enrolled_at 0), last patch promotes (enrolled_at > 0)
     assert tiler.metadata_patches[0][1]["virag_enrolled_at"] == 0
     assert tiler.metadata_patches[-1][1]["virag_enrolled_at"] > 0
+    # the metadata lives in the tiler: the pending patch carries it, so a re-enroll updates it
+    assert tiler.metadata_patches[0][1]["name"] == "Report A"
 
 
 def test_enroll_streams_in_batches(make_client):

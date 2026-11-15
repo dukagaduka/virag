@@ -94,8 +94,8 @@ client.chat.completions.create(
 ### Sources
 
 When `include_sources` is true, each injected tile is reported, in prompt order, as
-`{name, doc_id, tile_num, score}` (`name` from the tile's `metadata.name`, `score` the
-Qdrant one), plus `rerank_score` for a tile the reranker scored (absent without a
+`{name, doc_id, tile_num, score}` (`name` is the document's `metadata.name` as the tiler
+holds it at that moment — its `doc_id` when it has none; `score` the Qdrant one), plus `rerank_score` for a tile the reranker scored (absent without a
 reranker, or when the request fell back to the retriever's order).
 
 - **Non-streaming:** added as a top-level `"sources"` key on the (200, JSON) response.
@@ -140,8 +140,12 @@ a render timeout. The request/response contract above is unchanged. On any failu
 mid-enroll the document's partial points are rolled back out of Qdrant. A document the
 tiler already held stays there, marked pending, so [reconcile](ARCHITECTURE.md) heals it
 later; a new one the tiler drops itself, since its ingest never committed. Enrolling
-bytes the tiler already holds does not render them again and leaves the tiler's metadata
-as it is.
+bytes the tiler already holds does not render them again; the `metadata` sent with the
+enroll is merged into the document's metadata in the tiler.
+
+**Where metadata lives.** In the tiler only. A Qdrant point carries what fetching and
+checking its tile takes (`doc_id`, `tile_num`, `image_hash`, `render_version`) and no
+copy of the metadata, so a metadata change in the tiler needs no re-enroll.
 
 Response:
 

@@ -253,12 +253,6 @@ async def _reembed_pass(
     remaining = {doc_id: doc["tile_count"] for doc_id, doc in by_id.items()}
     failed: set[str] = set()
 
-    # Strip virag's own lifecycle markers — the payload carries user metadata only.
-    payload_meta = {
-        doc_id: {k: v for k, v in (doc.get("metadata") or {}).items() if not k.startswith("virag_")}
-        for doc_id, doc in by_id.items()
-    }
-
     async def finish(doc_ids: list[str]) -> None:
         if not mark_enrolled:
             return
@@ -286,10 +280,7 @@ async def _reembed_pass(
                     "doc_id": doc_id,
                     "tile_num": n,
                     "image_hash": hashlib.sha256(j).hexdigest(),
-                    "doc_type": by_id[doc_id].get("doc_type"),
-                    "source_url": by_id[doc_id].get("source_url"),
                     "render_version": by_id[doc_id].get("render_version") or "",
-                    "metadata": payload_meta[doc_id],
                 }
                 for (doc_id, n), j in zip(batch, jpegs)
             ]

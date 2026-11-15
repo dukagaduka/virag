@@ -74,14 +74,12 @@ def test_inject_tiles_preserves_multimodal_original():
 
 
 def test_source_shape():
-    hit = FakeHit(score=0.77, payload={
-        "doc_id": "d1", "tile_num": 3, "metadata": {"name": "Report"},
-    })
-    assert _source(hit) == {"name": "Report", "doc_id": "d1", "tile_num": 3, "score": 0.77}
+    hit = FakeHit(score=0.77, payload={"doc_id": "d1", "tile_num": 3})
+    assert _source(hit, "Report") == {"name": "Report", "doc_id": "d1", "tile_num": 3, "score": 0.77}
 
 
-def test_source_missing_metadata():
+def test_source_carries_the_rerank_score_when_there_is_one():
     hit = FakeHit(score=0.5, payload={"doc_id": "d2", "tile_num": 0})
-    src = _source(hit)
-    assert src["name"] is None
+    src = _source(hit, "d2", 0.8)
+    assert src["rerank_score"] == 0.8
     assert src["doc_id"] == "d2"

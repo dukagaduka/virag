@@ -64,7 +64,7 @@ async def enroll(
     # collection the doc is written into, pinned at `begin`.
     doc_id: str | None = None
     physical: str | None = None
-    doc_type_out = source_url = render_version = payload_meta = None
+    doc_type_out = render_version = None
     batch: list[dict] = []
     enrolled = 0
 
@@ -81,10 +81,7 @@ async def enroll(
                 "doc_id": doc_id,
                 "tile_num": t["tile_num"],
                 "image_hash": t["image_hash"],
-                "doc_type": doc_type_out,
-                "source_url": source_url,
                 "render_version": render_version,
-                "metadata": payload_meta,
             }
             for t in batch
         ]
@@ -104,11 +101,9 @@ async def enroll(
                 if kind == "begin":
                     doc_id = event["doc_id"]
                     doc_type_out = event["doc_type"]
-                    source_url = event.get("source_url")
                     render_version = event["render_version"]
-                    payload_meta = meta_obj if has_name else {**(meta_obj or {}), "name": doc_id}
                     if not has_name:
-                        log.warning("no metadata.name; naming doc_id=%s by its content hash", doc_id)
+                        log.warning("no metadata.name; doc_id=%s goes by its content hash", doc_id)
 
                     # Registered as a writer until commit/rollback and pinned to one
                     # collection, so a concurrent revision journals this doc and syncs it
@@ -117,8 +112,11 @@ async def enroll(
 
                     # Mark pending (virag semantics on the tiler's indexed metadata) and clear
                     # any prior partial/stale points. A crash from here leaves a clean, detectable
-                    # state that reconcile finishes or rolls back.
-                    await tiler.patch_metadata(doc_id, {"virag_started_at": int(time.time()), "virag_enrolled_at": 0})
+                    # state that reconcile finishes or rolls back. The document's metadata goes
+                    # along: the tiler keeps it for everyone (points carry none) and leaves the
+                    # metadata of bytes it already holds as it is, so a re-enroll updates it here.
+                    pending = {"virag_started_at": int(time.time()), "virag_enrolled_at": 0}
+                    await tiler.patch_metadata(doc_id, {**(meta_obj or {}), **pending})
                     await store.delete_by_doc(doc_id, collection=physical)
 
                 elif kind == "tile":

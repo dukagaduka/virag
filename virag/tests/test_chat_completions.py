@@ -47,7 +47,9 @@ def test_rag_injects_tiles(make_client):
 
 
 def test_rag_sources_in_json(make_client):
-    client = make_client(vlm=FakeVLM(), store=_rag_store(), retriever=FakeRetriever(), tiler=FakeTiler())
+    tiler = FakeTiler()
+    tiler.doc_metadata = {"doc-a": {"name": "Doc A", "virag_enrolled_at": 5}}
+    client = make_client(vlm=FakeVLM(), store=_rag_store(), retriever=FakeRetriever(), tiler=tiler)
 
     r = client.post("/v1/chat/completions", json={
         "model": "m", "messages": [{"role": "user", "content": "q"}],
@@ -58,6 +60,33 @@ def test_rag_sources_in_json(make_client):
     sources = r.json()["sources"]
     assert [s["tile_num"] for s in sources] == [0, 1]
     assert sources[0] == {"name": "Doc A", "doc_id": "doc-a", "tile_num": 0, "score": 0.9}
+    assert tiler.metadata_calls == ["doc-a"]                 # the name comes from the tiler, once per doc
+
+
+def test_rag_source_without_a_name_goes_by_its_doc_id(make_client):
+    tiler = FakeTiler()
+    tiler.doc_metadata = {"doc-a": {"project": "x"}}         # enrolled with allow_missing_name
+    store = FakeStore(hits=[hit_for("doc-a", 0), hit_for("doc-b", 0)])   # doc-b: the tiler will not say
+    client = make_client(vlm=FakeVLM(), store=store, retriever=FakeRetriever(), tiler=tiler)
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "q"}],
+        "rag": {"include_sources": True},
+    })
+
+    assert r.status_code == 200
+    assert [s["name"] for s in r.json()["sources"]] == ["doc-a", "doc-b"]
+
+
+def test_rag_without_sources_asks_the_tiler_for_no_names(make_client):
+    tiler = FakeTiler()
+    client = make_client(vlm=FakeVLM(), store=_rag_store(), retriever=FakeRetriever(), tiler=tiler)
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "q"}], "rag": True,
+    })
+
+    assert r.status_code == 200 and tiler.metadata_calls == []
 
 
 def test_rag_retriever_defaults_reach_qdrant(make_client):
@@ -89,7 +118,7 @@ def test_rag_overrides_reach_qdrant(make_client):
 def test_rag_integrity_mismatch_skips_tile(make_client):
     # a hit whose stored image_hash does NOT match what the tiler regenerates
     bad_hit = FakeHit(score=0.9, payload={
-        "doc_id": "doc-a", "tile_num": 0, "image_hash": "deadbeef", "metadata": {"name": "A"},
+        "doc_id": "doc-a", "tile_num": 0, "image_hash": "deadbeef",
     })
     vlm = FakeVLM()
     client = make_client(vlm=vlm, store=FakeStore(hits=[bad_hit]),
@@ -108,7 +137,7 @@ def test_rag_integrity_mismatch_skips_tile(make_client):
 
 def test_rag_tile_without_hash_is_skipped(make_client):
     # a point that carries no image_hash cannot be checked, so it is not trusted
-    hashless = FakeHit(score=0.9, payload={"doc_id": "doc-a", "tile_num": 0, "metadata": {"name": "A"}})
+    hashless = FakeHit(score=0.9, payload={"doc_id": "doc-a", "tile_num": 0})
     vlm = FakeVLM()
     client = make_client(vlm=vlm, store=FakeStore(hits=[hashless]),
                          retriever=FakeRetriever(), tiler=FakeTiler())

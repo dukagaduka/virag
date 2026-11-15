@@ -69,11 +69,13 @@ object per line:
 The doc is known to the store from `begin` on — its row is there, **incomplete**, so a
 client can refer to it (list it, patch its metadata) while the tiles stream — but
 nothing of it is served before `committed`: its tiles and its blob reach the store
-together, when the last tile has rendered. Pre-flight errors
-(unknown `doc_type` → `400`, oversize → `413`, media mismatch → `415`) are returned as
-normal HTTP errors **before** the stream begins. Once the `200` stream has started, any
-failure is reported as an in-stream `error` event (the HTTP status is already `200`) — the
-**absence of a `committed` event** is the client's signal that the ingest did not complete.
+together, when the last tile has rendered. **Whatever fails before `begin` is a normal
+HTTP error**: an unknown `doc_type` (`400`), an oversize upload (`413`), a media
+mismatch (`415`), invalid metadata (`422`), a URL that is blocked or cannot be captured
+(`403`, `502`, `504`), the same bytes being ingested by another request (`409`). **From
+`begin` on** the HTTP status is already `200`, so a failure is reported as an in-stream
+`error` event — the **absence of a `committed` event** is the client's signal that the
+ingest did not complete.
 An ingest that does not commit — an error, a client that went away, a killed process —
 leaves nothing behind: its row and its upload are removed (at the next start, for a
 killed process). Idempotent like `/tile`: bytes already stored and served replay the

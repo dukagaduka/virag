@@ -235,6 +235,13 @@ class TilerService(HttpService):
         return self._json(response, action="the schema fetch")
 
 
+    async def get_metadata(self, doc_id: str) -> dict:
+        """A stored document's metadata object."""
+        response = await self._request("GET", self.metadata_route(doc_id), action="the metadata fetch")
+
+        return self._json(response, action="the metadata fetch")
+
+
     async def patch_metadata(self, doc_id: str, patch: dict) -> None:
         """Shallow-merge a metadata patch onto a stored document (a null value deletes a key).
 

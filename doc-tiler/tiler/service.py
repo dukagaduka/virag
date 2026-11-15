@@ -137,15 +137,20 @@ class TilerService:
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream an ingest as NDJSON events: `begin`, one `tile` per tile, then `committed`.
 
-        The response is already 200 when the first event leaves, so a failure surfaces as
-        an `error` event; the absence of `committed` is the client's signal to roll back.
+        A failure before `begin` raises: the response has not started, so it can still
+        be an HTTP error. From `begin` on the response is already 200 and a failure
+        surfaces as an `error` event; the absence of `committed` is the client's signal
+        to roll back.
         """
         events = self._ingest(doc_type=doc_type, upload=upload, url=url, metadata=metadata, replay=True)
+        begun = False
 
         try:
             # Closed with this stream: a client that goes away ends the ingest at once.
             async with aclosing(events):
                 async for event in events:
+                    begun = True  # the first event is `begin`
+
                     if event["event"] == "tile":
                         tile: RenderedTile = event["tile"]
                         event = {
@@ -156,9 +161,15 @@ class TilerService:
                     yield event
 
         except ApiError as exc:
+            if not begun:
+                raise
+
             yield {"event": "error", "code": exc.code, "message": exc.message}
 
         except Exception as exc:  # noqa: BLE001 - the stream is already 200; report in-band
+            if not begun:
+                raise
+
             log.exception("streaming ingest crashed")
             yield {"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)}
 

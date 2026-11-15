@@ -93,8 +93,9 @@ injected context (logged as `rag injected: 0 tiles`).
 ## 4. Sources
 
 When `rag.include_sources` is true, the response carries a `sources` array — one entry
-per injected tile, in prompt order: `{name, doc_id, tile_num, score}` (`name` from the
-tile's `metadata.name`, `score` the Qdrant one), plus `rerank_score` for a tile the
+per injected tile, in prompt order: `{name, doc_id, tile_num, score}` (`name` is read
+from the tiler — the document's `metadata.name`, one request per distinct document, its
+`doc_id` when it has none; `score` the Qdrant one), plus `rerank_score` for a tile the
 reranker scored.
 
 - **Non-streaming:** the upstream JSON is parsed and `sources` is added as a top-level

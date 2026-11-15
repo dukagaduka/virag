@@ -69,7 +69,7 @@ def test_reconcile_self_heals_complete_pending():
     assert len(store.upserts) == 1
     up = store.upserts[0]
     assert up["ids"] == [point_id("doc-a", 0), point_id("doc-a", 1)]     # matches enroll's ids
-    assert up["payloads"][0]["metadata"] == {"name": "A"}               # virag_* markers stripped
+    assert set(up["payloads"][0]) == {"doc_id", "tile_num", "image_hash", "render_version"}   # as enroll writes them
     assert tiler.metadata_patches[-1][0] == "doc-a"                     # pending promoted
     assert tiler.metadata_patches[-1][1]["virag_enrolled_at"] > 0
     assert up["collection"] == "c__v1"                                  # pinned to the serving one

@@ -95,7 +95,9 @@ async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | N
         log.info("rag injected: 0 tiles")
 
     if config["include_sources"]:
-        return [_source(hit, rerank_score) for hit, _, rerank_score in tiles]
+        names = await _doc_names(tiler, {hit.payload.get("doc_id") for hit, _, _ in tiles})
+
+        return [_source(hit, names[hit.payload.get("doc_id")], rerank_score) for hit, _, rerank_score in tiles]
 
     return None
 
@@ -236,12 +238,31 @@ def _last_user_index(messages: list) -> int:
     return len(messages) - 1
 
 
-def _source(hit, rerank_score: float | None = None) -> dict:
+async def _doc_names(tiler, doc_ids: set[str]) -> dict[str, str]:
+    """Each document's `metadata.name` as the tiler holds it now (points carry no
+    metadata); a document without one, or one the tiler would not answer for, goes by
+    its doc_id."""
+    async def name(doc_id: str) -> str:
+        try:
+            metadata = await tiler.get_metadata(doc_id)
+
+        except ApiError as e:
+            log.warning("no name for doc_id=%s: %s", doc_id, e.message)
+
+            return doc_id
+
+        return metadata.get("name") or doc_id
+
+    ordered = sorted(doc_ids)
+
+    return dict(zip(ordered, await gather(name(doc_id) for doc_id in ordered)))
+
+
+def _source(hit, name: str, rerank_score: float | None = None) -> dict:
     payload = hit.payload or {}
-    metadata = payload.get("metadata") or {}
 
     source = {
-        "name": metadata.get("name"),
+        "name": name,
         "doc_id": payload.get("doc_id"),
         "tile_num": payload.get("tile_num"),
         "score": hit.score,

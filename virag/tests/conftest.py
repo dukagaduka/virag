@@ -336,6 +336,8 @@ class FakeTiler:
         self.get_tile_calls: list[tuple] = []
         self.existing: set[str] = set()
         self.metadata_patches: list[tuple] = []
+        self.doc_metadata: dict[str, dict] = {}
+        self.metadata_calls: list[str] = []
         self.schema: dict = {
             "version": 1,
             "fields": [
@@ -373,6 +375,12 @@ class FakeTiler:
 
     async def doc_exists(self, doc_id: str) -> bool:
         return doc_id in self.existing
+
+    async def get_metadata(self, doc_id: str) -> dict:
+        self.metadata_calls.append(doc_id)
+        if doc_id not in self.doc_metadata:
+            raise ApiError(status_code=503, message="tiler has no such doc", details={"upstream_status": 404})
+        return self.doc_metadata[doc_id]
 
     async def patch_metadata(self, doc_id: str, patch: dict) -> None:
         self.metadata_patches.append((doc_id, patch))
@@ -527,7 +535,7 @@ def sample_tile_result(doc_id="doc-a", n_tiles=2, doc_type="PDF") -> TileResult:
     )
 
 
-def hit_for(doc_id, tile_num, score=0.9, name="Doc A") -> FakeHit:
+def hit_for(doc_id, tile_num, score=0.9) -> FakeHit:
     """A Qdrant hit whose image_hash matches what FakeTiler.get_tile will produce."""
     return FakeHit(
         score=score,
@@ -535,6 +543,5 @@ def hit_for(doc_id, tile_num, score=0.9, name="Doc A") -> FakeHit:
             "doc_id": doc_id,
             "tile_num": tile_num,
             "image_hash": tile_hash(doc_id, tile_num),
-            "metadata": {"name": name},
         },
     )

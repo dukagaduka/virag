@@ -129,8 +129,10 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
     assert [(d["doc_id"], d["complete"]) for d in listed] == [(doc_id, False)]
 
     # Its ingest owns it: the same bytes again, or a delete, are refused meanwhile.
-    late = await client.post("/tile", **pdf_form(sample_pdf))
-    assert (late.status_code, late.json()["error"]["code"]) == (409, "INGEST_IN_PROGRESS")
+    for route in ("/tile", "/tile/stream"):
+        late = await client.post(route, **pdf_form(sample_pdf))
+        assert (late.status_code, late.json()["error"]["code"]) == (409, "INGEST_IN_PROGRESS")
+
     gone = await client.delete(f"/doc/{doc_id}")
     assert (gone.status_code, gone.json()["error"]["code"]) == (409, "INGEST_IN_PROGRESS")
     assert len(_spooled(svc)) == 1                                     # the latecomer's upload is gone
@@ -141,6 +143,21 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
     assert (await svc.store.get_doc(doc_id)).complete is True
     assert svc.blobs.exists(doc_id) and _spooled(svc) == []            # moved into the store
     assert (await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})).status_code == 200
+
+
+async def test_what_fails_before_begin_is_an_http_error(client, sample_pdf):
+    """The stream has not started, so the failure keeps its status; nothing is kept."""
+    svc = client.service
+
+    files = {"document": ("x.pdf", b"this is not a pdf", "application/pdf")}
+    wrong = await client.post("/tile/stream", files=files, data={"doc_type": "PDF"})
+    assert (wrong.status_code, wrong.json()["error"]["code"]) == (415, "UNSUPPORTED_MEDIA")
+
+    invalid = await client.post("/tile/stream", **pdf_form(sample_pdf, metadata='{"year": "soon"}'))
+    assert (invalid.status_code, invalid.json()["error"]["code"]) == (422, "METADATA_SCHEMA_VIOLATION")
+
+    assert await svc.store.count_docs() == 0
+    assert _spooled(svc) == []
 
 
 async def test_an_abandoned_ingest_leaves_nothing(client):

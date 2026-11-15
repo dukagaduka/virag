@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import aclosing
 from typing import Annotated
 
 import orjson
@@ -90,8 +91,9 @@ async def ingest_document_stream(
 ) -> StreamingResponse:
     """The `/tile` ingest, streamed tile by tile (NDJSON) and terminated by `committed`.
 
-    Errors surface as an in-stream `error` event; the absence of `committed` means the
-    ingest did not complete.
+    What fails before `begin` is an HTTP error; from `begin` on errors surface as an
+    in-stream `error` event, and the absence of `committed` means the ingest did not
+    complete.
     """
     svc = service(request)
     doc_type = _validate_ingest_inputs(doc_type, document)
@@ -101,8 +103,16 @@ async def ingest_document_stream(
     meta_obj = parse_metadata_field(metadata)
     upload = await _spool(svc, doc_type, document)
 
+    events = svc.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj)
+
+    # Awaited before the response starts, so a failure up to `begin` keeps its HTTP status.
+    begin = await anext(events)
+
     async def ndjson():
-        async for event in svc.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj):
-            yield orjson.dumps(event) + b"\n"
+        async with aclosing(events):
+            yield orjson.dumps(begin) + b"\n"
+
+            async for event in events:
+                yield orjson.dumps(event) + b"\n"
 
     return StreamingResponse(ndjson(), media_type="application/x-ndjson")

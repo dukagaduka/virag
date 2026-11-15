@@ -67,6 +67,9 @@ paths:
               schema: { $ref: '#/components/schemas/IngestResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: The same bytes are being ingested by another request (INGEST_IN_PROGRESS).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '413': { $ref: '#/components/responses/TooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMedia' }
         '422': { $ref: '#/components/responses/Unprocessable' }
@@ -86,11 +89,12 @@ paths:
         finishes — order is not guaranteed monotonic), then a terminal `committed` event
         on success. The doc's row exists, incomplete, from `begin` on; its tiles and
         blob reach the store together at `committed`, and an ingest that does not commit
-        leaves nothing behind. Pre-flight errors (unknown doc_type 400, oversize 413, media
-        mismatch 415) are normal HTTP errors returned before streaming begins; once the
-        200 stream has started, any failure is reported as an in-stream `error` event and
-        the absence of a `committed` event is the client's signal that ingest did not
-        complete. Bytes already stored and served replay the stored tiles as the same
+        leaves nothing behind. Whatever fails before `begin` (unknown doc_type 400,
+        oversize 413, media mismatch 415, invalid metadata 422, a blocked or failed URL
+        capture 403/502/504, the same bytes being ingested by another request 409) is a
+        normal HTTP error; from `begin` on the status is already 200, a failure is
+        reported as an in-stream `error` event and the absence of a `committed` event
+        is the client's signal that ingest did not complete. Bytes already stored and served replay the stored tiles as the same
         event stream without re-rendering.
       requestBody:
         required: true
@@ -130,6 +134,9 @@ paths:
               schema: { $ref: '#/components/schemas/StreamEvent' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: The same bytes are being ingested by another request (INGEST_IN_PROGRESS).
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '413': { $ref: '#/components/responses/TooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMedia' }
         '422': { $ref: '#/components/responses/Unprocessable' }
