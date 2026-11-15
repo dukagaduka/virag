@@ -22,6 +22,9 @@ ERRORS = Counter("tiler_errors_total", "Errors returned to clients", ["code"])
 MISMATCHES = Counter("tiler_hash_mismatch_total", "Regenerated tile hash mismatches", ["doc_type"])
 SSRF_BLOCKS = Counter("tiler_ssrf_blocked_total", "Requests blocked by the SSRF policy")
 BROWSER_RECYCLES = Counter("tiler_browser_recycles_total", "Chromium process recycles")
+WORKER_RESTARTS = Counter(
+    "tiler_render_worker_restarts_total", "Render workers killed or lost and replaced", ["reason"]
+)
 DOCS = Gauge("tiler_docs", "Documents currently stored")
 INFLIGHT = Gauge("tiler_inflight_renders", "Renders currently in flight", ["layer"])
 SERVING = Gauge("tiler_serving", "1 while serving; 0 while a revision holds the service not-ready")

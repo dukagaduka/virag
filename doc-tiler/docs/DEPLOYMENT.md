@@ -146,13 +146,29 @@ mkdir -p ./data && sudo chown -R 10001:10001 ./data
 - **Liveness:** `GET /healthz` (touches nothing, stays fast under load). The image
   `HEALTHCHECK` and the Compose healthcheck use it, so an hours-long revision never marks
   the container unhealthy (and an orchestrator never kills it mid-way).
-- **Readiness:** `GET /readyz` — checks DB, blob dir, Chromium pool and the revision
-  gate; `503` when not ready. Route traffic on it (load balancer / Kubernetes readiness).
+- **Readiness:** `GET /readyz` — checks DB, blob dir, the render pool, Chromium and the
+  revision gate; `503` when not ready. Route traffic on it (load balancer / Kubernetes readiness).
 - Run **one** uvicorn worker per container (`--workers 1`). Concurrency comes from the
   event loop plus the browser/render pools, not from workers — multiple workers would each
   spawn their own Chromium pool and SQLite writer and fight over the volume. **Scale
   horizontally with more containers**, sharing the blob store and DB behind their
   interfaces.
+
+### Memory
+
+Rendering memory is bounded per render worker by `TILER_RENDER_WORKER_MEMORY` (default
+2 GiB of address space; an idle worker takes ~130 MB). Give the container at least
+
+```
+TILER_N_RENDER_WORKERS × TILER_RENDER_WORKER_MEMORY  +  Chromium  +  ~0.5 GiB
+```
+
+where Chromium needs roughly 0.3–0.5 GiB per `TILER_N_BROWSERS`. With that, a heavy
+document fails on its own (`422 RENDER_TOO_LARGE`) instead of drawing the kernel's OOM
+killer onto the container. The defaults (a worker per CPU) are sized for a dedicated
+host; on a shared one lower `TILER_N_RENDER_WORKERS` rather than the per-worker memory.
+A worker that still dies (a decoder crash) or hangs is replaced on its own, never
+taking the service or the other renders down: see `tiler_render_worker_restarts_total`.
 
 See [CONFIG.md](CONFIG.md) for every `TILER_*` variable and [METRICS.md](METRICS.md) for
 the Prometheus endpoint.

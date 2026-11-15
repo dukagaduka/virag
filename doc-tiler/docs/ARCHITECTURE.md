@@ -68,14 +68,64 @@ Chromium RAM/CPU).
 - Recycle a Chromium process after `TILER_RECYCLE_AFTER` renders; detect crashed
   contexts and replace the process.
 
-### Layer 3 — Render workers (PDF raster, PIL resize/slice, hashing), CPU-bound
+### Layer 3 — Render workers (PDF raster, PIL resize/slice, JPEG), CPU-bound
 
 Done inline it blocks the loop; in threads the GIL kills parallelism. So:
-`ProcessPoolExecutor(max_workers=TILER_N_RENDER_WORKERS)` — separate processes, true
-multi-core. Dispatch via `loop.run_in_executor(process_pool, fn, ...)` and `await`.
+a process pool of `TILER_N_RENDER_WORKERS` — separate processes, true multi-core. It is
+`pebble.ProcessPool` rather than the stdlib `ProcessPoolExecutor`: pebble can stop one
+running task (it kills and replaces that worker), and a dead worker fails only its own
+task, where the stdlib pool breaks as a whole. Dispatch via `pool.schedule(fn, args,
+timeout=...)`, awaited through `asyncio.wrap_future`.
 
 The render pool uses the **`spawn`** start method: the parent runs an event loop and
 Playwright threads, and forking those into workers deadlocks.
+
+### Readers and the RenderPool
+
+Every document type is read the same way: as **pages of width `W`**, each one long
+image. A reader (`render/readers.py`) answers the page heights and hands out rows
+`[y0, y1)` of a page; how is its own business:
+
+- `PdfReader` rasterizes just the requested rows of a page from its display list (the
+  page is parsed once), at `TILER_PDF_DPI` but never wider than 4 × `W`, then
+  downscales them to `W`;
+- `ImageReader` decodes the image once (a JPEG straight at a 1/2ᵏ scale when that still
+  covers `W`) and crops;
+- `MhtmlReader` loads the archive in a Chromium tab: one full-page capture up to
+  `TILER_SAFE_FULLPAGE_PX` (cached per document), a clip capture per tile beyond it.
+
+The service only plans tiles over page heights (`plan_tiles`) and stores what comes
+back. `RenderPool` (`render/pool.py`) decides where the work runs: PDF and image
+readers inside the render workers (one task builds a batch of tiles and encodes
+them), MHTML captures on the loop with the encoding in the workers.
+
+**Bands.** A tile is assembled from bands of at most `band_rows` rows, sized so one
+band's source raster stays within 32 MiB: while more than a band is missing the next
+read takes a full band, the last one takes exactly the rest — no read crosses the
+tile's edges. A tile therefore depends only on its own rows, so `get_tile` rasterizes
+just that tile, and memory follows the band, not the page. An A4 page at 200 dpi is a
+single band. The band size and the supersampling cap are pixel-tier constants (in
+`render_version`).
+
+**Limits and recovery.**
+
+- Each worker caps its address space at `TILER_RENDER_WORKER_MEMORY`: a document that
+  needs more fails alone with `422 RENDER_TOO_LARGE`, the worker survives, and the
+  kernel's OOM killer never sees it.
+- A task may execute for `TILER_RENDER_TIMEOUT_SEC` (time spent queued does not count);
+  past it its worker is killed and replaced, and the document fails with
+  `504 RENDER_TIMEOUT`. The other workers' tasks are untouched.
+- A worker that dies (a segfault in a decoder) fails only its own task, and the pool
+  replaces it. Since a worker can also be killed from outside (the kernel's OOM killer),
+  the task runs once more; a document that kills the second worker too fails with
+  `422 RENDER_CRASHED`. `tiler_render_worker_restarts_total` counts the replacements.
+- pebble gives the whole pool up when a worker dies while **no** task runs (it takes
+  that for a failing initializer). The RenderPool then replaces the pool and proves the
+  new one starts with a no-op task; the next task or `/readyz` triggers it.
+- A cancelled task (the ingest it belongs to failed or its client went away) stops
+  too: its worker is killed and replaced.
+- A revision quarantines a document that fails these ways; only workers that cannot
+  start at all (`WORKER_CRASH`) or an unavailable Chromium abort it.
 
 ### Why not simpler
 
@@ -84,12 +134,13 @@ is expensive to start; keep it warm and shared behind a semaphore.
 
 ### Flow examples
 
-- **PDF ingest:** handler (loop) reads bytes → process pool rasters + slices → await →
-  DB → stream response. Pages fan out across the pool in chunks of ≤16, so a 200-page
-  PDF uses every core without pickling one giant result.
+- **PDF ingest:** handler (loop) stores the blob → one worker task measures the page
+  heights → the service plans the tiles → batches of ≤16 tiles fan out across the pool
+  (the blob's path is pickled, never its bytes) → each batch's tiles go to the DB and the
+  stream in order.
 - **URL ingest:** handler takes the browser semaphore → Playwright navigates +
-  `captureSnapshot(mhtml)` → releases → process pool slices the snapshot → await → DB
-  → response.
+  `captureSnapshot(mhtml)` → releases → the snapshot is stored and read like any MHTML
+  archive → DB → response.
 
 ### `get_tile` cache
 
@@ -98,8 +149,8 @@ coalescing** — a per-key future map so concurrent requests for the same tile r
 once.
 
 - Key `(doc_id, tile_num)` → final JPEG bytes (all types).
-- Web/MHTML additionally caches `doc_id` → full-page image so sequential strip
-  requests reuse one render.
+- Web/MHTML additionally caches the full-page capture per document (in the render pool)
+  so sequential strip requests reuse one render.
 
 ---
 
@@ -198,18 +249,18 @@ while True:
 tile_count = len(tiles)
 ```
 
-**Reverse (get_tile):** `offset = tile_num * STEP`, `height = min(TH, H - offset)`.
-Consistent because a sliver is only dropped as the final element. Forward (ingest) and
-reverse (get_tile) must produce byte-identical bounds or `image_hash` will not match —
-this is pinned by a property test over random `H`. `page_height = H` stored.
+**Reverse (get_tile):** the same plan over the stored `H`, indexed by `tile_num` —
+forward and reverse are one computation (`plan_tiles`), so their bounds cannot drift.
+Every offset is `tile_num * STEP` because a sliver is only ever dropped as the final
+element (a property test over random `H`). `page_height = H` stored.
 
 A page shorter than `MIN` yields **zero tiles** (the only strip is a sliver, and
 slivers are dropped); such a doc is stored with `tile_count = 0`.
 
 ### 5.2 PDF — one tile per page (default), or sliced (opt-in)
 
-Raster page `p` at `TILER_PDF_DPI` → `(w0, h0)` → proportional resize to width `W`
-(`new_h = round(h0 * W / w0)`, LANCZOS).
+Raster page `p` at `TILER_PDF_DPI` (capped at 4 × `W` wide) → `(w0, h0)` →
+proportional resize to width `W` (`new_h = round(h0 * W / w0)`, LANCZOS), band by band.
 
 **Default (`TILER_PDF_SLICE_ENABLE=false`):** `tile_num = p`, `height = new_h`, no
 slicing. `tile_count = pages`, `page_height = 0`.
@@ -217,10 +268,9 @@ slicing. `tile_count = pages`, `page_height = 0`.
 **Sliced (`TILER_PDF_SLICE_ENABLE=true`):** each resized page is sliced into strips of
 `TILER_PDF_TILE_HEIGHT` (overlap `TILER_PDF_TILE_OVERLAP`) with the same `slice_strips`
 geometry as IMG/Web — **strictly within a page, never across pages**. Strips get a
-contiguous global `tile_num` in page order; the per-page resized heights are stored
-(`docs.page_heights`) so `get_tile` replays `slice_doc_strips(page_heights, …)` to
-reverse a `tile_num` back to `(page, offset, height)`. `page_height = 0` still (heights
-are per page now). The PDF slicing sizes join `render_version` only while slicing is on.
+contiguous global `tile_num` in page order. Either way the per-page resized heights are
+stored (`docs.page_heights`) and `get_tile` replays `plan_tiles(page_heights, …)` to map
+a `tile_num` back to `(page, offset, height)`. `page_height = 0` (heights are per page). The PDF slicing sizes join `render_version` only while slicing is on.
 
 ### 5.3 IMG
 
@@ -467,14 +517,18 @@ sliced PDF stream never waits on a group that is itself waiting for a slot.
 tiler/
   __init__.py        # routes sqlite3 → pysqlite3 (STAT4) before aiosqlite loads; __version__
   main.py            # app, lifespan (guard, pools, DB, schema+index creation, revision gate), routes
-  service.py         # core: ingest, regeneration, the three-layer pool wiring, bulk slots
+  service.py         # core: ingest, regeneration, revision writes — plans tiles over page heights
+  capture.py         # URL capture: SSRF policy + guard proxy + MHTML snapshot
   revision.py        # serving gate + the job that brings stored docs to the current render_version
   config.py          # env + render_version + geometry/pixel tiers
   guard.py           # startup geometry guard (service_meta)
   preflight.py       # standalone startup validation (runs before uvicorn)
   media.py  metrics.py  errors.py  models.py  responses.py  # mime sniff, Prometheus, error envelope, pydantic, orjson response
   api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  revision.py  ops.py
-  render/ browser.py  render.py  geometry.py  types.py  # render = PDF raster/PIL/hash; geometry = tiling forward+reverse; types = worker/tile result dataclasses
+  render/ readers.py  # DocumentReader: PdfReader, ImageReader (in the workers), MhtmlReader (Chromium)
+          pool.py     # RenderPool: pebble process pool (memory cap, timeout), Chromium, bulk slots
+          worker.py   # what runs in a worker: page heights, tiles built from bands
+          browser.py  render.py  geometry.py  types.py  # Chromium tabs; pixel primitives; plan_tiles/bands; result dataclasses
   store/  blobs.py  meta.py  cache.py
   meta/   schema.py                                # load schema, meta_expr(), CREATE INDEX loop
   ssrf.py  netguard.py  hashing.py                 # URL policy + pinning proxy + sha256

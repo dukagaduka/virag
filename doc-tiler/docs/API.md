@@ -197,10 +197,10 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 | `413` | Upload exceeds `TILER_MAX_DOC_BYTES`. |
 | `415` | Content-type mismatch. |
 | `416` | `Range` not satisfiable (`GET /doc`). |
-| `422` | Corrupt document, invalid metadata JSON (including integers beyond 64 bits), schema violation, request validation. |
-| `502` | Upstream fetch/render failure. |
+| `422` | Corrupt document (`DECODE_FAILED`), a document that needs more than `TILER_RENDER_WORKER_MEMORY` to render (`RENDER_TOO_LARGE`) or crashes the render worker (`RENDER_CRASHED`), invalid metadata JSON (including integers beyond 64 bits), schema violation, request validation. |
+| `502` | Upstream fetch/render failure; `WORKER_CRASH` when the render workers cannot start. |
 | `503` | Data routes while a revision is pending or running (`NOT_READY`, with `Retry-After`). |
-| `504` | Render timeout. |
+| `504` | Render timeout (`RENDER_TIMEOUT`: Chromium's `TILER_NAV_TIMEOUT_MS`, or a render task past `TILER_RENDER_TIMEOUT_SEC`). |
 
 **Startup** is separate: a geometry mismatch makes the process exit
 non-zero before serving anything (see [ARCHITECTURE.md](ARCHITECTURE.md) and

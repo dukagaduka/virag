@@ -51,6 +51,7 @@ rate(tiler_cache_total[5m])`. Live per-cache stats are also on `GET /info`.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `tiler_browser_recycles_total` | counter | — | Chromium process recycles (`TILER_RECYCLE_AFTER`). |
+| `tiler_render_worker_restarts_total` | counter | `reason` | Render workers replaced: `worker_died` (a worker crashed or was killed mid-task), `timeout` (its task ran past `TILER_RENDER_TIMEOUT_SEC` and it was killed) or `pool_broken` (a worker died idle; pebble gives the pool up and the whole pool is replaced). |
 | `tiler_docs` | gauge | — | Documents currently stored. Set at startup and maintained on write. |
 | `tiler_inflight_renders` | gauge | `layer` | Renders currently in flight, by execution `layer` (browser vs cpu). |
 

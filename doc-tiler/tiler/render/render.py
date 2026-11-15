@@ -1,36 +1,38 @@
-"""Rendering primitives (PDF raster, image resize/slice, JPEG encode).
+"""Pixel primitives shared by every reader: decode, resize, flatten, JPEG encode.
 
-Every function here must stay importable and picklable: they run inside
-`ProcessPoolExecutor` workers, never on the event loop. No app state, no I/O
-besides the bytes handed in.
+Everything here runs inside the render workers, never on the event loop, and must stay
+picklable: plain functions over the bytes or paths handed in, no app state.
 
-Ingest and /get_tile deliberately share these functions — same decode, same
-resize, same JPEG encoder settings — so a regenerated tile is byte-identical to
-the one hashed at ingest.
+Ingest and /get_tile deliberately share these functions — same decode, same resize,
+same JPEG encoder settings — so a regenerated tile is byte-identical to the one hashed
+at ingest.
 """
 
 from __future__ import annotations
 
 import io
 
-import pymupdf
 from PIL import Image, ImageOps
 
 from ..config import JPEG_PROGRESSIVE, JPEG_SUBSAMPLING
-from .geometry import resized_height, slice_strips, strip_for
-from .types import EncodedImage, EncodedPage, EncodedStrip, EncodedTile
+from .geometry import resized_height
+from .types import EncodedImage
 
-# Guard against decompression-bomb DoS while still allowing very tall pages.
-Image.MAX_IMAGE_PIXELS = 512_000_000
+# Memory is bounded per render worker (TILER_RENDER_WORKER_MEMORY), so Pillow's own
+# pixel-count guard would only reject documents the worker can afford.
+Image.MAX_IMAGE_PIXELS = None
 
 
 class DecodeError(ValueError):
-    """The document could not be decoded (maps to 422)."""
+    """The document could not be decoded (maps to 422 DECODE_FAILED)."""
 
 
-def _flatten(img: Image.Image) -> Image.Image:
+class RenderTooLarge(MemoryError):
+    """A render needed more memory than one worker may take (maps to 422 RENDER_TOO_LARGE)."""
+
+
+def flatten(img: Image.Image) -> Image.Image:
     """RGB with transparency composited over white — deterministic across formats."""
-
     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
 
         rgba = img.convert("RGBA")
@@ -42,11 +44,11 @@ def _flatten(img: Image.Image) -> Image.Image:
     return img.convert("RGB") if img.mode != "RGB" else img
 
 
-def _to_jpeg(img: Image.Image, quality: int) -> bytes:
+def to_jpeg(img: Image.Image, quality: int) -> bytes:
     """Flatten and encode an image to JPEG bytes with fixed encoder settings."""
     buf = io.BytesIO()
 
-    _flatten(img).save(
+    flatten(img).save(
         buf,
         format="JPEG",
         quality=quality,
@@ -58,11 +60,23 @@ def _to_jpeg(img: Image.Image, quality: int) -> bytes:
     return buf.getvalue()
 
 
-def _open_image(data: bytes) -> Image.Image:
-    """Decode image bytes and normalise EXIF rotation; raise DecodeError on failure."""
+def open_image(source: str | bytes, min_width: int | None = None) -> Image.Image:
+    """Decode an image file or bytes and normalise its EXIF rotation.
+
+    With `min_width`, a JPEG is decoded straight at the smallest 1/2^k scale that still
+    keeps both sides at least that wide, so a large photo never decodes at full size.
+    Raises DecodeError when the data is not a readable image.
+    """
     try:
-        img = Image.open(io.BytesIO(data))
+        img = Image.open(source if isinstance(source, str) else io.BytesIO(source))
+
+        if min_width is not None and img.format == "JPEG":
+            img.draft(None, (min_width, min_width))
+
         img.load()
+
+    except MemoryError:
+        raise
 
     except Exception as exc:
         raise DecodeError(f"cannot decode image: {exc}") from exc
@@ -71,237 +85,48 @@ def _open_image(data: bytes) -> Image.Image:
     return ImageOps.exif_transpose(img) or img
 
 
-def _fit_width(img: Image.Image, width: int) -> Image.Image:
+def fit_width(img: Image.Image, width: int) -> Image.Image:
     """Proportionally resize an image to exactly `width` (no-op if already that wide)."""
     if img.width == width:
         return img
 
-    new_h = resized_height(img.width, img.height, width)
-
-    return img.resize((width, new_h), Image.Resampling.LANCZOS)
+    return img.resize((width, resized_height(img.width, img.height, width)), Image.Resampling.LANCZOS)
 
 
-# --------------------------------------------------------------------------- #
-# PDF — one tile per page, no slicing.
-# --------------------------------------------------------------------------- #
-def pdf_page_count(blob: bytes) -> int:
-    """Number of pages in a PDF blob; raise DecodeError if it cannot be opened."""
-    try:
-        with pymupdf.open(stream=blob, filetype="pdf") as doc:
-            if doc.needs_pass:
-                raise DecodeError("PDF is password protected")
-
-            return doc.page_count
-
-    except DecodeError:
-        raise
-
-    except Exception as exc:
-        raise DecodeError(f"cannot open PDF: {exc}") from exc
-
-
-def render_pdf_pages(
-    blob: bytes,
-    page_nums: list[int] | None,
-    dpi: int,
-    width: int,
-    quality: int,
-) -> list[EncodedTile]:
-    """Render the requested pages (all when None), one tile per page, tile_num == page_num."""
-    try:
-        doc = pymupdf.open(stream=blob, filetype="pdf")
-
-    except Exception as exc:
-        raise DecodeError(f"cannot open PDF: {exc}") from exc
-
-    with doc:
-        if doc.needs_pass:
-            raise DecodeError("PDF is password protected")
-
-        pages = list(range(doc.page_count)) if page_nums is None else page_nums
-        out: list[EncodedTile] = []
-
-        for pno in pages:
-            if not 0 <= pno < doc.page_count:
-                raise DecodeError(f"page {pno} is out of range")
-
-            try:
-                pix = doc.load_page(pno).get_pixmap(dpi=dpi, alpha=False)
-
-            except Exception as exc:
-                raise DecodeError(f"cannot rasterize page {pno}: {exc}") from exc
-
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            img = _fit_width(img, width)
-
-            out.append(EncodedTile(tile_num=pno, height=img.height, jpeg=_to_jpeg(img, quality)))
-
-        return out
-
-
-def render_pdf_page_strips(
-    blob: bytes,
-    page_nums: list[int] | None,
-    dpi: int,
-    width: int,
-    tile_height: int,
-    overlap: int,
-    min_tile_height: int,
-    quality: int,
-) -> list[EncodedPage]:
-    """Render pages and slice each into vertical strips (never across pages).
-
-    Returns one `EncodedPage` per requested page, in the requested order. The crop box here MUST match `crop_pdf_page_strip` so a
-    regenerated strip is byte-identical to the one hashed at ingest.
-    """
-    try:
-        doc = pymupdf.open(stream=blob, filetype="pdf")
-
-    except Exception as exc:
-        raise DecodeError(f"cannot open PDF: {exc}") from exc
-
-    with doc:
-        if doc.needs_pass:
-            raise DecodeError("PDF is password protected")
-
-        pages = list(range(doc.page_count)) if page_nums is None else page_nums
-        out: list[EncodedPage] = []
-
-        for pno in pages:
-            if not 0 <= pno < doc.page_count:
-                raise DecodeError(f"page {pno} is out of range")
-
-            try:
-                pix = doc.load_page(pno).get_pixmap(dpi=dpi, alpha=False)
-
-            except Exception as exc:
-                raise DecodeError(f"cannot rasterize page {pno}: {exc}") from exc
-
-            img = _fit_width(Image.frombytes("RGB", (pix.width, pix.height), pix.samples), width)
-            page_height = img.height
-
-            strips = [
-                EncodedStrip(
-                    offset=s.offset,
-                    height=s.height,
-                    jpeg=_to_jpeg(img.crop((0, s.offset, width, s.offset + s.height)), quality),
-                )
-                for s in slice_strips(page_height, tile_height, overlap, min_tile_height)
-            ]
-            out.append(EncodedPage(page_num=pno, page_height=page_height, strips=strips))
-
-        return out
-
-
-def crop_pdf_page_strip(
-    blob: bytes,
-    page_num: int,
-    dpi: int,
-    width: int,
-    offset: int,
-    height: int,
-    quality: int,
-) -> EncodedImage:
-    """Regenerate a single PDF strip: render its page, crop `[offset, offset+height]`.
-
-    The crop box mirrors `render_pdf_page_strips` exactly → byte-identical output.
-    """
-    try:
-        doc = pymupdf.open(stream=blob, filetype="pdf")
-
-    except Exception as exc:
-        raise DecodeError(f"cannot open PDF: {exc}") from exc
-
-    with doc:
-        if doc.needs_pass:
-            raise DecodeError("PDF is password protected")
-
-        if not 0 <= page_num < doc.page_count:
-            raise DecodeError(f"page {page_num} is out of range")
-
-        try:
-            pix = doc.load_page(page_num).get_pixmap(dpi=dpi, alpha=False)
-
-        except Exception as exc:
-            raise DecodeError(f"cannot rasterize page {page_num}: {exc}") from exc
-
-        img = _fit_width(Image.frombytes("RGB", (pix.width, pix.height), pix.samples), width)
-        top = min(max(offset, 0), img.height)
-        bottom = min(offset + height, img.height)
-
-        if bottom <= top:
-            raise DecodeError(
-                f"strip (page={page_num}, offset={offset}, height={height}) falls outside "
-                f"the rendered page (rendered_height={img.height})"
-            )
-
-        return EncodedImage(
-            height=bottom - top,
-            jpeg=_to_jpeg(img.crop((0, top, width, bottom)), quality),
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Full-page sources: an IMG blob, or a full-page PNG screenshot.
-# --------------------------------------------------------------------------- #
-def page_height_of(data: bytes, width: int) -> int:
-    """Height the source has after proportional resize to `width`."""
-    return _fit_width(_open_image(data), width).height
-
-
-def tile_full_page(
-    data: bytes,
-    width: int,
-    tile_height: int,
-    overlap: int,
-    min_tile_height: int,
-    quality: int,
-) -> EncodedPage:
-    """Slice a full-page source into strips; strip order is the tile_num order."""
-    img = _fit_width(_open_image(data), width)
-    page_height = img.height
-    strips = [
-        EncodedStrip(
-            offset=s.offset,
-            height=s.height,
-            jpeg=_to_jpeg(img.crop((0, s.offset, width, s.offset + s.height)), quality),
-        )
-        for s in slice_strips(page_height, tile_height, overlap, min_tile_height)
-    ]
-
-    return EncodedPage(page_num=0, page_height=page_height, strips=strips)
-
-
-def crop_one_tile(
-    data: bytes,
-    width: int,
-    tile_num: int,
-    page_height: int,
-    tile_height: int,
-    overlap: int,
-    quality: int,
-) -> EncodedImage:
-    """Crop and encode a single tile by its index."""
-    img = _fit_width(_open_image(data), width)
-    strip = strip_for(tile_num, page_height, tile_height, overlap)
-    top = min(max(strip.offset, 0), img.height)
-    bottom = min(strip.offset + strip.height, img.height)
+def crop_rows(img: Image.Image, y0: int, y1: int, what: str) -> Image.Image:
+    """Rows `[y0, y1)` of an image, clipped to it; DecodeError when nothing is left."""
+    top = min(max(y0, 0), img.height)
+    bottom = min(y1, img.height)
 
     if bottom <= top:
-        raise DecodeError(
-            f"tile {tile_num} falls outside the rendered page "
-            f"(page_height={page_height}, rendered={img.height})"
-        )
+        raise DecodeError(f"{what} [{y0}, {y1}) falls outside the rendered page (height={img.height})")
 
-    return EncodedImage(
-        height=bottom - top,
-        jpeg=_to_jpeg(img.crop((0, top, width, bottom)), quality),
-    )
+    return img.crop((0, top, img.width, bottom))
 
 
-def encode_strip(data: bytes, width: int, quality: int) -> EncodedImage:
+# --------------------------------------------------------------------------- #
+# Chromium captures (MHTML): encoded in the render workers, captured on the loop.
+# --------------------------------------------------------------------------- #
+def png_page_height(png: bytes, width: int) -> int:
+    """Height a full-page capture has after proportional resize to `width`."""
+    return fit_width(open_image(png), width).height
+
+
+def crop_page_png(png: bytes, rows: list[tuple[int, int]], width: int, quality: int) -> list[EncodedImage]:
+    """Encode several row ranges of one full-page capture (decoded once)."""
+    page = fit_width(open_image(png), width)
+    out = []
+
+    for y0, y1 in rows:
+        tile = crop_rows(page, y0, y1, "tile")
+        out.append(EncodedImage(height=tile.height, jpeg=to_jpeg(tile, quality)))
+
+    return out
+
+
+def encode_strip(png: bytes, width: int, quality: int) -> EncodedImage:
     """Encode an already-cropped capture (tall-page clip path)."""
-    img = _flatten(_open_image(data))
+    img = flatten(open_image(png))
 
     if img.width > width:
         img = img.crop((0, 0, width, img.height))
@@ -311,4 +136,4 @@ def encode_strip(data: bytes, width: int, quality: int) -> EncodedImage:
         padded.paste(img, (0, 0))
         img = padded
 
-    return EncodedImage(height=img.height, jpeg=_to_jpeg(img, quality))
+    return EncodedImage(height=img.height, jpeg=to_jpeg(img, quality))

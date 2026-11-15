@@ -11,13 +11,12 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import tempfile
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from ..config import Settings
 from ..metrics import BROWSER_RECYCLES
-from .geometry import Strip
 
 log = logging.getLogger("tiler.browser")
 
@@ -67,15 +66,6 @@ class RenderTimeout(RuntimeError):
 
 class RenderFailure(RuntimeError):
     """Navigation or capture failed (maps to 502)."""
-
-
-@dataclass
-class MhtmlRender:
-    """Either one full-page PNG, or per-strip PNGs when the page is very tall."""
-
-    css_height: int
-    full_png: bytes | None = None
-    strip_pngs: list[bytes] | None = None
 
 
 class BrowserPool:
@@ -260,16 +250,31 @@ async def _prepare(page: Any, settings: Settings) -> None:
         await page.evaluate("() => document.fonts.ready.then(() => true)")
 
 
-async def _page_height(page: Any) -> int:
+async def page_height(page: Any) -> int:
     """Measure the full scroll height of the loaded page in CSS pixels."""
-    return int(
-        await page.evaluate(
-            "() => Math.ceil(Math.max("
-            "  document.documentElement.scrollHeight,"
-            "  document.body ? document.body.scrollHeight : 0,"
-            "  document.documentElement.offsetHeight))"
+    try:
+        return int(
+            await page.evaluate(
+                "() => Math.ceil(Math.max("
+                "  document.documentElement.scrollHeight,"
+                "  document.body ? document.body.scrollHeight : 0,"
+                "  document.documentElement.offsetHeight))"
+            )
         )
-    )
+
+    except Exception as exc:
+        raise _map_error(exc) from exc
+
+
+async def full_page_png(page: Any) -> bytes:
+    """Capture the whole loaded page as one PNG."""
+    try:
+        return await page.screenshot(
+            full_page=True, type="png", animations="disabled", caret="hide", scale="css"
+        )
+
+    except Exception as exc:
+        raise _map_error(exc) from exc
 
 
 def _map_error(exc: Exception) -> Exception:
@@ -311,20 +316,29 @@ async def capture_url_mhtml(
 
 
 @contextlib.asynccontextmanager
-async def _mhtml_page(pool: BrowserPool, settings: Settings, blob: bytes):
-    """Load a stored MHTML archive from a temp file (Chromium reads MHTML natively)."""
+async def mhtml_page(pool: BrowserPool, settings: Settings, path: str):
+    """Load a stored MHTML archive in a fresh tab (Chromium reads MHTML natively).
+
+    Chromium recognises the archive by its `.mhtml` suffix, which a content-addressed
+    blob lacks, so it is opened through a hard link (a copy across file systems).
+    """
     os.makedirs(settings.temp_dir, exist_ok=True)
-    fd, path = tempfile.mkstemp(suffix=".mhtml", dir=settings.temp_dir)
+    fd, link = tempfile.mkstemp(suffix=".mhtml", dir=settings.temp_dir)
+    os.close(fd)
+    os.unlink(link)
 
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(blob)
+        try:
+            os.link(path, link)
+
+        except OSError:
+            shutil.copyfile(path, link)
 
         async with pool.context() as ctx:
             page = await ctx.new_page()
 
             try:
-                await page.goto(f"file://{path}", wait_until="load")
+                await page.goto(f"file://{link}", wait_until="load")
                 await _prepare(page, settings)
 
             except Exception as exc:
@@ -334,92 +348,29 @@ async def _mhtml_page(pool: BrowserPool, settings: Settings, blob: bytes):
 
     finally:
         with contextlib.suppress(OSError):
-            os.unlink(path)
+            os.unlink(link)
 
 
-async def _clip(page: Any, settings: Settings, strip: Strip) -> bytes:
-    """Screenshot a single vertical strip of the page as PNG bytes."""
-    # Scroll the region into view first so lazy-loaded content rasterizes.
-    await page.evaluate("y => window.scrollTo(0, y)", strip.offset)
-    await _prepare(page, settings)
+async def clip(page: Any, settings: Settings, offset: int, height: int) -> bytes:
+    """Screenshot rows `[offset, offset + height)` of the page as PNG bytes."""
+    try:
+        # Scroll the region into view first so lazy-loaded content rasterizes.
+        await page.evaluate("y => window.scrollTo(0, y)", offset)
+        await _prepare(page, settings)
 
-    # This is a viewport screenshot (not full_page — that would rasterize the whole
-    # tall page and defeat the strip path), so the clip is viewport-relative. scrollY
-    # can fall short of the requested offset at the bottom of the page, so subtract
-    # where the page actually landed, not where we asked it to go.
-    scroll_y = await page.evaluate("() => window.scrollY")
+        # This is a viewport screenshot (not full_page — that would rasterize the whole
+        # tall page and defeat the clip path), so the clip is viewport-relative. scrollY
+        # can fall short of the requested offset at the bottom of the page, so subtract
+        # where the page actually landed, not where we asked it to go.
+        scroll_y = await page.evaluate("() => window.scrollY")
 
-    return await page.screenshot(
-        type="png",
-        animations="disabled",
-        caret="hide",
-        scale="css",
-        clip={
-            "x": 0,
-            "y": strip.offset - scroll_y,
-            "width": settings.tile_width,
-            "height": strip.height,
-        },
-    )
+        return await page.screenshot(
+            type="png",
+            animations="disabled",
+            caret="hide",
+            scale="css",
+            clip={"x": 0, "y": offset - scroll_y, "width": settings.tile_width, "height": height},
+        )
 
-
-async def render_mhtml_document(
-    pool: BrowserPool,
-    settings: Settings,
-    blob: bytes,
-    make_strips: Callable[[int], list[Strip]],
-) -> MhtmlRender:
-    """Render a stored MHTML archive in one page session.
-
-    Pages up to `SAFE_FULLPAGE_PX` come back as a single full-page PNG; taller ones
-    are clip-captured strip by strip, which is also exactly what /get_tile does for
-    them, so both paths produce identical bytes.
-    """
-    async with _mhtml_page(pool, settings, blob) as page:
-        try:
-            height = await _page_height(page)
-
-            if height <= settings.safe_fullpage_px:
-                png = await page.screenshot(
-                    full_page=True, type="png", animations="disabled", caret="hide", scale="css"
-                )
-                return MhtmlRender(css_height=height, full_png=png)
-
-            strips = make_strips(height)
-
-            return MhtmlRender(
-                css_height=height,
-                strip_pngs=[await _clip(page, settings, s) for s in strips],
-            )
-
-        except Exception as exc:
-            raise _map_error(exc) from exc
-
-
-async def render_mhtml_region(
-    pool: BrowserPool, settings: Settings, blob: bytes, strip: Strip
-) -> bytes:
-    """Clip-capture a single strip of a very tall stored page (get_tile path)."""
-    async with _mhtml_page(pool, settings, blob) as page:
-        try:
-            return await _clip(page, settings, strip)
-
-        except Exception as exc:
-            raise _map_error(exc) from exc
-
-
-async def render_mhtml_full_png(
-    pool: BrowserPool, settings: Settings, blob: bytes
-) -> tuple[int, bytes]:
-    """Full-page PNG of a stored archive → `(css_height, png)` (get_tile path)."""
-    async with _mhtml_page(pool, settings, blob) as page:
-        try:
-            height = await _page_height(page)
-            png = await page.screenshot(
-                full_page=True, type="png", animations="disabled", caret="hide", scale="css"
-            )
-
-        except Exception as exc:
-            raise _map_error(exc) from exc
-
-        return height, png
+    except Exception as exc:
+        raise _map_error(exc) from exc

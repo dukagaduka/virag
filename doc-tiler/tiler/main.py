@@ -122,6 +122,12 @@ async def lifespan(app: FastAPI):
     if not settings.api_key:
         log.warning("TILER_API_KEY is empty: every route is open to anyone who reaches the port")
 
+    if not settings.render_worker_memory:
+        log.warning(
+            "TILER_RENDER_WORKER_MEMORY is 0: a heavy document can exhaust the container's "
+            "memory and draw the OOM killer instead of failing on its own"
+        )
+
     sweeper = asyncio.create_task(_run_sweeper(svc, settings))
 
     try:

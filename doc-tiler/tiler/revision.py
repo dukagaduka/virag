@@ -20,8 +20,10 @@ The job:
      410) rather than holding the whole service back.
   4. Turns the service ready once nothing revisable is left.
 
-An infrastructure failure (render worker crash, Chromium unavailable) aborts the job
-instead of quarantining every doc after it, and the service stays not-ready. The
+An infrastructure failure (render workers that cannot start, Chromium unavailable)
+aborts the job instead of quarantining every doc after it, and the service stays
+not-ready. A document that crashes a worker, exhausts its memory or times out is that
+document's failure (RENDER_CRASHED, RENDER_TOO_LARGE, RENDER_TIMEOUT) and is quarantined. The
 selection is by render_version, so a restart resumes where a job stopped (a forced
 revision is not resumed). GET /revision reports progress.
 

@@ -7,10 +7,12 @@ import random
 import pytest
 
 from tiler.render.geometry import (
+    TileSpec,
+    bands_for,
+    plan_tiles,
     resized_height,
     slice_doc_strips,
     slice_strips,
-    strip_for,
 )
 
 TH = 1024
@@ -45,7 +47,7 @@ def test_page_shorter_than_min_yields_no_tiles():
 
 
 @pytest.mark.parametrize("overlap", [0, 1, 100, 512, 1023])
-def test_forward_and_reverse_agree_on_random_heights(overlap):
+def test_strips_on_random_heights(overlap):
     rng = random.Random(1337 + overlap)
     # Keep the sample space bounded: with overlap=1023 the step is 1px, so a
     # 200k-tall page would mean 200k strips per sample.
@@ -54,9 +56,6 @@ def test_forward_and_reverse_agree_on_random_heights(overlap):
     heights += [TH - 1, TH, TH + 1, MIN, MIN - 1, 2 * TH, 2 * TH - overlap]
     for height in heights:
         strips = slice_strips(height, TH, overlap, MIN)
-        for strip in strips:
-            reverse = strip_for(strip.tile_num, height, TH, overlap)
-            assert reverse == strip, f"H={height} overlap={overlap} tile={strip.tile_num}"
         # Offsets are exactly n*STEP and every strip stays inside the page.
         step = TH - overlap
         for strip in strips:
@@ -100,3 +99,41 @@ def test_resized_height_is_proportional():
     assert resized_height(1000, 2000, 875) == 1750
     assert resized_height(3, 1, 875) == 292  # rounds, never zero
     assert resized_height(10_000, 1, 875) == 1
+
+
+def test_plan_tiles_whole_pages_is_one_tile_per_page():
+    assert plan_tiles([1200, 900], TH, 0, MIN, whole_pages=True) == [
+        TileSpec(tile_num=0, page=0, offset=0, height=1200),
+        TileSpec(tile_num=1, page=1, offset=0, height=900),
+    ]
+
+
+def test_plan_tiles_slices_each_page_and_numbers_globally():
+    specs = plan_tiles([2058, 1500], TH, 0, MIN)
+    assert [(t.tile_num, t.page, t.offset, t.height) for t in specs] == [
+        (0, 0, 0, 1024),
+        (1, 0, 1024, 1024),          # the 10 px rest of page 0 is a dropped sliver
+        (2, 1, 0, 1024),
+        (3, 1, 1024, 476),
+    ]
+
+
+def test_bands_take_the_rest_of_the_tile_last():
+    assert bands_for(1024, 300) == [(0, 300), (300, 600), (600, 900), (900, 1024)]
+    assert bands_for(1024, 1024) == [(0, 1024)]
+    assert bands_for(1024, 5000) == [(0, 1024)]
+    assert bands_for(7, 1) == [(i, i + 1) for i in range(7)]
+
+
+@pytest.mark.parametrize("band", [1, 7, 100, 1023, 1024, 1025])
+def test_bands_cover_the_tile_exactly(band):
+    for height in (1, 28, 999, 1024, 4097):
+        bands = bands_for(height, band)
+        assert bands[0][0] == 0 and bands[-1][1] == height
+        assert all(a[1] == b[0] for a, b in zip(bands, bands[1:]))
+        assert all(0 < end - start <= band for start, end in bands)
+
+
+def test_bands_reject_an_empty_band():
+    with pytest.raises(ValueError):
+        bands_for(10, 0)

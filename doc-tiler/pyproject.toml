@@ -26,6 +26,7 @@ dependencies = [
     "pyyaml==6.0.3",
     "prometheus-client==0.26.0",
     "orjson==3.13.0",
+    "pebble==5.2.3",
 ]
 
 [project.optional-dependencies]

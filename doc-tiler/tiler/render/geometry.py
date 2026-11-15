@@ -74,20 +74,58 @@ def slice_doc_strips(
     return out
 
 
-def strip_for(
-    tile_num: int, page_height: int, tile_height: int, overlap: int
-) -> Strip:
-    """Compute a single tile's placement from its index (inverse of slice_strips).
+@dataclass(frozen=True)
+class TileSpec:
+    """Where one tile sits: rows `[offset, offset + height)` of page `page` at tile width."""
 
-    Valid for `tile_num < len(slice_strips(...))`. It agrees with the forward pass
-    because a short strip is only ever dropped as the final element, so every
-    surviving tile keeps the same offset `tile_num * step` it had going forward.
+    tile_num: int
+    page: int
+    offset: int
+    height: int
+
+
+def plan_tiles(
+    page_heights: list[int],
+    tile_height: int,
+    overlap: int,
+    min_tile_height: int,
+    *,
+    whole_pages: bool = False,
+) -> list[TileSpec]:
+    """The tiles of a document whose pages are `page_heights` tall at tile width.
+
+    `whole_pages` makes every page one tile (a PDF without slicing); otherwise each
+    page is sliced into strips that never cross a page boundary, numbered globally in
+    page order. Ingest and get_tile both plan from the same heights, so the forward and
+    reverse mappings are one computation.
     """
-    step = tile_height - overlap
-    offset = tile_num * step
-    height = min(tile_height, page_height - offset)
+    if whole_pages:
+        return [TileSpec(tile_num=p, page=p, offset=0, height=h) for p, h in enumerate(page_heights)]
 
-    return Strip(tile_num=tile_num, offset=offset, height=height)
+    return [
+        TileSpec(tile_num=s.tile_num, page=page, offset=s.offset, height=s.height)
+        for page, s in slice_doc_strips(page_heights, tile_height, overlap, min_tile_height)
+    ]
+
+
+def bands_for(height: int, band_rows: int) -> list[tuple[int, int]]:
+    """Split a tile of `height` rows into bands of `band_rows`, as `(start, end)` pairs.
+
+    Bands never cross the tile's edges: while more than a band is missing the next one
+    is a full band, and the last one is exactly what remains (`height - X`).
+    """
+    if band_rows <= 0:
+        raise ValueError("band_rows must be positive")
+
+    bands = []
+    done = 0
+
+    while done < height:
+        end = min(height, done + band_rows)
+        bands.append((done, end))
+        done = end
+
+    return bands
 
 
 def resized_height(src_width: int, src_height: int, target_width: int) -> int:
