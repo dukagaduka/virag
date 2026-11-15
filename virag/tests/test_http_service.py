@@ -308,6 +308,40 @@ def test_tiler_stream_is_never_replayed():
     assert len(seen) == 1
 
 
+def test_tiler_stream_relays_a_document_the_tiler_refuses():
+    tiler = TilerService("http://tiler", max_retries=0, **_HTTP)
+    refusal = {"error": {
+        "code": "UNSUPPORTED_MEDIA",
+        "message": "declared doc_type=PDF but the payload does not start with %PDF-",
+        "details": {"declared": "PDF"},
+    }}
+    _mock(tiler, lambda req, n: httpx2.Response(415, json=refusal))
+
+    async def consume():
+        return [event async for event in tiler.tile_stream("PDF", document=b"x")]
+
+    with pytest.raises(ApiError) as exc:
+        _run(consume())
+
+    assert (exc.value.status_code, exc.value.code) == (415, "UNSUPPORTED_MEDIA")   # the caller's to fix
+    assert "does not start with %PDF-" in exc.value.message
+    assert exc.value.details == {"tiler_code": "UNSUPPORTED_MEDIA", "tiler_details": {"declared": "PDF"}}
+
+
+def test_tiler_stream_rejecting_our_key_is_not_the_callers_fault():
+    tiler = TilerService("http://tiler", api_key="wrong", max_retries=0, **_HTTP)
+    _mock(tiler, lambda req, n: httpx2.Response(401, json={"error": {"code": "UNAUTHORIZED", "message": "no"}}))
+
+    async def consume():
+        return [event async for event in tiler.tile_stream("PDF", document=b"x")]
+
+    with pytest.raises(ApiError) as exc:
+        _run(consume())
+
+    assert exc.value.status_code == 503
+    assert exc.value.details["upstream_status"] == 401
+
+
 def test_tiler_stream_yields_events():
     tiler = TilerService("http://tiler", max_retries=0, **_HTTP)
     _mock(tiler, lambda req, n: httpx2.Response(200, content=b'{"event":"begin"}\n\n{"event":"committed"}\n'))

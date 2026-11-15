@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from virag.api.enroll import point_id
+from virag.errors import ApiError
 
 from virag.settings import EnrollSettings
 
@@ -159,6 +160,26 @@ def test_enroll_stream_error_rolls_back(make_client):
     assert r.status_code == 502
     assert store.upserts == []
     assert store.deletes == ["doc-a", "doc-a"]                       # start clear + rollback
+
+
+def test_enroll_relays_a_document_the_tiler_refuses(make_client):
+    client, store, _, tiler = _client(make_client)
+
+    async def refusing_stream(doc_type, *, document=None, url=None, metadata=None):
+        raise ApiError(status_code=415, message="The tiler refused the document: not a PDF")
+        yield  # pragma: no cover - makes this an async generator
+
+    tiler.tile_stream = refusing_stream
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+    assert (r.status_code, r.json()["error"]["code"]) == (415, "UNSUPPORTED_MEDIA")
+    assert store.upserts == [] and store.deletes == []                # nothing was begun
+    assert tiler.metadata_patches == []
 
 
 def test_enroll_rolls_back_on_upsert_failure(make_client):

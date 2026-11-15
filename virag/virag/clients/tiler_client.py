@@ -16,6 +16,11 @@ class TilerService(HttpService):
     # A tile rendered by another render_version than the one it was embedded from.
     RENDER_VERSION_MISMATCH = "RENDER_VERSION_MISMATCH"
 
+    # What the tiler answers to a document it will not take: the caller's to fix, not an
+    # outage, so it is relayed with its own status. 401 is not among them — a wrong
+    # TILER_API_KEY is ours.
+    REFUSALS = frozenset({400, 403, 409, 413, 415, 422})
+
 
     def __init__(
         self,
@@ -121,15 +126,22 @@ class TilerService(HttpService):
         Because tiles arrive as they render, the per-read timeout — not a single
         whole-request deadline — bounds each hop, so an arbitrarily long render never
         trips `TILER_TIMEOUT_SEC`. Never replayed: events may already be consumed.
+
+        A document the tiler refuses before the stream begins (wrong type, too large,
+        invalid metadata, already being ingested, …) raises with the tiler's own status.
         """
         async with self._stream(
             "POST",
             self.tile_stream_route,
             action="the ingest",
             retry=False,
+            passthrough_statuses=self.REFUSALS,
             data=self._ingest_form(doc_type, url, metadata),
             files=self._ingest_files(document),
         ) as response:
+            if not response.is_success:
+                raise await self._refusal(response)
+
             try:
                 async for line in response.aiter_lines():
                     if line.strip():
@@ -307,3 +319,21 @@ class TilerService(HttpService):
             return None
 
         return {"document": ("document", document, "application/octet-stream")}
+
+
+    @staticmethod
+    async def _refusal(response: httpx2.Response) -> ApiError:
+        """The tiler's refusal of a document as our own error of the same status."""
+        await response.aread()
+        body = error_body(response)
+        error = body.get("error", {}) if isinstance(body, dict) else {"message": body}
+        details = {"tiler_code": error.get("code")}
+
+        if error.get("details"):
+            details["tiler_details"] = error["details"]
+
+        return ApiError(
+            status_code=response.status_code,
+            message=f"The tiler refused the document: {error.get('message')}",
+            details=details,
+        )

@@ -192,11 +192,13 @@ class HttpService(ABC):
         *,
         action: str,
         retry: bool = True,
+        passthrough_statuses: Collection[int] = (),
         **kwargs,
     ):
         """Open a streaming request that must answer 2xx and yield the live response;
-        it is always closed on exit. Errors while *reading* the body surface in the
-        caller as the HTTP library's RequestError."""
+        it is always closed on exit. Statuses listed in `passthrough_statuses` are
+        yielded instead, for the caller to handle. Errors while *reading* the body
+        surface in the caller as the HTTP library's RequestError."""
         try:
             response = await self.send(method, url, retry=retry, stream=True, **kwargs)
 
@@ -204,7 +206,7 @@ class HttpService(ABC):
             raise self._transport_error(url, action, e) from e
 
         try:
-            if not response.is_success:
+            if not response.is_success and response.status_code not in passthrough_statuses:
                 await response.aread()
 
                 raise ApiError(

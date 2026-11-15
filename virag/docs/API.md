@@ -265,5 +265,8 @@ Every error uses one shape:
 | `503` | `NOT_READY` | Queried before startup finished wiring backends; the tiler is unreachable / not serving during a RAG chat; Valkey is unreachable during an enroll or a revision call. |
 | `500` | `INTERNAL_ERROR` | Unexpected server error. |
 
-Backend services can surface their own statuses (e.g. the tiler's `409`/`413`) through
-the enroll path; those pass through with the originating service's meaning.
+A document the tiler refuses before it starts on it comes back from `/enroll` with the
+tiler's own status — `400`, `403` (a blocked URL), `409` (the same bytes are being
+ingested by another request), `413`, `415`, `422` — and the tiler's code in
+`details.tiler_code`: it is the caller's to fix, not an outage. Anything else the tiler
+fails with is `503` (before the stream) or `502` (an error inside it).
