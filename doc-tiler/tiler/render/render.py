@@ -1,4 +1,4 @@
-"""Pixel primitives shared by every reader: decode, resize, flatten, JPEG encode.
+"""Pixel primitives shared by every document type: decode, resize, flatten, JPEG encode.
 
 Everything here runs inside the render workers, never on the event loop, and must stay
 picklable: plain functions over the bytes or paths handed in, no app state.
@@ -25,6 +25,10 @@ Image.MAX_IMAGE_PIXELS = None
 
 class DecodeError(ValueError):
     """The document could not be decoded (maps to 422 DECODE_FAILED)."""
+
+
+class EmptyDocument(DecodeError):
+    """The document decodes but has nothing to render (maps to 422 EMPTY_DOCUMENT)."""
 
 
 class RenderTooLarge(MemoryError):

@@ -22,13 +22,13 @@ SearchOp = Literal["eq", "ne", "gt", "gte", "lt", "lte"]
 
 
 class IngestResult(BaseModel):
-    """Result of `/tile`: the stored doc's identity and layout, without its tiles."""
+    """Result of `/tile`: the stored doc's identity and size, without its tiles."""
 
     doc_id: str
     doc_type: DocType
     source_url: str | None = None
     render_version: str
-    page_height: int
+    height: int
     tile_count: int
     result: Literal["rendered", "idempotent"]
 

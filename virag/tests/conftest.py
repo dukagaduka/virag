@@ -320,7 +320,7 @@ class TileResult:
     doc_type: str
     source_url: str | None
     render_version: str
-    page_height: int
+    height: int
     tile_count: int
     tiles: list[Tile]
 
@@ -358,7 +358,7 @@ class FakeTiler:
                    "height": t.height, "image_hash": t.image_hash, "data": t.data}
         yield {"event": "committed", "doc_id": res.doc_id, "doc_type": res.doc_type,
                "source_url": res.source_url, "render_version": res.render_version,
-               "page_height": 0, "tile_count": res.tile_count, "result": "rendered"}
+               "height": res.height, "tile_count": res.tile_count, "result": "rendered"}
 
     async def get_tile(self, doc_id, tile_num, *, render_version=None, bulk=False) -> bytes:
         self.get_tile_calls.append((doc_id, tile_num))
@@ -518,7 +518,7 @@ def sample_tile_result(doc_id="doc-a", n_tiles=2, doc_type="PDF") -> TileResult:
         doc_type=doc_type,
         source_url=None,
         render_version="rv-test",
-        page_height=0,
+        height=n_tiles * 1024,
         tile_count=n_tiles,
         tiles=[
             Tile(tile_num=i, width=875, height=1024, image_hash=tile_hash(doc_id, i), data=f"b64-{i}")

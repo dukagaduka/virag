@@ -64,7 +64,7 @@ async def test_mhtml_round_trip_identity(browser_env, tmp_path):
         manifest = await ingest_tiles(client, mhtml_form(blob))
 
         assert manifest["doc_type"] == "MHTML"
-        assert manifest["page_height"] > 1024
+        assert manifest["height"] > 1024
         assert manifest["tile_count"] >= 3
 
         for tile in manifest["tiles"]:
@@ -86,7 +86,7 @@ async def test_mhtml_render_is_deterministic(browser_env, tmp_path):
         assert [t["image_hash"] for t in first["tiles"]] == [
             t["image_hash"] for t in second["tiles"]
         ]
-        assert first["page_height"] == second["page_height"]
+        assert first["height"] == second["height"]
 
 
 async def test_sequential_strips_reuse_one_full_page_render(browser_env, tmp_path):
@@ -117,7 +117,7 @@ async def test_tall_page_uses_the_clip_path(tmp_path):
     async with running_app(env) as (client, svc):
         blob = await capture_fixture(svc, tmp_path, rows=14)
         manifest = await ingest_tiles(client, mhtml_form(blob))
-        assert manifest["page_height"] > 1024
+        assert manifest["height"] > 1024
         assert manifest["tile_count"] >= 2
 
         for tile in manifest["tiles"]:

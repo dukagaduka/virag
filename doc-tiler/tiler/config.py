@@ -16,9 +16,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 RESIZE_FILTER = "LANCZOS"
 JPEG_SUBSAMPLING = 2  # 4:2:0, pinned explicitly (Pillow's default is quality-dependent)
 JPEG_PROGRESSIVE = False
-# A PDF page is rasterized in horizontal bands of at most this many source bytes, then
-# downscaled band by band; the band layout is part of the output, hence of render_version.
-BAND_BYTES = 32 << 20
 # A PDF page is rasterized at pdf_dpi, but never wider than this many tile widths:
 # supersampling beyond it costs time and memory and adds nothing to a 875 px tile.
 MAX_SUPERSAMPLE = 4
@@ -230,7 +227,6 @@ class Settings(BaseSettings):
             "jpeg_subsampling": JPEG_SUBSAMPLING,
             "jpeg_progressive": JPEG_PROGRESSIVE,
             "pdf_dpi": self.pdf_dpi,
-            "pdf_band_bytes": BAND_BYTES,
             "pdf_max_supersample": MAX_SUPERSAMPLE,
             "resize_filter": RESIZE_FILTER,
             "chromium": self.chromium_revision,

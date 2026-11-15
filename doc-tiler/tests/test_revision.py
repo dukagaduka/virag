@@ -169,7 +169,7 @@ async def test_incomplete_doc_is_left_to_the_sweeper(tmp_path, sample_pdf):
         rel = await svc.blobs.put("f" * 64, sample_pdf)
         await svc.store.begin_doc(
             doc_id="f" * 64, doc_type="PDF", blob_rel_path=rel, source_url=None,
-            page_height=0, tile_count=0, mime_type="application/pdf",
+            height=0, tile_count=0, mime_type="application/pdf",
             metadata=None, render_version=svc.settings.render_version,
         )
     _age_volume(env["TILER_DB_PATH"])
@@ -180,8 +180,8 @@ async def test_incomplete_doc_is_left_to_the_sweeper(tmp_path, sample_pdf):
 
 
 async def test_revision_keeps_pdf_strip_slicing(tmp_path):
-    """A revised sliced PDF keeps its strip layout: page_heights survive, the tile count
-    is unchanged and every strip still regenerates to its stored hash."""
+    """A revised sliced PDF keeps its strip layout: the height and the tile count are
+    unchanged and every strip still regenerates to its stored hash."""
     env = base_env(
         tmp_path,
         TILER_PDF_SLICE_ENABLE="true",
@@ -196,7 +196,7 @@ async def test_revision_keeps_pdf_strip_slicing(tmp_path):
         assert (await _revised(svc))["revised"] == 1
 
         row = await svc.store.get_doc(manifest["doc_id"])
-        assert row.page_heights                                         # still sliced
+        assert row.height == manifest["height"]
         assert row.tile_count == manifest["tile_count"] > 3
 
         for tile_num in range(row.tile_count):

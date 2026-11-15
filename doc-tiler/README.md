@@ -93,7 +93,7 @@ docker compose --profile test run --rm tests              # full suite incl. MHT
 ```
 
 The suite covers round-trip identity per doc type, idempotency (asserted against the
-render counter), the forward/reverse geometry property over random heights and overlaps,
+render counter), the tiling geometry property over random heights and overlaps,
 expression-index usage via `EXPLAIN QUERY PLAN`, metadata CRUD with
 immediate index visibility, cursor pagination, the fatal geometry guard, SSRF blocking,
 cache coalescing, `/healthz` latency under concurrent ingests, and MHTML re-render

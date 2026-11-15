@@ -1,4 +1,4 @@
-"""IMG ingest: strip geometry, round-trip identity, page_height."""
+"""IMG ingest: strip geometry, round-trip identity, height."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ async def test_img_strip_geometry_and_round_trip(client):
 
     expected_h = round(2600 * W / 1000)
     assert manifest["doc_type"] == "IMG"
-    assert manifest["page_height"] == expected_h
+    assert manifest["height"] == expected_h
     assert manifest["tile_count"] == 3  # 1024 + 1024 + 227
 
     heights = [t["height"] for t in manifest["tiles"]]
@@ -33,7 +33,7 @@ async def test_img_strip_geometry_and_round_trip(client):
 async def test_img_final_sliver_is_dropped(client):
     # 875 x (2048 + 10) → the 10px remainder is below MIN_TILE_HEIGHT.
     manifest = await ingest_tiles(client, png_form(make_png(width=875, height=2058)))
-    assert manifest["page_height"] == 2058
+    assert manifest["height"] == 2058
     assert manifest["tile_count"] == 2
     assert [t["height"] for t in manifest["tiles"]] == [TH, TH]
 

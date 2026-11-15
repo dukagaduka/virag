@@ -1,83 +1,72 @@
 """What runs inside a render worker process: the entry points the RenderPool submits.
 
-A worker keeps the reader of its last task open (a PDF stays parsed between the tasks
-of one document) and drops the per-task state after every task. Its address space is
-capped at start, so a document that needs more memory fails with RenderTooLarge
-instead of drawing the kernel's OOM killer onto the whole container.
+A task names a document by its type and path; the worker opens the reader for it and
+keeps it open (a PDF stays parsed between the tasks of one document), dropping the
+per-task state after every task. The render params are the same for every task, so a
+worker gets them once, at start. Its address space is capped there too, so a document
+that needs more memory fails with RenderTooLarge instead of drawing the kernel's OOM
+killer onto the whole container.
 """
 
 from __future__ import annotations
 
 import resource
 
-from PIL import Image
-
-from .geometry import TileSpec, bands_for
-from .readers import CpuReader
+from ..models import DocType
+from .geometry import Tile
+from .readers import READERS, DocumentReader, RenderParams
 from .render import DecodeError, RenderTooLarge, to_jpeg
 from .types import EncodedImage
 
 # JPEG cannot hold an image taller than this.
 MAX_JPEG_SIDE = 65_500
 
-_current: CpuReader | None = None
+_params: RenderParams | None = None
+_current: DocumentReader | None = None
 
 
-def init_worker(memory_bytes: int) -> None:
-    """Cap the worker's address space (0 = no cap)."""
+def init_worker(memory_bytes: int, params: RenderParams) -> None:
+    """Cap the worker's address space (0 = no cap) and take the render params."""
+    global _params
+
     if memory_bytes > 0:
         resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
 
-
-def page_heights(reader: CpuReader) -> list[int]:
-    """The document's page heights at tile width."""
-    return _run(reader, lambda r: r.page_heights())
+    _params = params
 
 
-def render_tiles(reader: CpuReader, specs: list[TileSpec]) -> list[EncodedImage]:
-    """Build and encode the given tiles of one document, in order."""
-    return _run(reader, lambda r: [build_tile(r, spec) for spec in specs])
+def plan(doc_type: DocType, path: str) -> tuple[int, list[Tile]]:
+    """The height of the document image and the tiles it is cut into."""
+    return _run(doc_type, path, lambda reader: reader.layout())
 
 
-def build_tile(reader: CpuReader, spec: TileSpec) -> EncodedImage:
-    """Assemble one tile from bands of at most `reader.band_rows` rows and encode it.
-
-    While more than a band is missing the next read takes a full band; the last one
-    takes exactly the rest, so no read crosses the tile's edges.
-    """
-    if spec.height > MAX_JPEG_SIDE:
-        raise DecodeError(f"tile {spec.tile_num} is {spec.height} px tall; JPEG allows {MAX_JPEG_SIDE}")
-
-    band = reader.band_rows(spec.page)
-
-    if band >= spec.height:
-        tile = reader.read(spec.page, spec.offset, spec.offset + spec.height)
-
-    else:
-        tile = Image.new("RGB", (reader.params.tile_width, spec.height), (255, 255, 255))
-
-        for start, end in bands_for(spec.height, band):
-            tile.paste(reader.read(spec.page, spec.offset + start, spec.offset + end), (0, start))
-
-    return EncodedImage(height=tile.height, jpeg=to_jpeg(tile, reader.params.jpeg_quality))
+def render(doc_type: DocType, path: str, tiles: list[Tile]) -> list[EncodedImage]:
+    """Read and encode the given tiles of one document, in order."""
+    return _run(doc_type, path, lambda reader: [encode_tile(reader, tile) for tile in tiles])
 
 
-def _run(reader: CpuReader, work):
-    """Run `work` on the worker's reader for this document, mapping memory exhaustion."""
+def encode_tile(reader: DocumentReader, tile: Tile) -> EncodedImage:
+    """Read one tile's rows and encode them."""
+    if tile.height > MAX_JPEG_SIDE:
+        raise DecodeError(f"tile {tile.num} is {tile.height} px tall; JPEG allows {MAX_JPEG_SIDE}")
+
+    image = reader.read(tile.offset, tile.offset + tile.height)
+
+    return EncodedImage(height=image.height, jpeg=to_jpeg(image, reader.params.jpeg_quality))
+
+
+def _run(doc_type: DocType, path: str, work):
+    """Run `work` on the worker's reader of this document, mapping memory exhaustion."""
     global _current
 
-    if (
-        _current is None
-        or type(_current) is not type(reader)
-        or (_current.path, _current.params) != (reader.path, reader.params)
-    ):
-        if _current is not None:
-            _current.close()
+    if type(_current) is not READERS[doc_type] or _current.path != path:
+        _forget()
+        _current = READERS[doc_type](path, _params)
 
-        _current = reader
+    reader = _current
 
     try:
-        return work(_current)
+        return work(reader)
 
     except MemoryError as exc:
         _forget()
@@ -89,12 +78,12 @@ def _run(reader: CpuReader, work):
         raise
 
     finally:
-        if _current is not None:
-            _current.trim()
+        reader.trim()
 
 
 def _forget() -> None:
-    """Close the cached reader after a failure: its state is no longer trustworthy."""
+    """Close the reader the worker holds: another document's turn, or a failure left
+    its state untrustworthy."""
     global _current
 
     if _current is not None:

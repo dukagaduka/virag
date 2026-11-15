@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..hashing import sha256_hex
+from .geometry import Tile
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,15 +22,22 @@ class EncodedImage:
 
 @dataclass(frozen=True)
 class RenderedTile:
-    """One finished tile: its bytes, dimensions and content hash."""
+    """One finished tile: its place in the document image, its bytes and content hash."""
 
     tile_num: int
+    offset: int
     height: int
     jpeg: bytes
     image_hash: str
 
 
     @classmethod
-    def build(cls, tile_num: int, height: int, jpeg: bytes) -> RenderedTile:
-        """Hash `jpeg` and wrap it as a tile."""
-        return cls(tile_num=tile_num, height=height, jpeg=jpeg, image_hash=sha256_hex(jpeg))
+    def build(cls, tile: Tile, image: EncodedImage) -> RenderedTile:
+        """Hash the encoded image of `tile` and wrap the two as a finished tile."""
+        return cls(
+            tile_num=tile.num,
+            offset=tile.offset,
+            height=image.height,
+            jpeg=image.jpeg,
+            image_hash=sha256_hex(image.jpeg),
+        )

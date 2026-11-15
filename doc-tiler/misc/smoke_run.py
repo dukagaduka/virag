@@ -158,7 +158,7 @@ def ingest(base_url: str, item: Item, out_root: Path) -> Record | None:
 
     print(
         f"  + {item.name}: {item.doc_type} -> doc_id={manifest['doc_id'][:12]}… "
-        f"tiles={manifest['tile_count']} page_height={manifest['page_height']}"
+        f"tiles={manifest['tile_count']} height={manifest['height']}"
     )
     return Record(item=item, doc_id=manifest["doc_id"], tiles=manifest["tiles"], out_dir=out_dir)
 

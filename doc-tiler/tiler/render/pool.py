@@ -1,11 +1,14 @@
-"""RenderPool: where a reader's work runs — the CPU process pool or Chromium.
+"""RenderPool: where rendering runs — the process pool of render workers and Chromium.
 
-The service hands it a reader and the tiles it wants; the pool decides what runs where,
-bounds it (bulk slots, worker memory, task time) and keeps itself alive. The process
-pool is pebble's: a task that hangs or kills its worker costs that one worker, which
-the pool replaces; the other tasks never notice. pebble gives the whole pool up when a
-worker dies while no task runs (it takes that for a failing initializer); the
-RenderPool then replaces the pool, so a stray kill of an idle worker costs a restart.
+It only executes: a document (`documents.py`) hands it a task for the workers or takes
+a Chromium slot, and the pool bounds the work (bulk slots, worker memory, task time)
+and keeps itself alive. It knows nothing about document types.
+
+The process pool is pebble's: a task that hangs or kills its worker costs that one
+worker, which the pool replaces; the other tasks never notice. pebble gives the whole
+pool up when a worker dies while no task runs (it takes that for a failing
+initializer); the RenderPool then replaces the pool, so a stray kill of an idle worker
+costs a restart.
 """
 
 from __future__ import annotations
@@ -13,10 +16,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import math
 import multiprocessing
 from concurrent.futures.process import BrokenProcessPool
-from contextlib import nullcontext
+from contextlib import AbstractAsyncContextManager, nullcontext
 from typing import Any, AsyncIterator, Callable
 
 import pebble
@@ -27,17 +29,13 @@ from ..errors import ApiError, bad_gateway, gateway_timeout, unprocessable
 from ..store.cache import AsyncLRU
 from . import render, worker
 from .browser import BrowserPool, BrowserUnavailable, RenderFailure, RenderTimeout
-from .geometry import TileSpec
-from .readers import CpuReader, DocumentReader, MhtmlReader, RenderParams
-from .types import EncodedImage
+from .readers import RenderParams
 
 log = logging.getLogger("tiler.render.pool")
 
 
 class RenderPool:
     """Owns the render process pool and the Chromium pool."""
-
-    MAX_BATCH = 16  # tiles per process-pool task: bounds the result size per hop
 
 
     def __init__(self, settings: Settings):
@@ -96,13 +94,13 @@ class RenderPool:
 
 
     def _new_pool(self) -> pebble.ProcessPool:
-        """A process pool whose workers cap their own memory."""
+        """A process pool whose workers cap their own memory and hold the render params."""
         # 'spawn': the parent runs an event loop and Playwright threads; forking those
         # into workers is a well-known source of deadlocks.
         return pebble.ProcessPool(
             max_workers=self.settings.render_workers,
             initializer=worker.init_worker,
-            initargs=(self.settings.render_worker_memory,),
+            initargs=(self.settings.render_worker_memory, self.params),
             context=multiprocessing.get_context("spawn"),
         )
 
@@ -159,6 +157,9 @@ class RenderPool:
 
             try:
                 return await self._attempt(fn, args)
+
+            except render.EmptyDocument as exc:
+                raise unprocessable(str(exc), "EMPTY_DOCUMENT") from exc
 
             except render.DecodeError as exc:
                 raise unprocessable(str(exc), "DECODE_FAILED") from exc
@@ -230,29 +231,11 @@ class RenderPool:
 
 
     # ------------------------------------------------------------------ #
-    # documents
+    # Chromium
     # ------------------------------------------------------------------ #
-    @contextlib.asynccontextmanager
-    async def open(
-        self, reader: DocumentReader, *, bulk: bool = False, page_heights: list[int] | None = None
-    ) -> AsyncIterator[Document]:
-        """A render session over one document. `page_heights`, when already known (a
-        stored doc), spares measuring them; `bulk` holds the session to bulk slots."""
-        if isinstance(reader, MhtmlReader):
-            reader.bind(self.browser, self.page_cache)
-
-            async with (self._bulk_browser if bulk else nullcontext()):
-                try:
-                    yield BrowserDocument(self, reader, bulk, page_heights)
-
-                finally:
-                    await reader.close()
-
-        elif isinstance(reader, CpuReader):
-            yield CpuDocument(self, reader, bulk, page_heights)
-
-        else:  # pragma: no cover - every reader is one of the two
-            raise TypeError(f"no executor for {type(reader).__name__}")
+    def browser_slot(self, bulk: bool) -> AbstractAsyncContextManager:
+        """What bulk work holds while it uses Chromium (interactive work holds nothing)."""
+        return self._bulk_browser if bulk else nullcontext()
 
 
     @contextlib.asynccontextmanager
@@ -278,127 +261,5 @@ class RenderPool:
 
     async def browser_call(self, fn: Callable[..., Any], *args: Any, bulk: bool = False) -> Any:
         """Run one Chromium operation (e.g. a URL capture) under the browser limits."""
-        async with (self._bulk_browser if bulk else nullcontext()):
-            async with self.browser_errors():
-                return await fn(*args)
-
-
-class Document:
-    """One document opened for rendering: its page heights and its tiles."""
-
-    # How many batches may render at once.
-    parallel: int = 1
-
-
-    def __init__(self, pool: RenderPool, reader: DocumentReader, bulk: bool, page_heights: list[int] | None):
-        self.pool = pool
-        self.reader = reader
-        self.bulk = bulk
-        self._heights = page_heights
-
-
-    async def page_heights(self) -> list[int]:
-        """Height of every page at tile width (measured once)."""
-        if self._heights is None:
-            self._heights = await self._measure()
-
-        return self._heights
-
-
-    async def _measure(self) -> list[int]:
-        raise NotImplementedError
-
-
-    def batches(self, specs: list[TileSpec]) -> list[list[TileSpec]]:
-        """How the tiles split into render tasks (in order)."""
-        return [specs] if specs else []
-
-
-    async def render(self, specs: list[TileSpec]) -> list[EncodedImage]:
-        """Render and encode one batch of tiles, in order."""
-        raise NotImplementedError
-
-
-class CpuDocument(Document):
-    """A PDF or an image: everything happens in the render workers."""
-
-    reader: CpuReader
-
-
-    def __init__(self, pool: RenderPool, reader: CpuReader, bulk: bool, page_heights: list[int] | None):
-        super().__init__(pool, reader, bulk, page_heights)
-        settings = pool.settings
-        self.parallel = settings.bulk_render_workers if bulk else settings.render_workers
-
-
-    async def _measure(self) -> list[int]:
-        return await self.pool.run(worker.page_heights, self.reader, bulk=self.bulk)
-
-
-    def batches(self, specs: list[TileSpec]) -> list[list[TileSpec]]:
-        """Even chunks across the parallel slots, at most MAX_BATCH tiles each; an image
-        stays one task (reading any tile decodes all of it)."""
-        if not specs or not self.reader.splits_batches:
-            return super().batches(specs)
-
-        size = max(1, min(RenderPool.MAX_BATCH, math.ceil(len(specs) / max(1, self.parallel))))
-
-        return [specs[i:i + size] for i in range(0, len(specs), size)]
-
-
-    async def render(self, specs: list[TileSpec]) -> list[EncodedImage]:
-        return await self.pool.run(worker.render_tiles, self.reader, specs, bulk=self.bulk)
-
-
-class BrowserDocument(Document):
-    """An MHTML archive: Chromium captures on the loop, the workers encode."""
-
-    reader: MhtmlReader
-
-
-    async def _measure(self) -> list[int]:
-        async with self.pool.browser_errors():
-            height = await self.reader.css_height()
-
-            if not self.reader.full_page_mode(height):
-                return [height]
-
-            png = await self.reader.full_page()
-
-        return [await self.pool.run(render.png_page_height, png, self.pool.params.tile_width, bulk=self.bulk)]
-
-
-    def batches(self, specs: list[TileSpec]) -> list[list[TileSpec]]:
-        """A whole-page capture encodes in one task; clip captures go one by one."""
-        if self._heights is not None and not self.reader.full_page_mode(self._heights[0]):
-            return [[spec] for spec in specs]
-
-        return super().batches(specs)
-
-
-    async def render(self, specs: list[TileSpec]) -> list[EncodedImage]:
-        heights = await self.page_heights()
-        p = self.pool.params
-
-        if self.reader.full_page_mode(heights[0]):
-            before = self.pool.page_cache.hits
-
-            async with self.pool.browser_errors():
-                png = await self.reader.full_page()
-
-            outcome = "hit" if self.pool.page_cache.hits > before else "miss"
-            metrics.CACHE.labels(cache="page", outcome=outcome).inc()
-
-            rows = [(s.offset, s.offset + s.height) for s in specs]
-
-            return await self.pool.run(render.crop_page_png, png, rows, p.tile_width, p.jpeg_quality, bulk=self.bulk)
-
-        out = []
-
-        for spec in specs:
-            async with self.pool.browser_errors():
-                png = await self.reader.clip(spec.offset, spec.height)
-
-            out.append(await self.pool.run(render.encode_strip, png, p.tile_width, p.jpeg_quality, bulk=self.bulk))
-
-        return out
+        async with self.browser_slot(bulk), self.browser_errors():
+            return await fn(*args)

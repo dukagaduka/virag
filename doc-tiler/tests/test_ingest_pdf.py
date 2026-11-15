@@ -22,7 +22,7 @@ async def test_pdf_sliced_round_trip_identity(tmp_path):
         manifest = await ingest_tiles(client, pdf_form(pdf))
 
         assert manifest["doc_type"] == "PDF"
-        assert manifest["page_height"] == 0
+        assert abs(manifest["height"] - 3 * round(875 * 842 / 595)) <= 6  # the pages, stacked
         # A4@200dpi → ~1238px tall per page; at height 500/overlap 100 that is several
         # strips, so slicing must produce strictly more tiles than pages.
         assert manifest["tile_count"] > 3
@@ -46,28 +46,35 @@ async def test_tile_returns_the_summary_without_tiles(client, sample_pdf):
     r = await client.post("/tile", **pdf_form(sample_pdf))
     assert r.status_code == 200, r.text
 
-    assert r.json() == {
+    summary = r.json()
+    height = summary.pop("height")
+
+    assert summary == {
         "doc_id": hashlib.sha256(sample_pdf).hexdigest(),
         "doc_type": "PDF",
         "source_url": None,
         "render_version": client.service.settings.render_version,
-        "page_height": 0,
         "tile_count": 3,
         "result": "rendered",
     }
 
+    tile_heights = []
+
     for tile_num in range(3):
         got = await client.get(
-            "/get_tile", params={"doc_id": r.json()["doc_id"], "tile_num": tile_num}
+            "/get_tile", params={"doc_id": summary["doc_id"], "tile_num": tile_num}
         )
         assert got.status_code == 200, got.text
+        tile_heights.append(int(got.headers["x-tile-height"]))
+
+    assert height == sum(tile_heights)  # the document image is its pages, stacked
 
 
 async def test_pdf_ingest_round_trip_identity(client, sample_pdf):
     manifest = await ingest_tiles(client, pdf_form(sample_pdf))
 
     assert manifest["doc_type"] == "PDF"
-    assert manifest["page_height"] == 0  # PDF: one tile per page, no full-page height
+    assert manifest["height"] == sum(t["height"] for t in manifest["tiles"])  # pages stacked, a tile each
     assert manifest["tile_count"] == 3  # one tile per page
     assert manifest["doc_id"] == hashlib.sha256(sample_pdf).hexdigest()
 

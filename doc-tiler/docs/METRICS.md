@@ -33,7 +33,7 @@ All metric names are prefixed `tiler_`.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `tiler_cache_total` | counter | `cache`, `outcome` | Tile/page cache outcomes. `cache` ∈ {`tile`, `page`}; `outcome` ∈ {`hit`, `miss`} (plus coalesced waits). |
+| `tiler_cache_total` | counter | `cache`, `outcome` | Tile/page cache outcomes. `cache` ∈ {`tile`, `page`}; `outcome` ∈ {`hit`, `miss`}; a request that waited on another request's render of the same key is a `miss`. |
 
 Hit ratio per cache: `rate(tiler_cache_total{outcome="hit"}[5m]) /
 rate(tiler_cache_total[5m])`. Live per-cache stats are also on `GET /info`.

@@ -40,10 +40,11 @@ return at once without re-rendering (unless `force`). The response is an `Ingest
 
 ```json
 {"doc_id": "…", "doc_type": "PDF", "source_url": null, "render_version": "…",
- "page_height": 0, "tile_count": 3, "result": "rendered"}
+ "height": 3714, "tile_count": 3, "result": "rendered"}
 ```
 
-`result` is `rendered` or `idempotent`.
+`height` is the height of the document image at tile width (for a PDF, its pages
+stacked top to bottom); `result` is `rendered` or `idempotent`.
 
 ```bash
 curl -s -X POST localhost:8080/tile -H "Authorization: Bearer $TILER_API_KEY" \
@@ -62,7 +63,7 @@ object per line:
 - `{"event":"tile","tile_num","width","height","image_hash","data"}` — one per tile;
   `data` is base64 JPEG. For PDFs, tiles stream **group-by-group** as each group finishes
   rendering, so their order is **not guaranteed monotonic**.
-- `{"event":"committed","doc_id","doc_type","source_url","render_version","page_height","tile_count","result"}`
+- `{"event":"committed","doc_id","doc_type","source_url","render_version","height","tile_count","result"}`
   — terminal **success** event; `result` is `rendered` or `idempotent`, as in `/tile`.
 - `{"event":"error","code","message"}` — terminal **failure** event.
 
@@ -97,7 +98,7 @@ right away with `TILER_REVISION_ON_RENDER_MISMATCH=true` (default), otherwise on
   service turns not-ready until it finishes). `force=true` re-renders **every** complete
   doc, quarantined ones included. `409 REVISION_RUNNING` while a job runs.
 
-Per doc, tiles and layout (`tile_count`, `page_heights`) are swapped in one transaction
+Per doc, tiles and layout (`tile_count`, `height`) are swapped in one transaction
 at the new `render_version`; `doc_id` and **metadata are never touched**. A doc that
 fails twice is **quarantined** (its tiles answer `410 QUARANTINED`) instead of holding
 the service back; re-ingesting its bytes, or the next revision at another

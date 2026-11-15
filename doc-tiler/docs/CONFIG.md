@@ -38,9 +38,9 @@ stored docs are re-rendered by a revision before the service serves again (see
 | `TILER_PDF_DPI` | `200` | PDF rasterization DPI. |
 | `TILER_CHROMIUM_REVISION` | Playwright's pin | Exact Chromium build; read from Playwright's `browsers.json` without launching. |
 
-(JPEG subsampling 4:2:0, progressive off, `LANCZOS` resize, the PDF band size (32 MiB of
-source raster) and the PDF supersampling cap (4 tile widths) are pinned in code; Pillow
-and PyMuPDF versions are also folded into `render_version`.)
+(JPEG subsampling 4:2:0, progressive off, `LANCZOS` resize and the PDF supersampling cap
+(4 tile widths) are pinned in code; Pillow and PyMuPDF versions are also folded into
+`render_version`.)
 
 ## Rendering & capture
 
@@ -68,7 +68,7 @@ and PyMuPDF versions are also folded into `render_version`.)
 |---|---|---|
 | `TILER_MAX_DOC_BYTES` | `67108864` | Reject larger uploads (`413`). |
 | `TILER_RENDER_WORKER_MEMORY` | `2147483648` | Address space one render worker may take (bytes). A document that needs more fails alone with `422 RENDER_TOO_LARGE`; `0` = no cap (logged as a warning). Size the container's memory limit from it — see [DEPLOYMENT.md](DEPLOYMENT.md#memory). |
-| `TILER_RENDER_TIMEOUT_SEC` | `120` | Execution time one render task may take (a batch of up to 16 tiles, or a page measurement); queueing does not count. Past it the task's worker is killed and replaced, and the document fails with `504 RENDER_TIMEOUT`. |
+| `TILER_RENDER_TIMEOUT_SEC` | `120` | Execution time one render task may take (a batch of up to 16 tiles, or laying a document out); queueing does not count. Past it the task's worker is killed and replaced, and the document fails with `504 RENDER_TIMEOUT`. |
 | `TILER_ALLOW_DELETE` | `false` | If `false`, `DELETE /doc/{id}` → `405`. |
 | `TILER_URL_FETCH_ENABLED` | `true` | Allow `URL` input type. |
 | `TILER_URL_ALLOW_PRIVATE` | `false` | If `false`, SSRF-block private targets (see [SECURITY.md](SECURITY.md)). |

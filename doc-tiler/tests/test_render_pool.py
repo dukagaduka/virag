@@ -16,9 +16,11 @@ from conftest import base_env, png_form, running_app, make_png
 
 from tiler.config import Settings
 from tiler.errors import ApiError
+from tiler.models import DocType
 from tiler.render import worker
+from tiler.render.geometry import Tile, Tiling
 from tiler.render.pool import RenderPool
-from tiler.render.readers import ImageReader, RenderParams
+from tiler.render.readers import RenderParams
 
 
 def _settings(tmp_path: Path, **overrides) -> Settings:
@@ -149,7 +151,7 @@ async def test_a_document_over_the_worker_memory_fails_alone(tmp_path):
 
     try:
         with pytest.raises(ApiError) as caught:
-            await pool.run(worker.page_heights, ImageReader(str(big), pool.params))
+            await pool.run(worker.plan, DocType.IMG, str(big))
 
         assert caught.value.status_code == 422
         assert caught.value.code == "RENDER_TOO_LARGE"
@@ -157,7 +159,7 @@ async def test_a_document_over_the_worker_memory_fails_alone(tmp_path):
 
         small = tmp_path / "small.png"
         small.write_bytes(make_png(400, 300))
-        assert await pool.run(worker.page_heights, ImageReader(str(small), pool.params)) == [656]
+        assert await pool.run(worker.plan, DocType.IMG, str(small)) == (656, [Tile(0, 0, 656)])
 
     finally:
         await pool.stop()
@@ -180,6 +182,13 @@ async def test_ingest_reports_a_too_large_document_in_band(tmp_path):
         assert ready["checks"]["render_pool"] == "ok"
 
 
-def test_render_params_are_the_pixel_settings():
-    params = RenderParams.from_settings(Settings(tile_width=900, jpeg_quality=70, pdf_dpi=150))
+def test_render_params_are_the_pixel_settings_and_the_tilings():
+    settings = Settings(
+        tile_width=900, jpeg_quality=70, pdf_dpi=150, tile_overlap=10, pdf_slice=True, pdf_tile_height=500
+    )
+    params = RenderParams.from_settings(settings)
+
     assert (params.tile_width, params.jpeg_quality, params.pdf_dpi) == (900, 70, 150)
+    assert params.tiling == Tiling(1024, 10, 28)
+    assert params.pdf_tiling == Tiling(500, 0, 28)
+    assert RenderParams.from_settings(Settings()).pdf_tiling.whole   # unsliced: a page is a tile

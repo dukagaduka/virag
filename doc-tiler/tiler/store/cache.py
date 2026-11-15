@@ -1,8 +1,9 @@
 """Async LRU cache with in-flight coalescing.
 
 Two consumers: final JPEG bytes keyed by `(doc_id, tile_num)`, and the full-page
-PNG keyed by `doc_id` so sequential strip requests reuse one render.
-Concurrent misses on the same key render exactly once.
+PNG keyed by the blob path so sequential strip requests reuse one render.
+Concurrent misses on the same key render exactly once. Every lookup is counted in
+`tiler_cache_total` under the cache's name.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Hashable
+
+from .. import metrics
 
 
 class AsyncLRU:
@@ -45,6 +48,7 @@ class AsyncLRU:
                 if key in self._data:
                     self._data.move_to_end(key)
                     self.hits += 1
+                    self._count("hit")
 
                     return self._data[key]
 
@@ -52,11 +56,14 @@ class AsyncLRU:
 
                 if pending is None:
                     self.misses += 1
+                    self._count("miss")
                     fut: asyncio.Future = asyncio.get_running_loop().create_future()
                     self._inflight[key] = fut
                     break
 
+                # Not served from the cache either: a miss that rides another's render.
                 self.coalesced += 1
+                self._count("miss")
 
             # Someone else is already producing this key: wait for their result.
             try:
@@ -106,6 +113,11 @@ class AsyncLRU:
         """Drop all cached values."""
         async with self._lock:
             self._data.clear()
+
+
+    def _count(self, outcome: str) -> None:
+        """Count one lookup's outcome."""
+        metrics.CACHE.labels(cache=self.name, outcome=outcome).inc()
 
 
     def stats(self) -> dict[str, int]:

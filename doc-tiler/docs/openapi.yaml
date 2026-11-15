@@ -386,13 +386,13 @@ components:
 
     IngestResult:
       type: object
-      required: [doc_id, doc_type, render_version, page_height, tile_count, result]
+      required: [doc_id, doc_type, render_version, height, tile_count, result]
       properties:
         doc_id:         { type: string, description: sha256(blob) hex. }
         doc_type:       { $ref: '#/components/schemas/DocType' }
         source_url:     { type: [string, "null"], format: uri }
         render_version: { type: string }
-        page_height:    { type: integer, description: Full-page height for web/mhtml/img; 0 for PDF. }
+        height:         { type: integer, description: Height of the document image at tile width (a PDF's pages stacked). }
         tile_count:     { type: integer }
         result:         { type: string, enum: [rendered, idempotent], description: idempotent when identical bytes were already stored. }
 
@@ -451,14 +451,14 @@ components:
 
     StreamCommitted:
       type: object
-      required: [event, doc_id, doc_type, render_version, page_height, tile_count, result]
+      required: [event, doc_id, doc_type, render_version, height, tile_count, result]
       properties:
         event:          { type: string, enum: [committed] }
         doc_id:         { type: string }
         doc_type:       { $ref: '#/components/schemas/DocType' }
         source_url:     { type: [string, "null"], format: uri }
         render_version: { type: string }
-        page_height:    { type: integer, description: Full-page height for web/mhtml/img; 0 for PDF. }
+        height:         { type: integer, description: Height of the document image at tile width (a PDF's pages stacked). }
         tile_count:     { type: integer }
         result:         { type: string, enum: [rendered, idempotent], description: As in IngestResult. }
 

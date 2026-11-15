@@ -101,7 +101,7 @@ async def test_incomplete_doc_is_hidden_and_swept(client, sample_pdf):
     rel = await svc.blobs.put(doc_id, sample_pdf)
     await svc.store.begin_doc(
         doc_id=doc_id, doc_type="PDF", blob_rel_path=rel, source_url=None,
-        page_height=0, tile_count=0, mime_type="application/pdf",
+        height=0, tile_count=0, mime_type="application/pdf",
         metadata=None, render_version=svc.settings.render_version,
     )
 
@@ -124,7 +124,7 @@ async def test_sweeper_skips_in_flight(client, sample_pdf):
     rel = await svc.blobs.put(doc_id, sample_pdf)
     await svc.store.begin_doc(
         doc_id=doc_id, doc_type="PDF", blob_rel_path=rel, source_url=None,
-        page_height=0, tile_count=0, mime_type="application/pdf",
+        height=0, tile_count=0, mime_type="application/pdf",
         metadata=None, render_version=svc.settings.render_version,
     )
 

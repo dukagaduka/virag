@@ -1,9 +1,8 @@
 """Application core: ingest, regeneration and revision over the stores.
 
-The API modules stay thin — parse, delegate here, serialise. The service plans tiles
-over a document's page heights and stores what the render pool builds; how a page is
-read (PDF raster, image, Chromium) is the readers' business, and where it runs is the
-render pool's.
+The API modules stay thin — parse, delegate here, serialise. The service stores what a
+document renders; what a document is, how it is cut into tiles and where it renders
+(PDF raster, image, Chromium) is the render layer's business (`render/documents.py`).
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import asyncio
 import base64
 import logging
 import time
-from collections import deque
 from contextlib import contextmanager
 from typing import Any, AsyncIterator, Iterator
 
@@ -25,9 +23,9 @@ from .errors import ApiError, bad_request, conflict, gone, not_found, unprocessa
 from .hashing import sha256_hex
 from .meta.schema import MetadataSchema, MetadataViolation, validate_metadata
 from .models import DocType
-from .render.geometry import TileSpec, plan_tiles
-from .render.pool import Document, RenderPool
-from .render.readers import DocumentReader, ImageReader, MhtmlReader, PdfReader
+from .render.documents import DOCUMENTS, Document
+from .render.geometry import Tile
+from .render.pool import RenderPool
 from .render.types import RenderedTile
 from .revision import Revision
 from .store.blobs import BlobStore
@@ -76,86 +74,13 @@ class TilerService:
     # ------------------------------------------------------------------ #
     # rendering
     # ------------------------------------------------------------------ #
-    def _reader(self, doc_type: DocType, doc_id: str) -> DocumentReader:
-        """The reader of a stored document's blob."""
+    def _document(
+        self, doc_type: DocType, doc_id: str, *, bulk: bool = False, height: int | None = None
+    ) -> Document:
+        """A stored document's blob, opened for rendering."""
         path = str(self.blobs.path(doc_id))
-        params = self.render.params
 
-        if doc_type == DocType.PDF:
-            return PdfReader(path, params)
-
-        if doc_type == DocType.IMG:
-            return ImageReader(path, params)
-
-        if doc_type == DocType.MHTML:
-            return MhtmlReader(path, params, self.settings)
-
-        raise bad_request(f"unsupported doc_type {doc_type!r}")  # pragma: no cover - guarded upstream
-
-
-    def _plan(self, doc_type: DocType, page_heights: list[int]) -> list[TileSpec]:
-        """The tiles of a document of this type with these page heights."""
-        s = self.settings
-
-        if doc_type == DocType.PDF:
-            if not page_heights:
-                raise unprocessable("PDF has no pages", "EMPTY_DOCUMENT")
-
-            return plan_tiles(
-                page_heights, s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height,
-                whole_pages=not s.pdf_slice,
-            )
-
-        return plan_tiles(page_heights, s.tile_height, s.tile_overlap, s.min_tile_height)
-
-
-    @staticmethod
-    def _layout(doc_type: DocType, page_heights: list[int]) -> dict[str, Any]:
-        """How a layout is stored: a PDF keeps its page heights, other types are one page."""
-        if doc_type == DocType.PDF:
-            return {"page_height": 0, "page_heights": page_heights}
-
-        return {"page_height": page_heights[0], "page_heights": None}
-
-
-    @staticmethod
-    def _page_heights(row: DocRow) -> list[int]:
-        """A stored doc's page heights."""
-        return row.page_heights if row.page_heights is not None else [row.page_height]
-
-
-    async def _build(self, doc: Document, specs: list[TileSpec]) -> AsyncIterator[list[RenderedTile]]:
-        """Render `specs` batch by batch, up to `doc.parallel` batches at once, yielding
-        each batch's tiles in tile order."""
-        batches = iter(doc.batches(specs))
-        pending: deque[tuple[list[TileSpec], asyncio.Task]] = deque()
-
-        def submit() -> None:
-            batch = next(batches, None)
-
-            if batch is not None:
-                task = asyncio.ensure_future(doc.render(batch))
-                # A batch abandoned after an earlier one failed must not log its error.
-                task.add_done_callback(lambda t: t.cancelled() or t.exception())
-                pending.append((batch, task))
-
-        for _ in range(max(1, doc.parallel)):
-            submit()
-
-        try:
-            while pending:
-                batch, task = pending.popleft()
-                encoded = await task
-                submit()
-
-                yield [
-                    RenderedTile.build(spec.tile_num, image.height, image.jpeg)
-                    for spec, image in zip(batch, encoded)
-                ]
-
-        finally:
-            for _, task in pending:
-                task.cancel()
+        return DOCUMENTS[doc_type](self.render, doc_type, path, bulk=bulk, height=height)
 
 
     @contextmanager
@@ -320,7 +245,7 @@ class TilerService:
             doc_type=effective_type,
             blob_rel_path=rel,
             source_url=source_url,
-            page_height=0,
+            height=0,
             tile_count=0,
             mime_type=mime,
             metadata=metadata,
@@ -340,19 +265,17 @@ class TilerService:
         count = [0]
 
         with self._measured(effective_type, "ingest", count):
-            async with self.render.open(self._reader(effective_type, doc_id), bulk=True) as doc:
-                page_heights = await doc.page_heights()
-
-                async for batch in self._build(doc, self._plan(effective_type, page_heights)):
+            async with self._document(effective_type, doc_id, bulk=True) as doc:
+                async for batch in doc.render_all(await doc.plan()):
                     await self.store.append_tiles(doc_id, batch)
 
                     for tile in batch:
                         count[0] += 1
                         yield {"event": "tile", "tile": tile}
 
-        layout = self._layout(effective_type, page_heights)
+                height = doc.height
 
-        await self.store.finish_doc(doc_id, tile_count=count[0], **layout)
+        await self.store.finish_doc(doc_id, tile_count=count[0], height=height)
         await self._invalidate(doc_id)
 
         metrics.DOCS.set(await self.store.count_docs())
@@ -364,7 +287,7 @@ class TilerService:
             "doc_type": effective_type,
             "source_url": source_url,
             "render_version": self.settings.render_version,
-            "page_height": layout["page_height"],
+            "height": height,
             "tile_count": count[0],
             "result": "rendered",
         }
@@ -387,7 +310,11 @@ class TilerService:
                 yield {
                     "event": "tile",
                     "tile": RenderedTile(
-                        tile_num=tile.tile_num, height=tile.height, jpeg=jpeg, image_hash=tile.image_hash
+                        tile_num=tile.tile_num,
+                        offset=tile.offset,
+                        height=tile.height,
+                        jpeg=jpeg,
+                        image_hash=tile.image_hash,
                     ),
                 }
 
@@ -397,7 +324,7 @@ class TilerService:
             "doc_type": row.doc_type,
             "source_url": row.source_url,
             "render_version": row.render_version,
-            "page_height": row.page_height,
+            "height": row.height,
             "tile_count": row.tile_count,
             "result": "idempotent",
         }
@@ -415,24 +342,24 @@ class TilerService:
 
 
     async def revise_doc(self, row: DocRow) -> None:
-        """Re-render one stored doc from its blob and swap its tiles and layout in place
+        """Re-render one stored doc from its blob and swap its tiles and height in place
         at the current render_version (doc_id and metadata are untouched)."""
         self._require_blob(row)
         tiles: list[RenderedTile] = []
         count = [0]
 
         with self._measured(row.doc_type, "revise", count):
-            async with self.render.open(self._reader(row.doc_type, row.doc_id)) as doc:
-                page_heights = await doc.page_heights()
-
-                async for batch in self._build(doc, self._plan(row.doc_type, page_heights)):
+            async with self._document(row.doc_type, row.doc_id) as doc:
+                async for batch in doc.render_all(await doc.plan()):
                     tiles.extend(batch)
+
+                height = doc.height
 
             count[0] = len(tiles)
 
         await self.store.replace_render(
             row.doc_id,
-            **self._layout(row.doc_type, page_heights),
+            height=height,
             tile_count=len(tiles),
             render_version=self.settings.render_version,
             tiles=tiles,
@@ -524,11 +451,7 @@ class TilerService:
             raise not_found(f"tile {tile_num} of {doc_id!r} is missing", "UNKNOWN_TILE")
 
         key = (doc_id, tile_num)
-        before = self.tile_cache.hits
-        jpeg = await self.tile_cache.get_or_create(key, lambda: self._regenerate(row, tile_num))
-        outcome = "hit" if self.tile_cache.hits > before else "miss"
-
-        metrics.CACHE.labels(cache="tile", outcome=outcome).inc()
+        jpeg = await self.tile_cache.get_or_create(key, lambda: self._regenerate(row, tile_row))
 
         if verify:
             actual = sha256_hex(jpeg)
@@ -549,25 +472,14 @@ class TilerService:
         return jpeg, tile_row, row
 
 
-    async def _regenerate(self, row: DocRow, tile_num: int) -> bytes:
-        """Re-render one tile from the stored blob: plan the doc, render just that tile."""
+    async def _regenerate(self, row: DocRow, tile_row: TileRow) -> bytes:
+        """Re-render one tile from the stored blob: the rows it was cut from at ingest."""
         self._require_blob(row)
-        page_heights = self._page_heights(row)
-        specs = self._plan(row.doc_type, page_heights)
-
-        if tile_num >= len(specs):  # pragma: no cover - the stored layout disagrees with tile_count
-            raise conflict(
-                f"doc_id {row.doc_id!r} plans {len(specs)} tiles but stores {row.tile_count}",
-                "RENDER_MISMATCH",
-                doc_id=row.doc_id,
-                tile_num=tile_num,
-            )
+        tile = Tile(tile_row.tile_num, tile_row.offset, tile_row.height)
 
         with self._measured(row.doc_type, "regenerate", [1]):
-            reader = self._reader(row.doc_type, row.doc_id)
-
-            async with self.render.open(reader, page_heights=page_heights) as doc:
-                [image] = await doc.render([specs[tile_num]])
+            async with self._document(row.doc_type, row.doc_id, height=row.height) as doc:
+                [image] = await doc.render([tile])
 
         return image.jpeg
 

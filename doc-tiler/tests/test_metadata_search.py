@@ -118,7 +118,7 @@ async def _populate(store, rows: int = 400) -> None:
     """Insert rows straight into SQLite — the planner needs a realistic table."""
     async with store._lock:
         await store.db.executemany(
-            "INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, page_height, "
+            "INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, height, "
             "tile_count, mime_type, metadata, render_version, created_at, updated_at) "
             "VALUES (?,'PDF','x',NULL,0,1,'application/pdf',?,'v',?,?)",
             [

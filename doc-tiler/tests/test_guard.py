@@ -49,15 +49,15 @@ async def test_outdated_volume_is_fatal(tmp_path, caplog):
     async with running_app(env) as (client, _):
         pass  # initialise the volume
 
-    # Simulate a volume created before PDF strip slicing existed.
+    # Simulate a volume created before the document height was stored.
     with sqlite3.connect(env["TILER_DB_PATH"]) as db:
-        db.execute("ALTER TABLE docs DROP COLUMN page_heights")
+        db.execute("ALTER TABLE docs DROP COLUMN height")
 
     with pytest.raises(SystemExit) as exit_info:
         async with running_app(env) as (_, _svc):
             pass
     assert exit_info.value.code == 1
-    assert any("docs.page_heights" in r.message for r in caplog.records)
+    assert any("docs.height" in r.message for r in caplog.records)
 
 
 async def test_pixel_tier_change_on_empty_volume_serves(tmp_path, caplog):

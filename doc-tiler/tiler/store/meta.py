@@ -48,8 +48,7 @@ DDL = (
         doc_type       TEXT NOT NULL,
         blob_rel_path  TEXT NOT NULL,
         source_url     TEXT,
-        page_height    INTEGER NOT NULL,
-        page_heights   TEXT,
+        height         INTEGER NOT NULL,
         tile_count     INTEGER NOT NULL,
         mime_type      TEXT NOT NULL,
         metadata       TEXT,
@@ -63,6 +62,7 @@ DDL = (
     CREATE TABLE IF NOT EXISTS tiles (
         doc_id      TEXT NOT NULL,
         tile_num    INTEGER NOT NULL,
+        offset      INTEGER NOT NULL,
         height      INTEGER NOT NULL,
         image_hash  TEXT NOT NULL,
         PRIMARY KEY (doc_id, tile_num),
@@ -122,7 +122,7 @@ class DocRow:
     doc_type: DocType
     blob_rel_path: str
     source_url: str | None
-    page_height: int
+    height: int
     tile_count: int
     mime_type: str
     metadata: dict[str, Any]
@@ -130,7 +130,6 @@ class DocRow:
     created_at: int
     updated_at: int
     complete: bool = True
-    page_heights: list[int] | None = None
     quarantine_reason: str | None = None
 
 
@@ -142,18 +141,16 @@ class DocRow:
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> "DocRow":
-        """Build a DocRow from a SQLite row, decoding the metadata and page-heights JSON."""
+        """Build a DocRow from a SQLite row, decoding the metadata JSON."""
         raw = row["metadata"]
-        keys = row.keys()
-        raw_ph = row["page_heights"] if "page_heights" in keys else None
-        reason = row["quarantine_reason"] if "quarantine_reason" in keys else None
+        reason = row["quarantine_reason"] if "quarantine_reason" in row.keys() else None
 
         return cls(
             doc_id=row["doc_id"],
             doc_type=DocType(row["doc_type"]),
             blob_rel_path=row["blob_rel_path"],
             source_url=row["source_url"],
-            page_height=row["page_height"],
+            height=row["height"],
             tile_count=row["tile_count"],
             mime_type=row["mime_type"],
             metadata=orjson.loads(raw) if raw else {},
@@ -161,17 +158,17 @@ class DocRow:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             complete=bool(row["complete"]),
-            page_heights=orjson.loads(raw_ph) if raw_ph else None,
             quarantine_reason=reason,
         )
 
 
 @dataclass(frozen=True)
 class TileRow:
-    """A row from the `tiles` table: one tile's height and image hash."""
+    """A row from the `tiles` table: one tile's rows in the document image and its hash."""
 
     doc_id: str
     tile_num: int
+    offset: int
     height: int
     image_hash: str
 
@@ -258,8 +255,8 @@ def build_search_query(
         params.extend([created_at, created_at, doc_id])
 
     sql = (
-        "SELECT doc_id, doc_type, blob_rel_path, source_url, page_height, page_heights, "
-        "tile_count, mime_type, metadata, render_version, complete, created_at, updated_at, "
+        "SELECT doc_id, doc_type, blob_rel_path, source_url, height, tile_count, mime_type, "
+        "metadata, render_version, complete, created_at, updated_at, "
         f"{QUARANTINE_REASON} FROM docs"
     )
 
@@ -275,12 +272,13 @@ def build_search_query(
 class MetaStore:
     """Async wrapper over the SQLite database backing docs, tiles, and search."""
 
-    # Columns that older volumes lacked (volume id, streaming ingest, PDF strip
-    # slicing). They are in DDL for fresh volumes; an old volume without them is not
-    # migrated — the guard refuses it at startup instead.
+    # Columns that older volumes lacked (volume id, streaming ingest, the document
+    # height and the tile offsets). They are in DDL for fresh volumes; an old volume
+    # without them is not migrated — the guard refuses it at startup instead.
     REQUIRED_COLUMNS = {
         "service_meta": ("volume_id",),
-        "docs": ("complete", "page_heights"),
+        "docs": ("complete", "height"),
+        "tiles": ("offset",),
     }
 
 
@@ -461,7 +459,7 @@ class MetaStore:
     async def get_tiles(self, doc_id: str) -> list[TileRow]:
         """Return all tile rows for a doc, ordered by tile number."""
         cur = await self.db.execute(
-            "SELECT doc_id, tile_num, height, image_hash FROM tiles WHERE doc_id = ? "
+            "SELECT doc_id, tile_num, offset, height, image_hash FROM tiles WHERE doc_id = ? "
             "ORDER BY tile_num",
             (doc_id,),
         )
@@ -472,7 +470,7 @@ class MetaStore:
     async def get_tile(self, doc_id: str, tile_num: int) -> TileRow | None:
         """Return a single tile row, or None if absent."""
         cur = await self.db.execute(
-            "SELECT doc_id, tile_num, height, image_hash FROM tiles "
+            "SELECT doc_id, tile_num, offset, height, image_hash FROM tiles "
             "WHERE doc_id = ? AND tile_num = ?",
             (doc_id, tile_num),
         )
@@ -488,7 +486,7 @@ class MetaStore:
         doc_type: DocType,
         blob_rel_path: str,
         source_url: str | None,
-        page_height: int,
+        height: int,
         tile_count: int,
         mime_type: str,
         metadata: dict[str, Any] | None,
@@ -507,7 +505,7 @@ class MetaStore:
                 await self.db.execute("BEGIN IMMEDIATE")
                 await self.db.execute(
                     """
-                    INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, page_height,
+                    INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, height,
                                       tile_count, mime_type, metadata, render_version, complete,
                                       created_at, updated_at)
                     VALUES (?,?,?,?,?,?,?,?,?,0,?,?)
@@ -515,7 +513,7 @@ class MetaStore:
                         doc_type=excluded.doc_type,
                         blob_rel_path=excluded.blob_rel_path,
                         source_url=COALESCE(excluded.source_url, docs.source_url),
-                        page_height=excluded.page_height,
+                        height=excluded.height,
                         tile_count=excluded.tile_count,
                         mime_type=excluded.mime_type,
                         metadata=COALESCE(excluded.metadata, docs.metadata),
@@ -528,7 +526,7 @@ class MetaStore:
                         doc_type,
                         blob_rel_path,
                         source_url,
-                        page_height,
+                        height,
                         tile_count,
                         mime_type,
                         meta_json,
@@ -549,13 +547,12 @@ class MetaStore:
         self,
         doc_id: str,
         *,
-        page_height: int,
-        page_heights: list[int] | None,
+        height: int,
         tile_count: int,
         render_version: str,
         tiles: Sequence[RenderedTile],
     ) -> None:
-        """Single transaction: swap a doc's tiles and layout for a fresh render.
+        """Single transaction: swap a doc's tiles and height for a fresh render.
 
         Revision's write: only what a render produces changes — metadata and identity
         stay as they are — and any quarantine is lifted.
@@ -564,11 +561,10 @@ class MetaStore:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 await self.db.execute(
-                    "UPDATE docs SET page_height = ?, page_heights = ?, tile_count = ?, "
-                    "render_version = ?, updated_at = ? WHERE doc_id = ?",
+                    "UPDATE docs SET height = ?, tile_count = ?, render_version = ?, "
+                    "updated_at = ? WHERE doc_id = ?",
                     (
-                        page_height,
-                        dumps(page_heights),
+                        height,
                         tile_count,
                         render_version,
                         int(time.time()),
@@ -588,8 +584,8 @@ class MetaStore:
         await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
         await self.db.execute("DELETE FROM quarantine WHERE doc_id = ?", (doc_id,))
         await self.db.executemany(
-            "INSERT INTO tiles (doc_id, tile_num, height, image_hash) VALUES (?,?,?,?)",
-            [(doc_id, t.tile_num, t.height, t.image_hash) for t in tiles],
+            "INSERT INTO tiles (doc_id, tile_num, offset, height, image_hash) VALUES (?,?,?,?,?)",
+            [(doc_id, t.tile_num, t.offset, t.height, t.image_hash) for t in tiles],
         )
 
 
@@ -600,8 +596,9 @@ class MetaStore:
 
         async with self._lock:
             await self.db.executemany(
-                "INSERT OR REPLACE INTO tiles (doc_id, tile_num, height, image_hash) VALUES (?,?,?,?)",
-                [(doc_id, t.tile_num, t.height, t.image_hash) for t in tiles],
+                "INSERT OR REPLACE INTO tiles (doc_id, tile_num, offset, height, image_hash) "
+                "VALUES (?,?,?,?,?)",
+                [(doc_id, t.tile_num, t.offset, t.height, t.image_hash) for t in tiles],
             )
             await self.db.commit()
 
@@ -611,18 +608,16 @@ class MetaStore:
         doc_id: str,
         *,
         tile_count: int,
-        page_height: int,
-        page_heights: list[int] | None = None,
+        height: int,
     ) -> None:
         """Close a streaming ingest: fix the final counts and flip the doc to complete."""
         async with self._lock:
             await self.db.execute(
-                "UPDATE docs SET tile_count = ?, page_height = ?, page_heights = ?, "
-                "complete = 1, updated_at = ? WHERE doc_id = ?",
+                "UPDATE docs SET tile_count = ?, height = ?, complete = 1, updated_at = ? "
+                "WHERE doc_id = ?",
                 (
                     tile_count,
-                    page_height,
-                    dumps(page_heights),
+                    height,
                     int(time.time()),
                     doc_id,
                 ),
