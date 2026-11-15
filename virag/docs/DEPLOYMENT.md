@@ -84,7 +84,7 @@ copied from a tracked `.example` (the copies are git-ignored):
 |---|---|---|
 | `.env` | Compose only | `*_DEPLOY_*`: images, container names, published hosts/ports, volume paths. No container sees it. |
 | `virag.env` | virag | `VIRAG_*`, `QDRANT_*`, `VALKEY_*`, `RETRIEVER_*`, `RERANKER_*`, `TILER_*` (how virag reaches the tiler), `VLM_*` — see [CONFIG.md](CONFIG.md). Required: `QDRANT_VECTOR_SIZE`, `VLM_BASE_URL`, `VLM_MODEL_NAME`, `VALKEY_URL`. |
-| `tiler.env` | doc-tiler | the tiler's own `TILER_*` (key, geometry, pixel tier, pools, sweeper) — see doc-tiler's CONFIG.md. |
+| `tiler.env` | doc-tiler | the tiler's own `TILER_*` (key, geometry, pixel tier, pools) — see doc-tiler's CONFIG.md. |
 | `configs/valkey.conf` | Valkey | `requirepass`, AOF. |
 | `configs/qdrant.yaml` | Qdrant | `service.api_key`, merged over the image's defaults. |
 

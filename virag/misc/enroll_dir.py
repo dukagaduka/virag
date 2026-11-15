@@ -24,7 +24,7 @@ Usage:
     python misc/enroll_dir.py DIR --endpoint http://localhost:48000
     python misc/enroll_dir.py DIR -e http://host:8080 --recursive
     python misc/enroll_dir.py DIR -e http://host:8080 \
-        --metadata '{"project":"atlas","year":2026}' --force
+        --metadata '{"project":"atlas","year":2026}'
 
 Extra ``--metadata`` (a JSON object) is merged into every document's metadata;
 the per-file ``name`` always wins. See ``--help`` for the full flag list.
@@ -118,7 +118,6 @@ def enroll(
     item: Item,
     base_meta: dict,
     *,
-    force: bool,
     headers: dict,
     timeout: float,
 ) -> tuple[bool, str]:
@@ -126,12 +125,10 @@ def enroll(
     metadata = {**base_meta, "name": item.name}
     data = {"doc_type": item.doc_type, "metadata": json.dumps(metadata, ensure_ascii=False)}
     files = {"document": (item.path.name, item.path.read_bytes(), item.mime)}
-    params = {"force": "true"} if force else None
 
     try:
         resp = requests.post(
             f"{endpoint}/enroll",
-            params=params,
             data=data,
             files=files,
             headers=headers,
@@ -192,11 +189,6 @@ def main() -> int:
         default=1800,
         help="seconds to wait for one document's enroll (default: %(default)s)",
     )
-    ap.add_argument(
-        "--force",
-        action="store_true",
-        help="re-tile documents that already exist",
-    )
     args = ap.parse_args()
 
     endpoint = args.endpoint.rstrip("/")
@@ -233,7 +225,6 @@ def main() -> int:
             endpoint,
             item,
             base_meta,
-            force=args.force,
             headers=headers,
             timeout=args.timeout,
         )

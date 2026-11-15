@@ -124,7 +124,6 @@ retrievable. `multipart/form-data`.
 | `document` | file | The bytes (required unless `doc_type=URL`). |
 | `url` | form | The URL (for `doc_type=URL`). |
 | `metadata` | form | A JSON **object** as a string. Should include `name`. |
-| `force` | query | Re-tile even if the doc already exists. |
 | `allow_missing_name` | query | Opt out of the name requirement (see below). |
 
 **Naming policy.** Every enrolled document is named: `metadata.name` must be a
@@ -138,8 +137,11 @@ than duplicating them. A document that produces zero tiles enrolls nothing (repo
 and upserts tiles in batches as they arrive — it never buffers the whole document in
 memory, so arbitrarily large documents (e.g. a 920-page PDF) enroll fully without hitting
 a render timeout. The request/response contract above is unchanged. On any failure
-mid-enroll the document's partial points are rolled back out of Qdrant; the tiler doc is
-left in place and marked pending so [reconcile](ARCHITECTURE.md) heals or sweeps it later.
+mid-enroll the document's partial points are rolled back out of Qdrant. A document the
+tiler already held stays there, marked pending, so [reconcile](ARCHITECTURE.md) heals it
+later; a new one the tiler drops itself, since its ingest never committed. Enrolling
+bytes the tiler already holds does not render them again and leaves the tiler's metadata
+as it is.
 
 Response:
 

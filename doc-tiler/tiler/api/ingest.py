@@ -5,12 +5,14 @@ from __future__ import annotations
 from typing import Annotated
 
 import orjson
-from fastapi import APIRouter, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..errors import bad_request
 from ..models import DocType, IngestResult
-from .deps import ERROR_RESPONSES, check_declared_size, parse_metadata_field, read_capped, service
+from ..service import TilerService
+from ..store.blobs import Incoming
+from .deps import ERROR_RESPONSES, capped_chunks, check_declared_size, parse_metadata_field, service
 
 router = APIRouter()
 
@@ -36,6 +38,15 @@ def _validate_ingest_inputs(doc_type: str, document: UploadFile | None) -> DocTy
     return doc_type
 
 
+async def _spool(svc: TilerService, doc_type: DocType, document: UploadFile | None) -> Incoming | None:
+    """Save the uploaded document to disk before any work starts on it; the service
+    takes the spooled upload over. A URL ingest brings no document."""
+    if document is None or doc_type == DocType.URL:
+        return None
+
+    return await svc.blobs.spool(capped_chunks(document, svc.settings.max_doc_bytes))
+
+
 @router.post(
     "/tile",
     response_model=IngestResult,
@@ -49,7 +60,6 @@ async def ingest_document(
     document: Annotated[UploadFile | None, File()] = None,
     url: Annotated[str | None, Form()] = None,
     metadata: Annotated[str | None, Form()] = None,
-    force: Annotated[bool, Query()] = False,
 ) -> IngestResult:
     """Ingest a document into the store and return its identity and tile count."""
     svc = service(request)
@@ -57,18 +67,10 @@ async def ingest_document(
 
     check_declared_size(request, svc.settings.max_doc_bytes)
 
-    data = None
+    meta_obj = parse_metadata_field(metadata)
+    upload = await _spool(svc, doc_type, document)
 
-    if document is not None and doc_type != DocType.URL:
-        data = await read_capped(document, svc.settings.max_doc_bytes)
-
-    result = await svc.ingest(
-        doc_type=doc_type,
-        data=data,
-        url=url,
-        metadata=parse_metadata_field(metadata),
-        force=force,
-    )
+    result = await svc.ingest(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj)
 
     return IngestResult(**result)
 
@@ -85,7 +87,6 @@ async def ingest_document_stream(
     document: Annotated[UploadFile | None, File()] = None,
     url: Annotated[str | None, Form()] = None,
     metadata: Annotated[str | None, Form()] = None,
-    force: Annotated[bool, Query()] = False,
 ) -> StreamingResponse:
     """The `/tile` ingest, streamed tile by tile (NDJSON) and terminated by `committed`.
 
@@ -96,17 +97,12 @@ async def ingest_document_stream(
     doc_type = _validate_ingest_inputs(doc_type, document)
 
     check_declared_size(request, svc.settings.max_doc_bytes)
-    data = None
-
-    if document is not None and doc_type != DocType.URL:
-        data = await read_capped(document, svc.settings.max_doc_bytes)
 
     meta_obj = parse_metadata_field(metadata)
+    upload = await _spool(svc, doc_type, document)
 
     async def ndjson():
-        async for event in svc.ingest_stream(
-            doc_type=doc_type, data=data, url=url, metadata=meta_obj, force=force
-        ):
+        async for event in svc.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj):
             yield orjson.dumps(event) + b"\n"
 
     return StreamingResponse(ndjson(), media_type="application/x-ndjson")

@@ -82,7 +82,9 @@ async def test_mhtml_render_is_deterministic(browser_env, tmp_path):
     async with running_app(browser_env) as (client, svc):
         blob = await capture_fixture(svc, tmp_path, rows=12)
         first = await ingest_tiles(client, mhtml_form(blob))
-        second = await ingest_tiles(client, mhtml_form(blob), force="true")
+        assert (await client.delete(f"/doc/{first['doc_id']}")).status_code == 204
+        second = await ingest_tiles(client, mhtml_form(blob))
+        assert second["result"] == "rendered"
         assert [t["image_hash"] for t in first["tiles"]] == [
             t["image_hash"] for t in second["tiles"]
         ]

@@ -20,7 +20,7 @@ omit the header — add `-H "Authorization: Bearer $TILER_API_KEY"` to each.
 ### `POST /tile` — ingest
 
 `multipart/form-data`. Renders a document at the fixed geometry and stores it: the
-original blob, one row per tile (height, `image_hash`) and the metadata. Tiles
+original blob, one row per tile (offset, height, `image_hash`) and the metadata. Tiles
 themselves are not returned — `/get_tile` regenerates any of them; `POST /tile/stream`
 (below) is the same ingest that also streams the tiles as they render.
 
@@ -31,12 +31,12 @@ Body fields:
 - `url` — the URL (required iff `doc_type=URL`).
 - `metadata` — a JSON **object** serialized as a string (optional).
 
-Query flags:
-
-- `force` (default `false`) — re-render even if this `doc_id` already exists.
-
-**Idempotent** on `doc_id = sha256(blob)`: identical bytes of an already-complete doc
-return at once without re-rendering (unless `force`). The response is an `IngestResult`:
+The upload is saved to disk first and hashed on the way; `doc_id = sha256(blob)`.
+**Idempotent** on it: bytes the store already holds and serves are not rendered again
+(`result: idempotent`), and their metadata stays as it is — metadata changes through
+its own routes. A quarantined doc is rendered again, which lifts its quarantine. While
+one request ingests a document, another bringing the same bytes is refused with
+`409 INGEST_IN_PROGRESS`. The response is an `IngestResult`:
 
 ```json
 {"doc_id": "…", "doc_type": "PDF", "source_url": null, "render_version": "…",
@@ -54,8 +54,7 @@ curl -s -X POST localhost:8080/tile -H "Authorization: Bearer $TILER_API_KEY" \
 
 ### `POST /tile/stream` — streaming ingest (NDJSON)
 
-The `POST /tile` ingest — same form fields, same `force` flag — that also streams every
-tile it renders. It returns `application/x-ndjson` (newline-delimited JSON), one event
+The `POST /tile` ingest — same form fields — that also streams every tile it renders. It returns `application/x-ndjson` (newline-delimited JSON), one event
 object per line:
 
 - `{"event":"begin","doc_id","doc_type","source_url","render_version"}` — emitted first,
@@ -67,17 +66,19 @@ object per line:
   — terminal **success** event; `result` is `rendered` or `idempotent`, as in `/tile`.
 - `{"event":"error","code","message"}` — terminal **failure** event.
 
-The doc is persisted **incrementally**: it stays incomplete (`complete=0`, see below)
-until the final tile, then flips to complete and `committed` is emitted. Pre-flight errors
+The doc is known to the store from `begin` on — its row is there, **incomplete**, so a
+client can refer to it (list it, patch its metadata) while the tiles stream — but
+nothing of it is served before `committed`: its tiles and its blob reach the store
+together, when the last tile has rendered. Pre-flight errors
 (unknown `doc_type` → `400`, oversize → `413`, media mismatch → `415`) are returned as
 normal HTTP errors **before** the stream begins. Once the `200` stream has started, any
 failure is reported as an in-stream `error` event (the HTTP status is already `200`) — the
 **absence of a `committed` event** is the client's signal that the ingest did not complete.
-A stream that dies mid-way leaves a swept-able partial doc, never a servable half-doc.
-Idempotent like `/tile`: identical bytes of an already-**complete** doc replay the stored
-tiles (regenerated, verified against their hashes) as the same event stream without
-re-rendering (unless `force`); a quarantined doc is re-rendered instead, which lifts its
-quarantine.
+An ingest that does not commit — an error, a client that went away, a killed process —
+leaves nothing behind: its row and its upload are removed (at the next start, for a
+killed process). Idempotent like `/tile`: bytes already stored and served replay the
+stored tiles (regenerated, verified against their hashes) as the same event stream
+without re-rendering.
 
 ### Revision — `GET /revision`, `POST /revision`
 
@@ -104,8 +105,7 @@ fails twice is **quarantined** (its tiles answer `410 QUARANTINED`) instead of h
 the service back; re-ingesting its bytes, or the next revision at another
 `render_version`, retries it. A render-worker crash or an unavailable Chromium aborts
 the job (`state=failed`, still not serving). Before the first write the DB is copied to
-`<TILER_DB_PATH>.bak-<previous render_version>` — the rollback point. Incomplete
-(streaming) docs are not revised; the sweeper owns them. The job is resumable: a restart
+`<TILER_DB_PATH>.bak-<previous render_version>` — the rollback point. The job is resumable: a restart
 picks up the docs still at another `render_version` (a forced job is not resumed).
 
 ### `GET /get_tile?doc_id=&tile_num=&verify=` — regenerate one tile
@@ -158,8 +158,8 @@ Body: `{filters?, limit, cursor}`.
   naming it. There is no fallback scan.
 - **No filters / omitted** → list all documents, newest first.
 - Cursor pagination on `(created_at, doc_id)`; response `{items: DocSummary[],
-  next_cursor}`. Each `DocSummary` carries `complete` (bool — `false` while a streaming
-  ingest is still in flight or crashed), `quarantined` (bool — a revision could not
+  next_cursor}`. Each `DocSummary` carries `complete` (bool — `false` while the doc's
+  first ingest is still in flight), `quarantined` (bool — a revision could not
   re-render it) and `render_version` alongside the usual fields.
 
 ```bash
@@ -191,9 +191,9 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 | `400` | Unknown `doc_type`, `tile_num` out of range, undeclared filter key, unsupported op, numeric op on a text field, bad cursor. |
 | `401` | Missing or wrong `TILER_API_KEY` (`UNAUTHORIZED`). |
 | `403` | SSRF policy block. |
-| `404` | Unknown `doc_id`; `GET /get_tile` on an incomplete doc (`DOC_INCOMPLETE`). |
+| `404` | Unknown `doc_id`; `GET /get_tile` or `GET /doc/{id}` on a doc whose ingest has not committed (`DOC_INCOMPLETE`). |
 | `405` | `DELETE` with `TILER_ALLOW_DELETE=false`. |
-| `409` | `image_hash` mismatch on regeneration (`RENDER_MISMATCH`); `POST /revision` while one runs (`REVISION_RUNNING`). |
+| `409` | `image_hash` mismatch on regeneration (`RENDER_MISMATCH`); `POST /revision` while one runs (`REVISION_RUNNING`); an ingest of, or `DELETE` on, a doc another request is ingesting (`INGEST_IN_PROGRESS`). |
 | `410` | `GET /get_tile` on a quarantined doc (`QUARANTINED`). |
 | `413` | Upload exceeds `TILER_MAX_DOC_BYTES`. |
 | `415` | Content-type mismatch. |

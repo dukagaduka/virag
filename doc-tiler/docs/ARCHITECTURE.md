@@ -145,10 +145,11 @@ is expensive to start; keep it warm and shared behind a semaphore.
 
 ### Flow examples
 
-- **PDF ingest:** handler (loop) stores the blob → one worker task lays the document
-  out (its height and its tiles) → batches of ≤16 tiles fan out across the pool (a task
-  carries the blob's path, never its bytes) → each batch's tiles go to the DB and the
-  stream in order.
+- **PDF ingest:** handler (loop) spools the upload to `.incoming`, hashing it → the row
+  goes in, incomplete → one worker task lays the document out (its height and its tiles)
+  → batches of ≤16 tiles fan out across the pool (a task carries the file's path, never
+  its bytes) → each batch's tiles go to the stream in order → the commit moves the blob
+  into the store and writes all the tile rows in one transaction.
 - **URL ingest:** handler takes the browser semaphore → Playwright navigates +
   `captureSnapshot(mhtml)` → releases → the snapshot is stored and read like any MHTML
   archive → DB → response.
@@ -195,7 +196,7 @@ CREATE TABLE IF NOT EXISTS docs (
     mime_type      TEXT NOT NULL,
     metadata       TEXT,                 -- raw JSON object (single source of truth); NULL if none
     render_version TEXT NOT NULL,        -- stamp (informational; geometry uniform by the startup guard)
-    complete       INTEGER NOT NULL DEFAULT 1,  -- 0 while a streaming ingest is mid-flight; see §9
+    complete       INTEGER NOT NULL DEFAULT 1,  -- 0 while the doc's first ingest is in flight; see §9
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL
 );
@@ -218,10 +219,8 @@ searchable by expression indexes created at startup, one per declared field (see
 "Metadata: declared schema + expression indexes").
 `tiles.width` is not stored (always `TILER_TILE_WIDTH`).
 
-The `complete` column **auto-migrates** on existing volumes: an `ALTER TABLE docs ADD
-COLUMN complete INTEGER NOT NULL DEFAULT 1` runs at startup, and pre-existing rows
-backfill to `complete=1` (they were written atomically). Both ingest routes write the
-row `complete=0` and flip it on the final tile (see §9).
+A doc's row is inserted `complete=0` when its ingest starts and flipped when the
+ingest commits (see §9); nothing ever turns a complete doc incomplete again.
 
 Everything storage-related sits behind `BlobStore` / `MetaStore` interfaces, keeping
 the FS→S3 and SQLite→Postgres swaps to a driver change.
@@ -231,14 +230,18 @@ the FS→S3 and SQLite→Postgres swaps to a driver change.
 ## 4. Blob storage (content-addressed)
 
 - Root `TILER_BLOB_DIR`; layout `<hash[0:2]>/<hash[2:4]>/<hash>`, `hash = doc_id`.
-- **Write-once, atomic:** temp file in the same dir → `fsync` → `os.rename`. If the
-  final path exists, skip (dedup).
+- **Spooled first.** An upload is written to `<root>/.incoming/<random>`, hashed as it
+  goes (never held in memory), and stays there while its document renders.
+- **Write-once, atomic commit:** `fsync` at the end of the spool, then one `os.rename`
+  into the content-addressed path when the ingest commits (same file system). If the
+  final path exists, the upload is dropped (dedup).
+- An ingest that does not commit removes its upload; `.incoming` is emptied at startup.
 - SQLite holds metadata only; blobs never in the DB.
 - Deliberately **isomorphic to S3** (`ab/cd/<hash>` → bucket key).
 
-**The blob is written before the DB row** (the reverse of the naive order). A blob
-without a row is inert and dedups away on the next ingest; a row without a blob is a
-permanently broken `/get_tile`.
+**The blob is committed before the tile rows** (the reverse of the naive order). A blob
+without its tiles is inert and dedups away on the next ingest; tiles without their blob
+are a permanently broken `/get_tile`.
 
 ---
 
@@ -454,36 +457,40 @@ content rasterizes. Ingest and regeneration call the *same* functions in
 ## 9. Idempotency, dedup, deletion
 
 - Idempotent ingest keyed by `doc_id = sha256(blob)`; identical bytes answer
-  `result=idempotent` (the stream replays the stored tiles) without re-render (unless `force`, or the doc is quarantined — then it is
-  re-rendered, lifting the quarantine).
-- Blob write skipped if the path exists.
+  `result=idempotent` (the stream replays the stored tiles) without re-render, and
+  their metadata is left as it is. A quarantined doc is rendered again, which lifts
+  the quarantine.
+- Blob commit skipped if the path exists.
 - URL caveat: re-fetching a changed URL yields a new `doc_id`; `source_url` is
   traceability, not identity.
 - `DELETE /doc/{doc_id}` (optional, flag-guarded by `TILER_ALLOW_DELETE`):
   cascade-delete rows + unlink blob.
 
-### Incomplete-doc lifecycle (streaming ingest)
+### An ingest, step by step
 
-Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipeline that
-persists a doc **incrementally**: it writes the `docs` row as `complete=0`, appends
-`tiles` rows as they render, and flips the row to `complete=1` on the final tile.
+Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipeline:
 
-- An **incomplete (`complete=0`) doc is not servable**: `GET /get_tile` on it returns
-  `404` with error code `DOC_INCOMPLETE`.
-- The **idempotency short-circuit only fires for complete docs** — an incomplete (crashed
-  or in-flight) doc is re-rendered rather than replayed. So a stream that dies mid-way
-  leaves a swept-able partial, never a servable half-doc.
-- `DocSummary` (search results) exposes `complete` and `render_version` so an operator can
-  see partials.
+1. **Spool.** The upload goes to `.incoming`, hashed on the way: `doc_id`.
+2. **Known already?** A doc that is stored and servable is not rendered: its tiles are
+   replayed (the stream) or its summary returned (`/tile`).
+3. **Row.** A new doc's row is inserted, `complete=0`, without tiles. The primary key
+   settles a race: of two requests bringing the same bytes one inserts, the other is
+   refused (`409 INGEST_IN_PROGRESS`), as is any later one until the first ends.
+4. **Render** from the spooled file. Tile rows are kept in memory; the stream route
+   sends each tile as it renders.
+5. **Commit.** The blob is renamed into the store, then one transaction writes every
+   tile row, the height and `complete=1`.
 
-### Incomplete-ingest sweeper (background)
-
-A background task (started in `lifespan`, interval `TILER_SWEEP_INTERVAL_SEC`) periodically
-deletes incomplete (`complete=0`) docs older than `TILER_INCOMPLETE_TTL_SEC`, **excluding
-any ingest currently in flight** (tracked in memory). Deletion is whole-doc (blob + rows).
-This reclaims storage from crashed/abandoned streaming ingests; because an incomplete doc
-was never fully enrolled downstream, reaping it is safe. The TTL defaults to `0` (disabled)
-and **must exceed the longest render** so an active render is never reaped.
+- An **incomplete doc is listed but not served**: `GET /get_tile` and `GET /doc/{id}`
+  answer `404 DOC_INCOMPLETE`, `DELETE` answers `409` — it belongs to its ingest. A
+  consumer can already refer to it (its metadata can be patched).
+- **An ingest that does not commit leaves nothing**: on an error or a client that went
+  away it removes its upload and the row it inserted, even while being cancelled; what
+  a killed process left (`complete=0` rows, `.incoming`) is removed at startup, when no
+  ingest can be alive.
+- **A stored doc is never touched before a commit.** The one stored doc that is
+  rendered again is a quarantined one; its row and tiles stay as they are until the
+  new render commits, so a failed attempt costs nothing.
 
 ### Revision (re-render before serving)
 
@@ -511,13 +518,12 @@ already quarantined at this one. None → it serves. Otherwise data routes answe
 4. **Open.** With nothing revisable left, `service_meta.render_version` is stamped and
    the gate opens.
 
-Incomplete docs are never revised (the sweeper owns them). Selection by `render_version`
+Incomplete docs do not outlive a start, so a revision never meets one. Selection by `render_version`
 makes the job resumable for free; a forced one (`force=true`: every complete doc) is
 not. Progress is in `GET /revision` and a `done/total, rate, ETA` log line every 30 s.
 Because nothing is served or written during the job, it races with nothing: no metadata
 PATCH to lose, no ingest in flight, no cached tile of the old layout (the process starts
-with empty caches). The gate, like `_inflight` and the caches, lives in the one tiler
-process. The render path is counted under `path="revise"` in the metrics; it never
+with empty caches). The gate, like the caches, lives in the one tiler process. The render path is counted under `path="revise"` in the metrics; it never
 touches any downstream (Qdrant).
 
 ### Bulk slots (ingest vs `get_tile`)

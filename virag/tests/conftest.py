@@ -349,7 +349,7 @@ class FakeTiler:
         self.max_concurrency = 0
         self.fail_tiles: set[tuple] = set()
 
-    async def tile_stream(self, doc_type, *, document=None, url=None, metadata=None, force=False):
+    async def tile_stream(self, doc_type, *, document=None, url=None, metadata=None):
         res = self._result
         yield {"event": "begin", "doc_id": res.doc_id, "doc_type": res.doc_type,
                "source_url": res.source_url, "render_version": res.render_version}

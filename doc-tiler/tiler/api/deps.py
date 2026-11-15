@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hmac
-from typing import Any
+from typing import Any, AsyncIterator
 
 import orjson
 from fastapi import Request, Security, UploadFile
@@ -23,7 +23,7 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     401: {"description": "Missing or invalid API key (TILER_API_KEY)."},
     403: {"description": "Blocked (e.g. SSRF)."},
     404: {"description": "Not found."},
-    409: {"description": "Render non-determinism, or a revision already running."},
+    409: {"description": "Render non-determinism, a revision already running, or a doc being ingested."},
     410: {"description": "Document quarantined by a revision."},
     413: {"description": "Payload too large."},
     415: {"description": "Content-type does not match declared doc_type."},
@@ -87,9 +87,8 @@ def check_declared_size(request: Request, limit: int) -> None:
         )
 
 
-async def read_capped(upload: UploadFile, limit: int) -> bytes:
-    """Read an upload in chunks, raising 413 once it exceeds the byte limit."""
-    chunks: list[bytes] = []
+async def capped_chunks(upload: UploadFile, limit: int) -> AsyncIterator[bytes]:
+    """An upload chunk by chunk, raising 413 once it exceeds the byte limit."""
     total = 0
 
     while chunk := await upload.read(_CHUNK):
@@ -100,9 +99,7 @@ async def read_capped(upload: UploadFile, limit: int) -> bytes:
                 f"document exceeds TILER_MAX_DOC_BYTES={limit}", read_bytes=total, limit=limit
             )
 
-        chunks.append(chunk)
-
-    return b"".join(chunks)
+        yield chunk
 
 
 def parse_metadata_field(raw: str | None) -> dict[str, Any] | None:

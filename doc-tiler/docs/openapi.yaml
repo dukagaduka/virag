@@ -27,13 +27,12 @@ paths:
       operationId: ingestDocument
       summary: Ingest a document into the store; the tiles are served by /get_tile.
       description: >
-        Renders at the fixed geometry and stores the original, one row per tile (height,
-        image_hash) and the metadata. Tiles are not returned: /get_tile regenerates any
-        of them, and /tile/stream is the same ingest that also streams them. Idempotent
-        on doc_id = sha256(blob): identical bytes of an already-complete doc return at
-        once with result=idempotent (unless force).
-      parameters:
-        - { name: force, in: query, required: false, schema: { type: boolean, default: false }, description: Re-render even if this doc_id already exists. }
+        Renders at the fixed geometry and stores the original, one row per tile (offset,
+        height, image_hash) and the metadata. Tiles are not returned: /get_tile
+        regenerates any of them, and /tile/stream is the same ingest that also streams
+        them. Idempotent on doc_id = sha256(blob): bytes already stored and served are
+        not rendered again (result=idempotent) and their metadata stays as it is. Bytes
+        another request is ingesting right now are refused with 409 INGEST_IN_PROGRESS.
       requestBody:
         required: true
         content:
@@ -79,22 +78,20 @@ paths:
       operationId: ingestDocumentStream
       summary: Ingest a document and stream its tiles as NDJSON, then a `committed` event.
       description: >
-        The /tile ingest (same form fields and force flag) that also streams every tile
+        The /tile ingest (same form fields) that also streams every tile
         it renders. The response is newline-delimited JSON
         (application/x-ndjson), one event object per line, streamed as tiles render: a
         `begin` event first (identity, so a client can build point ids before tiles
         arrive), a `tile` event per tile (for PDFs, streamed group-by-group as each group
         finishes — order is not guaranteed monotonic), then a terminal `committed` event
-        on success. The doc is persisted incrementally and stays incomplete until the
-        final tile; a stream that dies mid-way leaves a swept-able partial, never a
-        servable half-doc. Pre-flight errors (unknown doc_type 400, oversize 413, media
+        on success. The doc's row exists, incomplete, from `begin` on; its tiles and
+        blob reach the store together at `committed`, and an ingest that does not commit
+        leaves nothing behind. Pre-flight errors (unknown doc_type 400, oversize 413, media
         mismatch 415) are normal HTTP errors returned before streaming begins; once the
         200 stream has started, any failure is reported as an in-stream `error` event and
         the absence of a `committed` event is the client's signal that ingest did not
-        complete. Identical bytes of an already-complete doc replay the stored tiles as
-        the same event stream without re-rendering (unless force).
-      parameters:
-        - { name: force, in: query, required: false, schema: { type: boolean, default: false }, description: Re-render even if this doc_id already exists (skip the idempotency replay). }
+        complete. Bytes already stored and served replay the stored tiles as the same
+        event stream without re-rendering.
       requestBody:
         required: true
         content:
@@ -403,7 +400,7 @@ components:
         doc_id:         { type: string }
         doc_type:       { $ref: '#/components/schemas/DocType' }
         tile_count:     { type: integer }
-        complete:       { type: boolean, default: true, description: False while a streaming ingest is still in flight (or crashed); such a doc is not servable via /get_tile. }
+        complete:       { type: boolean, default: true, description: False while the doc's first ingest is still in flight; such a doc is not servable via /get_tile. }
         quarantined:    { type: boolean, default: false, description: True when a revision could not re-render the doc; its tiles answer 410 until it is re-ingested. }
         render_version: { type: [string, "null"], description: The render_version stamped on the doc at ingest. }
         created_at:     { type: integer, description: Unix epoch seconds. }
@@ -572,7 +569,7 @@ components:
                 Machine-readable error code. Non-exhaustive vocabulary: UNAUTHORIZED,
                 UNKNOWN_DOC_TYPE, AMBIGUOUS_INPUT, MISSING_URL, MISSING_FILE,
                 PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA, SSRF_BLOCKED, UNKNOWN_DOC,
-                DOC_INCOMPLETE, MISSING_BLOB, UNKNOWN_TILE, TILE_OUT_OF_RANGE, RANGE_NOT_SATISFIABLE,
+                DOC_INCOMPLETE, INGEST_IN_PROGRESS, MISSING_BLOB, UNKNOWN_TILE, TILE_OUT_OF_RANGE, RANGE_NOT_SATISFIABLE,
                 DELETE_DISABLED, UNDECLARED_FILTER_KEY, INVALID_METADATA_JSON,
                 METADATA_SCHEMA_VIOLATION, RENDER_MISMATCH, DECODE_FAILED,
                 EMPTY_DOCUMENT, RENDER_TOO_LARGE, RENDER_CRASHED, BROWSER_UNAVAILABLE,

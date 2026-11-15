@@ -140,7 +140,7 @@ def test_enroll_streams_in_batches(make_client):
 def test_enroll_stream_error_rolls_back(make_client):
     client, store, _, tiler = _client(make_client)
 
-    async def bad_stream(doc_type, *, document=None, url=None, metadata=None, force=False):
+    async def bad_stream(doc_type, *, document=None, url=None, metadata=None):
         yield {"event": "begin", "doc_id": "doc-a", "doc_type": "PDF",
                "source_url": None, "render_version": "rv-test"}
         yield {"event": "error", "code": "INTERNAL", "message": "boom"}

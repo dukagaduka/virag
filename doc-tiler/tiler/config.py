@@ -78,11 +78,6 @@ class Settings(BaseSettings):
     # replaced) and the document fails with 504 RENDER_TIMEOUT.
     render_timeout_sec: int = 120
 
-    # Incomplete-ingest sweeper: reap streaming ingests left incomplete this long
-    # (must exceed the longest render); 0 disables the sweeper.
-    incomplete_ttl_sec: int = 0
-    sweep_interval_sec: int = 300
-
     db_path: str = "/data/meta.sqlite"
     blob_dir: str = "/data/blobs"
     tmp_dir: str = ""  # defaults to <blob_dir>/../tmp

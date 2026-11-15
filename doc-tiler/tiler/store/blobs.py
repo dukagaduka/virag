@@ -1,6 +1,11 @@
 """Content-addressed blob storage on the local filesystem.
 
-Write-once and atomic: temp file in the destination directory → fsync → rename.
+An upload is first spooled to `.incoming/` under the blob root — hashed as it is
+written, never held in memory — and stays there while its document renders. Only a
+finished ingest moves it into the store (`commit`), by an atomic rename on the same
+file system; an abandoned one is dropped (`discard`), and whatever a killed process
+left behind is purged at startup.
+
 The layout `ab/cd/<hash>` is deliberately isomorphic to an S3 key, and everything
 goes through this interface so the filesystem can be swapped for object storage.
 """
@@ -8,24 +13,44 @@ goes through this interface so the filesystem can be swapped for object storage.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
-import tempfile
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import AsyncIterable, BinaryIO
 
 from ..hashing import blob_rel_path
 
 
+@dataclass(frozen=True)
+class Incoming:
+    """An upload spooled to disk and not in the store yet."""
+
+    path: Path
+    doc_id: str  # sha256 of the content
+    size: int
+
+
 class BlobStore:
     """Stores and retrieves blob bytes under a content-addressed directory tree."""
+
+    INCOMING = ".incoming"
 
 
     def __init__(self, root: str | Path):
         self.root = Path(root)
 
 
+    @property
+    def incoming_dir(self) -> Path:
+        """Where uploads wait while their documents render."""
+        return self.root / self.INCOMING
+
+
     def ensure_root(self) -> None:
         """Create the blob root and verify it is writable."""
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.incoming_dir.mkdir(parents=True, exist_ok=True)
         probe = self.root / ".writable"
         probe.write_bytes(b"")
         probe.unlink()
@@ -46,45 +71,69 @@ class BlobStore:
         return self.path(doc_id).exists()
 
 
-    def _put_sync(self, doc_id: str, data: bytes) -> str:
-        """Write the blob atomically, skipping if it already exists."""
-        dest = self.path(doc_id)
+    # ------------------------------------------------------------------ #
+    # incoming
+    # ------------------------------------------------------------------ #
+    async def spool(self, chunks: AsyncIterable[bytes] | bytes) -> Incoming:
+        """Write an upload to `.incoming/`, hashing it on the way; nothing is left
+        behind when the source fails."""
+        if isinstance(chunks, bytes):
+            chunks = self._once(chunks)
 
-        if dest.exists():  # dedup: identical content, identical path
-            return blob_rel_path(doc_id)
-
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
+        path = self.incoming_dir / uuid.uuid4().hex
+        digest = hashlib.sha256()
+        size = 0
+        fh = await asyncio.to_thread(open, path, "wb")
 
         try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(data)
-                fh.flush()
-                os.fsync(fh.fileno())
+            async for chunk in chunks:
+                await asyncio.to_thread(self._write, fh, digest, chunk)
+                size += len(chunk)
 
-            os.replace(tmp, dest)
-            dir_fd = os.open(dest.parent, os.O_RDONLY)
-
-            try:
-                os.fsync(dir_fd)
-
-            finally:
-                os.close(dir_fd)
+            await asyncio.to_thread(self._sync, fh)
 
         except BaseException:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-
+            path.unlink(missing_ok=True)
             raise
 
-        return blob_rel_path(doc_id)
+        finally:
+            fh.close()
+
+        return Incoming(path=path, doc_id=digest.hexdigest(), size=size)
 
 
-    async def put(self, doc_id: str, data: bytes) -> str:
-        """Store the blob and return its relative path."""
-        return await asyncio.to_thread(self._put_sync, doc_id, data)
+    async def head(self, incoming: Incoming, size: int = 4096) -> bytes:
+        """The first bytes of a spooled upload (for content sniffing)."""
+        return await asyncio.to_thread(self._head, incoming.path, size)
 
 
+    async def commit(self, incoming: Incoming) -> str:
+        """Move a spooled upload into the store and return its relative path. The
+        blob may be there already (identical content): the upload is then dropped."""
+        await asyncio.to_thread(self._commit, incoming.path, self.path(incoming.doc_id))
+
+        return blob_rel_path(incoming.doc_id)
+
+
+    async def discard(self, incoming: Incoming) -> None:
+        """Drop a spooled upload (a no-op once it is committed)."""
+        await asyncio.to_thread(incoming.path.unlink, missing_ok=True)
+
+
+    def purge_incoming(self) -> int:
+        """Drop every spooled upload — at startup, when no ingest can be alive. Returns
+        how many there were."""
+        leftovers = [path for path in self.incoming_dir.iterdir() if path.is_file()]
+
+        for path in leftovers:
+            path.unlink(missing_ok=True)
+
+        return len(leftovers)
+
+
+    # ------------------------------------------------------------------ #
+    # stored blobs
+    # ------------------------------------------------------------------ #
     async def read(self, doc_id: str) -> bytes:
         """Return the blob's bytes."""
         return await asyncio.to_thread(self.path(doc_id).read_bytes)
@@ -110,3 +159,49 @@ class BlobStore:
                 return False
 
         return await asyncio.to_thread(_unlink)
+
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    async def _once(data: bytes) -> AsyncIterable[bytes]:
+        """Bytes already in memory as a one-chunk upload."""
+        yield data
+
+
+    @staticmethod
+    def _write(fh: BinaryIO, digest: hashlib._Hash, chunk: bytes) -> None:
+        """Write and hash one chunk (off the event loop)."""
+        fh.write(chunk)
+        digest.update(chunk)
+
+
+    @staticmethod
+    def _sync(fh: BinaryIO) -> None:
+        """Flush a spooled upload to disk."""
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+    @staticmethod
+    def _head(path: Path, size: int) -> bytes:
+        with open(path, "rb") as fh:
+            return fh.read(size)
+
+
+    @staticmethod
+    def _commit(source: Path, dest: Path) -> None:
+        """Rename `source` to `dest` atomically, or drop it when `dest` exists."""
+        if dest.exists():  # dedup: identical content, identical path
+            source.unlink(missing_ok=True)
+
+            return
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, dest)
+        dir_fd = os.open(dest.parent, os.O_RDONLY)
+
+        try:
+            os.fsync(dir_fd)
+
+        finally:
+            os.close(dir_fd)

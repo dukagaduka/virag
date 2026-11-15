@@ -88,17 +88,6 @@ the service serves; meanwhile data routes answer `503 NOT_READY`. See
 | `TILER_REVISION_ON_RENDER_MISMATCH` | `true` | Start the revision on its own at startup. `false` → stay not-ready (`state=required`) until `POST /revision`, e.g. to pick the moment. |
 | `TILER_REVISION_CONCURRENCY` | `4` | Docs re-rendered at once. Each holds its blob and rendered tiles in memory; a doc's pages already fan out over the whole render pool. |
 
-## Incomplete-ingest sweeper
-
-A streaming ingest (`POST /tile/stream`) persists a doc incrementally and leaves it
-incomplete (`complete=0`) if it crashes mid-stream. This background task reclaims that
-storage. See [ARCHITECTURE.md](ARCHITECTURE.md) ("Incomplete-ingest sweeper").
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `TILER_INCOMPLETE_TTL_SEC` | `0` | Delete incomplete docs older than this many seconds. `0` disables the sweeper. **Must exceed the longest render** so an in-flight ingest is never reaped (an active ingest is also excluded in memory). |
-| `TILER_SWEEP_INTERVAL_SEC` | `300` | How often (seconds) the sweeper runs. |
-
 ## State (inside the container / named volume)
 
 | Variable | Default | Meaning |

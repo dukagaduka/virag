@@ -81,6 +81,9 @@ async def download_original(request: Request, doc_id: str) -> Response:
     if row is None:
         raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
 
+    if not row.complete:  # its blob is not in the store before the ingest commits
+        raise not_found(f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id)
+
     path = svc.blobs.path(doc_id)
 
     if not path.exists():

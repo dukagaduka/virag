@@ -14,6 +14,7 @@ license = { text = "Proprietary" }
 # list straight out of pyproject (see Dockerfile) — there is no requirements.txt.
 dependencies = [
     "fastapi==0.162.0",
+    "anyio==4.16.0",
     "pydantic==2.14.1",
     "pydantic-settings==2.16.1",
     "uvicorn[standard]==0.54.0",

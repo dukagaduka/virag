@@ -115,7 +115,6 @@ class TilerService(HttpService):
         document: bytes | None = None,
         url: str | None = None,
         metadata: dict | None = None,
-        force: bool = False,
     ):
         """Stream a stored ingest as NDJSON events (begin, tile*, committed | error).
 
@@ -128,7 +127,6 @@ class TilerService(HttpService):
             self.tile_stream_route,
             action="the ingest",
             retry=False,
-            params={"force": force},
             data=self._ingest_form(doc_type, url, metadata),
             files=self._ingest_files(document),
         ) as response:

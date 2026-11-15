@@ -212,14 +212,15 @@ documents enroll fully.
   request exceeds Qdrant's request limit: `QDRANT_CHUNK_SIZE` (per-request budget in MB)
   and `QDRANT_MAX_BATCH_CHUNKS` (hard cap on points per request).
 - **The invariant `Qdrant ⊆ Tiler`.** Every Qdrant point is backed by a tiler tile,
-  enforced by write order (the tiler persists a tile, *then* virag writes its point) and
-  by reconcile. A query therefore never returns a hit whose tile the tiler can't
+  enforced by write order (the tiler inserts the doc's row before its first tile leaves,
+  *then* virag writes points; the tiles are served once the ingest commits) and by
+  reconcile. A query therefore never returns a hit whose tile the tiler can't
   regenerate.
 - **Pending markers.** At the start of an enroll virag stamps the tiler's indexed
   metadata with `virag_started_at` (epoch at start) and `virag_enrolled_at` (`0` while
   pending); on success it sets `virag_enrolled_at` to the epoch. On any mid-enroll failure
-  the partial points are rolled back out of Qdrant; the tiler doc stays in place and
-  pending for reconcile to heal or sweep.
+  the partial points are rolled back out of Qdrant; a doc the tiler held before stays in
+  place and pending for reconcile to heal, a new one the tiler drops with its ingest.
 - **One collection per write.** At `begin` the enroll registers as a writer and is pinned
   to the physical collection the alias resolves to then (`Coordinator.writer`); every
   upsert and the rollback delete go there. A revision swapping the alias meanwhile never

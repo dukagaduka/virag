@@ -20,7 +20,6 @@ import orjson
 
 from ..meta.schema import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
 from ..models import DocType
-from ..render.types import RenderedTile
 
 PRAGMAS = (
     "PRAGMA journal_mode=WAL",
@@ -486,61 +485,43 @@ class MetaStore:
         doc_type: DocType,
         blob_rel_path: str,
         source_url: str | None,
-        height: int,
-        tile_count: int,
         mime_type: str,
         metadata: dict[str, Any] | None,
         render_version: str,
-    ) -> None:
-        """Open a streaming ingest: (re)create the doc row as incomplete, clear old tiles.
+    ) -> bool:
+        """Insert a new doc's row, incomplete and without tiles, for the ingest that
+        renders it; False when the doc_id is already there (the row is left as it is).
 
-        `complete=0` hides the doc from regeneration until `finish_doc`, so a stream
-        that dies mid-way leaves a swept-able partial rather than a servable half-doc.
+        `complete=0` keeps the doc from being served until `replace_render` commits it,
+        and the primary key lets exactly one of two concurrent ingests of the same
+        bytes through.
         """
         now = int(time.time())
-        meta_json = dumps(metadata, sort_keys=True)
 
         async with self._lock:
-            try:
-                await self.db.execute("BEGIN IMMEDIATE")
-                await self.db.execute(
-                    """
-                    INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, height,
-                                      tile_count, mime_type, metadata, render_version, complete,
-                                      created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,0,?,?)
-                    ON CONFLICT(doc_id) DO UPDATE SET
-                        doc_type=excluded.doc_type,
-                        blob_rel_path=excluded.blob_rel_path,
-                        source_url=COALESCE(excluded.source_url, docs.source_url),
-                        height=excluded.height,
-                        tile_count=excluded.tile_count,
-                        mime_type=excluded.mime_type,
-                        metadata=COALESCE(excluded.metadata, docs.metadata),
-                        render_version=excluded.render_version,
-                        complete=0,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        doc_id,
-                        doc_type,
-                        blob_rel_path,
-                        source_url,
-                        height,
-                        tile_count,
-                        mime_type,
-                        meta_json,
-                        render_version,
-                        now,
-                        now,
-                    ),
-                )
-                await self._replace_tiles(doc_id, ())
-                await self.db.commit()
+            cur = await self.db.execute(
+                """
+                INSERT INTO docs (doc_id, doc_type, blob_rel_path, source_url, height,
+                                  tile_count, mime_type, metadata, render_version, complete,
+                                  created_at, updated_at)
+                VALUES (?,?,?,?,0,0,?,?,?,0,?,?)
+                ON CONFLICT(doc_id) DO NOTHING
+                """,
+                (
+                    doc_id,
+                    doc_type,
+                    blob_rel_path,
+                    source_url,
+                    mime_type,
+                    dumps(metadata, sort_keys=True),
+                    render_version,
+                    now,
+                    now,
+                ),
+            )
+            await self.db.commit()
 
-            except BaseException:
-                await self.db.rollback()
-                raise
+            return cur.rowcount > 0
 
 
     async def replace_render(
@@ -550,19 +531,20 @@ class MetaStore:
         height: int,
         tile_count: int,
         render_version: str,
-        tiles: Sequence[RenderedTile],
+        tiles: Sequence[TileRow],
     ) -> None:
-        """Single transaction: swap a doc's tiles and height for a fresh render.
+        """Single transaction: swap a doc's tiles and height for a fresh render and
+        mark it complete.
 
-        Revision's write: only what a render produces changes — metadata and identity
-        stay as they are — and any quarantine is lifted.
+        The commit of an ingest and of a revision alike: only what a render produces
+        changes — metadata and identity stay as they are — and any quarantine is lifted.
         """
         async with self._lock:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 await self.db.execute(
                     "UPDATE docs SET height = ?, tile_count = ?, render_version = ?, "
-                    "updated_at = ? WHERE doc_id = ?",
+                    "complete = 1, updated_at = ? WHERE doc_id = ?",
                     (
                         height,
                         tile_count,
@@ -579,7 +561,7 @@ class MetaStore:
                 raise
 
 
-    async def _replace_tiles(self, doc_id: str, tiles: Sequence[RenderedTile]) -> None:
+    async def _replace_tiles(self, doc_id: str, tiles: Sequence[TileRow]) -> None:
         """Inside an open transaction: replace a doc's tile rows and lift its quarantine."""
         await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
         await self.db.execute("DELETE FROM quarantine WHERE doc_id = ?", (doc_id,))
@@ -589,50 +571,14 @@ class MetaStore:
         )
 
 
-    async def append_tiles(self, doc_id: str, tiles: Sequence[RenderedTile]) -> None:
-        """Insert a batch of tile rows for an in-progress streaming ingest."""
-        if not tiles:
-            return
-
+    async def delete_incomplete(self) -> int:
+        """Delete every doc an ingest left incomplete — at startup, when no ingest can
+        be alive. Returns how many there were."""
         async with self._lock:
-            await self.db.executemany(
-                "INSERT OR REPLACE INTO tiles (doc_id, tile_num, offset, height, image_hash) "
-                "VALUES (?,?,?,?,?)",
-                [(doc_id, t.tile_num, t.offset, t.height, t.image_hash) for t in tiles],
-            )
+            cur = await self.db.execute("DELETE FROM docs WHERE complete = 0")
             await self.db.commit()
 
-
-    async def finish_doc(
-        self,
-        doc_id: str,
-        *,
-        tile_count: int,
-        height: int,
-    ) -> None:
-        """Close a streaming ingest: fix the final counts and flip the doc to complete."""
-        async with self._lock:
-            await self.db.execute(
-                "UPDATE docs SET tile_count = ?, height = ?, complete = 1, updated_at = ? "
-                "WHERE doc_id = ?",
-                (
-                    tile_count,
-                    height,
-                    int(time.time()),
-                    doc_id,
-                ),
-            )
-            await self.db.commit()
-
-
-    async def list_incomplete(self, older_than: int) -> list[str]:
-        """Return doc_ids of incomplete ingests last touched before `older_than` (for the sweeper)."""
-        cur = await self.db.execute(
-            "SELECT doc_id FROM docs WHERE complete = 0 AND updated_at < ?",
-            (older_than,),
-        )
-
-        return [row["doc_id"] for row in await cur.fetchall()]
+            return cur.rowcount
 
 
     # ------------------------------------------------------------------ #
@@ -642,7 +588,7 @@ class MetaStore:
     def _revisable(render_version: str, force: bool) -> tuple[str, list[Any]]:
         """WHERE clause for the docs a revision re-renders: complete docs rendered by
         another render_version, minus those already quarantined at this one — or every
-        complete doc with `force`. Incomplete docs are the sweeper's, not revision's."""
+        complete doc with `force`. An incomplete doc belongs to the ingest rendering it."""
         if force:
             return "complete = 1", []
 

@@ -111,12 +111,11 @@ geometry is a fatal startup error (see [ARCHITECTURE.md](ARCHITECTURE.md)). To c
 it, deploy against a fresh volume and re-ingest; the fresh volume gets a new
 `volume_id`, so a bound consumer refuses it until it is re-bound.
 
-**Reclaiming crashed streaming ingests.** `POST /tile/stream` persists a doc incrementally
-and leaves it incomplete if the stream dies. Set `TILER_INCOMPLETE_TTL_SEC` (default `0` =
-disabled) to have a background sweeper delete incomplete docs older than that TTL — set it
-**above your longest render** so an in-flight ingest is never reaped — running every
-`TILER_SWEEP_INTERVAL_SEC` (default `300`). See [CONFIG.md](CONFIG.md) and
-[ARCHITECTURE.md](ARCHITECTURE.md).
+**Unfinished ingests clean up after themselves.** An upload waits in
+`<TILER_BLOB_DIR>/.incoming` while its document renders; an ingest that fails or loses its
+client removes its upload and its row at once, and whatever a killed process left is
+removed at the next start. Keep `.incoming` on the same file system as the blobs: the
+commit is a rename. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Running as a non-root user
 

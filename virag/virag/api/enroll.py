@@ -34,7 +34,6 @@ async def enroll(
     document: UploadFile | None = File(None),
     url: str | None = Form(None),
     metadata: str | None = Form(None),
-    force: bool = False,
     allow_missing_name: bool = False,
 ):
 
@@ -59,7 +58,7 @@ async def enroll(
     doc_bytes = await document.read() if document is not None else None
 
     filename = document.filename if document is not None else None
-    log.info("enroll request: doc_type=%s filename=%s force=%s", doc_type, filename, force)
+    log.info("enroll request: doc_type=%s filename=%s", doc_type, filename)
 
     # Streaming state, filled from the `begin` event and each `tile`. `physical` is the
     # collection the doc is written into, pinned at `begin`.
@@ -70,8 +69,8 @@ async def enroll(
     enrolled = 0
 
     async def flush() -> None:
-        # Embed one batch of tiles and upsert it; the tiler already persisted these
-        # tiles (write-then-send), so every point stays backed by a tile (Qdrant ⊆ Tiler).
+        # Embed one batch of tiles and upsert it; the tiler knows the doc since `begin`
+        # (Qdrant ⊆ Tiler) and serves its tiles once the ingest commits.
         nonlocal enrolled
         if not batch:
             return
@@ -98,7 +97,7 @@ async def enroll(
     async with AsyncExitStack() as writing:
         try:
             async for event in tiler.tile_stream(
-                doc_type, document=doc_bytes, url=url, metadata=meta_obj, force=force
+                doc_type, document=doc_bytes, url=url, metadata=meta_obj
             ):
                 kind = event.get("event")
 
@@ -147,14 +146,17 @@ async def enroll(
             raise ApiError(status_code=502, message="tiler stream ended without a committed event")
 
         except Exception:
-            # Roll the doc back out of Qdrant. It stays in the tiler (Tiler ⊇ Qdrant) and
-            # pending, so reconcile heals or sweeps it later. Not yet pinned, nothing was
-            # written — and the points of an earlier enroll must stay.
+            # Roll the doc back out of Qdrant. A doc the tiler held before stays there
+            # pending, so reconcile heals it later; a new one the tiler drops itself when
+            # its ingest ends without a commit. Not yet pinned, nothing was written — and
+            # the points of an earlier enroll must stay.
             if physical is not None:
+                
                 try:
                     await store.delete_by_doc(doc_id, collection=physical)
                 except Exception as cleanup_err:  # noqa: BLE001 - never mask the original failure
                     log.error("rollback delete_by_doc failed for doc_id=%s: %r", doc_id, cleanup_err)
+
             raise
 
 

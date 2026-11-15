@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sys
@@ -61,6 +60,17 @@ async def bootstrap(settings: Settings, schema: MetadataSchema) -> TilerService:
     except BaseException:
         await svc.store.close()
         raise
+
+    # No ingest outlives its process: drop what a killed one left half-done.
+    unfinished = await svc.store.delete_incomplete()
+    spooled = svc.blobs.purge_incoming()
+
+    if unfinished or spooled:
+        log.warning(
+            "removed %d unfinished ingest(s) and %d spooled upload(s) the previous run left behind",
+            unfinished,
+            spooled,
+        )
 
     created = await svc.store.create_metadata_indexes(index_statements(schema))
     dropped = await svc.store.drop_stale_metadata_indexes({f.index_name for f in schema.fields})
@@ -128,41 +138,13 @@ async def lifespan(app: FastAPI):
             "memory and draw the OOM killer instead of failing on its own"
         )
 
-    sweeper = asyncio.create_task(_run_sweeper(svc, settings))
-
     try:
         yield
 
     finally:
-        sweeper.cancel()
-
-        try:
-            await sweeper
-
-        except asyncio.CancelledError:
-            pass
-
         await svc.revision.close()
         await svc.stop_pools()
         await svc.store.close()
-
-
-async def _run_sweeper(svc: TilerService, settings: Settings) -> None:
-    """Periodically reap incomplete ingests older than the TTL (0 = disabled)."""
-    if settings.incomplete_ttl_sec <= 0:
-        return
-
-    while True:
-        await asyncio.sleep(settings.sweep_interval_sec)
-
-        try:
-            await svc.sweep_incomplete(settings.incomplete_ttl_sec)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as exc:  # noqa: BLE001 - a sweep must never crash the service
-            log.error("incomplete-ingest sweep failed: %r", exc)
 
 
 def create_app() -> FastAPI:

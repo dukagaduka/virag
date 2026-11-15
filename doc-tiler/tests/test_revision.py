@@ -162,21 +162,35 @@ async def test_second_revision_is_refused_while_one_runs(client, sample_pdf):
     await _revised(client.service)
 
 
-async def test_incomplete_doc_is_left_to_the_sweeper(tmp_path, sample_pdf):
-    """An incomplete ingest is not revisable: it never holds the service not-ready."""
+async def test_an_abandoned_reingest_leaves_a_quarantined_doc_as_it_was(tmp_path):
+    """Nothing of a stored doc changes before an ingest of its bytes commits."""
+    from tiler.models import DocType
+
     env = base_env(tmp_path)
-    async with running_app(env) as (_, svc):
-        rel = await svc.blobs.put("f" * 64, sample_pdf)
-        await svc.store.begin_doc(
-            doc_id="f" * 64, doc_type="PDF", blob_rel_path=rel, source_url=None,
-            height=0, tile_count=0, mime_type="application/pdf",
-            metadata=None, render_version=svc.settings.render_version,
-        )
+    png = make_png(875, 3000)
+    async with running_app(env) as (client, svc):
+        doc_id = (await client.post("/tile", **png_form(png))).json()["doc_id"]
+        await svc.blobs.delete(doc_id)                                  # its original is lost
     _age_volume(env["TILER_DB_PATH"])
 
-    async with running_app(env) as (_, svc):
-        assert svc.revision.serving and svc.revision._task is None
-        assert (await svc.store.get_doc("f" * 64)).complete is False
+    async with running_app(env) as (client, svc):
+        assert (await _revised(svc))["quarantined"] == 1
+        before = await svc.store.get_doc(doc_id)
+
+        stream = svc.ingest_stream(
+            doc_type=DocType.IMG, upload=await svc.blobs.spool(png), url=None, metadata=None
+        )
+        assert (await anext(stream))["event"] == "begin"
+        await stream.aclose()                                           # abandoned before it commits
+
+        assert await svc.store.get_doc(doc_id) == before                # still there, still quarantined
+        assert before.quarantined and before.complete
+        assert len(await svc.store.get_tiles(doc_id)) == before.tile_count
+
+        again = await client.post("/tile", **png_form(png))             # a finished one lifts it
+        assert again.status_code == 200 and again.json()["result"] == "rendered"
+        assert await svc.store.count_quarantined() == 0
+        assert (await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})).status_code == 200
 
 
 async def test_revision_keeps_pdf_strip_slicing(tmp_path):

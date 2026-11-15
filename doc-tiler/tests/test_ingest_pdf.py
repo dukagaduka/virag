@@ -112,11 +112,23 @@ async def test_idempotent_ingest_does_not_re_render(client, sample_pdf):
     assert _render_count(client.service, "PDF", "ingest") == before  # idempotent: no re-render
 
 
-async def test_force_re_renders(client, sample_pdf):
-    await client.post("/tile", **pdf_form(sample_pdf))
+async def test_ingest_of_stored_bytes_leaves_their_metadata(client, sample_pdf):
+    first = (await client.post("/tile", **pdf_form(sample_pdf, metadata='{"project": "a"}'))).json()
+    second = (await client.post("/tile", **pdf_form(sample_pdf, metadata='{"project": "b"}'))).json()
+
+    assert second["result"] == "idempotent"
+    metadata = (await client.get(f"/doc/{first['doc_id']}/metadata")).json()
+    assert metadata == {"project": "a"}                              # metadata changes through its own routes
+
+
+async def test_a_deleted_doc_renders_again(client, sample_pdf):
+    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
     before = _render_count(client.service, "PDF", "ingest")
-    r = await client.post("/tile", params={"force": "true"}, **pdf_form(sample_pdf))
-    assert r.status_code == 200
+
+    assert (await client.delete(f"/doc/{doc_id}")).status_code == 204
+    again = await client.post("/tile", **pdf_form(sample_pdf))
+
+    assert again.status_code == 200 and again.json()["result"] == "rendered"
     assert _render_count(client.service, "PDF", "ingest") == before + 1
 
 
