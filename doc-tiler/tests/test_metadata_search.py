@@ -140,6 +140,8 @@ async def _populate(store, rows: int = 400) -> None:
         await store.db.execute("ANALYZE")
         await store.db.commit()
 
+    await store.optimize()  # the read connection takes fresh statistics when it reopens, as at startup
+
 
 async def test_expression_index_is_used(client):
     """A declared-key filter is answered through idx_meta_*, not a table scan."""

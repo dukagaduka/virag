@@ -51,6 +51,43 @@ async def test_concurrent_tile_requests_render_once(client):
     assert client.service.tile_cache.coalesced >= 1
 
 
+async def test_reads_never_see_a_commit_half_way(client, sample_pdf):
+    """A read made while a commit is between its statements sees the doc as it was
+    committed last — not the transaction's own view, with the old tiles already gone."""
+    store = client.service.store
+    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+    before = await store.get_tiles(doc_id)
+    assert len(before) == 3
+
+    replace = store._replace_tiles
+    inside, release = asyncio.Event(), asyncio.Event()
+
+    async def held(doc_id, tiles):
+        await replace(doc_id, ())                                    # the old tiles are deleted…
+        inside.set()
+        await release.wait()                                         # …and the new ones not written yet
+        await replace(doc_id, tiles)
+
+    store._replace_tiles = held
+    commit = asyncio.create_task(
+        store.replace_render(doc_id, height=7, tile_count=1, render_version="rv-next", tiles=before[:1])
+    )
+    await inside.wait()
+
+    try:
+        assert await store.get_tiles(doc_id) == before
+        assert ((await store.get_doc(doc_id)).tile_count, (await store.get_doc(doc_id)).height) != (1, 7)
+        got = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 2})
+        assert got.status_code == 200, got.text
+
+    finally:
+        release.set()
+        await commit
+
+    assert await store.get_tiles(doc_id) == before[:1]               # committed: visible at once
+    assert (await store.get_doc(doc_id)).render_version == "rv-next"
+
+
 async def test_lru_evicts_and_coalesces():
     cache = AsyncLRU(capacity=2)
     calls = {"n": 0}

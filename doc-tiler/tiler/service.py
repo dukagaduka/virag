@@ -559,7 +559,7 @@ class TilerService:
         ok = True
 
         try:
-            await self.store.db.execute("SELECT 1")
+            await self.store.ping()
             checks["db"] = "ok"
 
         except Exception as exc:

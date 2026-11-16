@@ -169,7 +169,10 @@ once.
 ## 3. Data model (SQLite)
 
 Startup pragmas: `journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`,
-`foreign_keys=ON`. SQLite runs on a single connection serialized by one lock. The
+`foreign_keys=ON`. SQLite is used through two connections: writes go through one,
+serialized by a lock; reads through another, opened read-only. In WAL mode the reader
+sees committed data only, so a request never observes a commit half-way through (a doc
+already complete, its tiles not written yet), and reads do not queue behind writes. The
 workload is metadata-only (blobs live on disk), so transactions stay trivial while the
 event loop stays free.
 

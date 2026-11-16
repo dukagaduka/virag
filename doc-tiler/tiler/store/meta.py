@@ -1,8 +1,10 @@
 """SQLite metadata store for documents, tiles, and indexed search.
 
-Single connection, WAL, serialized through one lock — the workload is metadata
-only (blobs live on disk), so this keeps transactional semantics trivial and
-still leaves the event loop free. Everything the rest of the app needs from
+Two connections over one WAL database: writes go through one, serialized by a lock;
+reads through another, opened read-only, which sees committed data only — never a
+write transaction half-way through. The workload is metadata only (blobs live on
+disk), so this keeps transactional semantics trivial and still leaves the event loop
+free. Everything the rest of the app needs from
 persistence goes through `MetaStore`, so SQLite → Postgres stays a driver swap.
 """
 
@@ -13,6 +15,7 @@ import base64
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import aiosqlite
@@ -284,12 +287,13 @@ class MetaStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._db: aiosqlite.Connection | None = None
+        self._reader: aiosqlite.Connection | None = None
         self._lock: Any = None
 
 
     @property
     def db(self) -> aiosqlite.Connection:
-        """The open connection; raises if the store is not connected."""
+        """The open write connection; raises if the store is not connected."""
         if self._db is None:
             raise RuntimeError("MetaStore is not connected")
 
@@ -297,26 +301,49 @@ class MetaStore:
 
 
     async def connect(self) -> None:
-        """Open the connection and apply the startup pragmas."""
+        """Open the write connection, apply the startup pragmas, then open the
+        read-only one (the database file and its WAL mode must exist by then)."""
         self._lock = asyncio.Lock()
-        connection = aiosqlite.connect(self.db_path)
-        # aiosqlite runs SQLite on a plain (non-daemon) thread; if startup aborts
-        # before close(), a non-daemon thread would wedge interpreter shutdown.
-        connection.daemon = True
-        self._db = await connection
-        self._db.row_factory = aiosqlite.Row
+        self._db = await self._open(self.db_path)
 
         for pragma in PRAGMAS:
             await self._db.execute(pragma)
 
         await self._db.commit()
+        await self._open_reader()
 
 
     async def close(self) -> None:
-        """Close the connection if open."""
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        """Close the connections if open."""
+        for connection in (self._reader, self._db):
+            if connection is not None:
+                await connection.close()
+
+        self._reader = self._db = None
+
+
+    async def _open_reader(self) -> None:
+        """(Re)open the read-only connection."""
+        if self._reader is not None:
+            await self._reader.close()
+
+        self._reader = await self._open(f"{Path(self.db_path).resolve().as_uri()}?mode=ro", uri=True)
+        await self._read("PRAGMA busy_timeout=5000")
+
+
+    async def _read(self, sql: str, params: Sequence[Any] = ()) -> list[aiosqlite.Row]:
+        """Run a query on the read-only connection and return all its rows. Fetched to
+        the end at once: a statement left half-read would pin the connection to an old
+        snapshot."""
+        if self._reader is None:
+            raise RuntimeError("MetaStore is not connected")
+
+        return list(await self._reader.execute_fetchall(sql, params))
+
+
+    async def ping(self) -> None:
+        """Touch the database (the readiness probe)."""
+        await self._read("SELECT 1")
 
 
     async def create_tables(self) -> None:
@@ -333,8 +360,7 @@ class MetaStore:
         missing = []
 
         for table, columns in self.REQUIRED_COLUMNS.items():
-            cur = await self.db.execute(f"PRAGMA table_info({table})")
-            present = {row["name"] for row in await cur.fetchall()}
+            present = {row["name"] for row in await self._read(f"PRAGMA table_info({table})")}
 
             missing += [f"{table}.{column}" for column in columns if column not in present]
 
@@ -361,10 +387,9 @@ class MetaStore:
 
     async def drop_stale_metadata_indexes(self, keep: set[str]) -> list[str]:
         """Drop `idx_meta_*` indexes for fields that are no longer declared."""
-        cur = await self.db.execute(
+        rows = await self._read(
             "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_meta_%'"
         )
-        rows = await cur.fetchall()
         dropped = []
 
         async with self._lock:
@@ -384,11 +409,12 @@ class MetaStore:
     # ------------------------------------------------------------------ #
     async def get_service_meta(self) -> ServiceMeta | None:
         """Return the singleton service-config row, or None if uninitialized."""
-        cur = await self.db.execute("SELECT * FROM service_meta WHERE id = 1")
-        row = await cur.fetchone()
+        rows = await self._read("SELECT * FROM service_meta WHERE id = 1")
 
-        if row is None:
+        if not rows:
             return None
+
+        row = rows[0]
 
         return ServiceMeta(
             tile_width=row["tile_width"],
@@ -447,35 +473,31 @@ class MetaStore:
     # ------------------------------------------------------------------ #
     async def get_doc(self, doc_id: str) -> DocRow | None:
         """Return the doc row for `doc_id`, or None if absent."""
-        cur = await self.db.execute(
-            f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE doc_id = ?", (doc_id,)
-        )
-        row = await cur.fetchone()
+        rows = await self._read(f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE doc_id = ?", (doc_id,))
 
-        return DocRow.from_row(row) if row else None
+        return DocRow.from_row(rows[0]) if rows else None
 
 
     async def get_tiles(self, doc_id: str) -> list[TileRow]:
         """Return all tile rows for a doc, ordered by tile number."""
-        cur = await self.db.execute(
+        rows = await self._read(
             "SELECT doc_id, tile_num, offset, height, image_hash FROM tiles WHERE doc_id = ? "
             "ORDER BY tile_num",
             (doc_id,),
         )
 
-        return [TileRow(**dict(r)) for r in await cur.fetchall()]
+        return [TileRow(**dict(row)) for row in rows]
 
 
     async def get_tile(self, doc_id: str, tile_num: int) -> TileRow | None:
         """Return a single tile row, or None if absent."""
-        cur = await self.db.execute(
+        rows = await self._read(
             "SELECT doc_id, tile_num, offset, height, image_hash FROM tiles "
             "WHERE doc_id = ? AND tile_num = ?",
             (doc_id, tile_num),
         )
-        row = await cur.fetchone()
 
-        return TileRow(**dict(row)) if row else None
+        return TileRow(**dict(rows[0])) if rows else None
 
 
     async def begin_doc(
@@ -602,10 +624,9 @@ class MetaStore:
     async def count_revisable(self, render_version: str, *, force: bool = False) -> int:
         """Return how many docs a revision at `render_version` would re-render."""
         where, params = self._revisable(render_version, force)
-        cur = await self.db.execute(f"SELECT COUNT(*) AS n FROM docs WHERE {where}", params)
-        row = await cur.fetchone()
+        rows = await self._read(f"SELECT COUNT(*) AS n FROM docs WHERE {where}", params)
 
-        return int(row["n"])
+        return int(rows[0]["n"])
 
 
     async def list_revisable(
@@ -614,13 +635,13 @@ class MetaStore:
         """One page of revisable docs, keyset-paged by doc_id — stable while re-rendered
         docs drop out of the stale set."""
         where, params = self._revisable(render_version, force)
-        cur = await self.db.execute(
+        rows = await self._read(
             f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE {where} AND doc_id > ? "
             "ORDER BY doc_id LIMIT ?",
             [*params, after, limit],
         )
 
-        return [DocRow.from_row(r) for r in await cur.fetchall()]
+        return [DocRow.from_row(row) for row in rows]
 
 
     async def quarantine(self, doc_id: str, render_version: str, reason: str) -> None:
@@ -636,10 +657,9 @@ class MetaStore:
 
     async def count_quarantined(self) -> int:
         """Return the number of quarantined documents."""
-        cur = await self.db.execute("SELECT COUNT(*) AS n FROM quarantine")
-        row = await cur.fetchone()
+        rows = await self._read("SELECT COUNT(*) AS n FROM quarantine")
 
-        return int(row["n"])
+        return int(rows[0]["n"])
 
 
     async def backup(self, path: str) -> None:
@@ -668,18 +688,21 @@ class MetaStore:
 
 
     async def optimize(self) -> None:
-        """Refresh planner statistics (cheap; a no-op when nothing changed)."""
+        """Refresh planner statistics (cheap; a no-op when nothing changed) — at
+        startup. A connection loads the statistics with the schema, so the read-only
+        one is reopened to plan with the fresh ones."""
         async with self._lock:
             await self.db.execute("PRAGMA optimize")
             await self.db.commit()
 
+        await self._open_reader()
+
 
     async def count_docs(self) -> int:
         """Return the total number of stored documents."""
-        cur = await self.db.execute("SELECT COUNT(*) AS n FROM docs")
-        row = await cur.fetchone()
+        rows = await self._read("SELECT COUNT(*) AS n FROM docs")
 
-        return int(row["n"])
+        return int(rows[0]["n"])
 
 
     # ------------------------------------------------------------------ #
@@ -692,8 +715,7 @@ class MetaStore:
     ) -> tuple[list[DocRow], str | None]:
         """Run a filtered, paginated search and return the page plus next cursor."""
         sql, params = build_search_query(filters, schema, limit, cursor)
-        cur = await self.db.execute(sql, params)
-        rows = [DocRow.from_row(r) for r in await cur.fetchall()]
+        rows = [DocRow.from_row(row) for row in await self._read(sql, params)]
         next_cursor = None
 
         if len(rows) > limit:
@@ -706,6 +728,19 @@ class MetaStore:
 
     async def explain(self, sql: str, params: Sequence[Any]) -> list[str]:
         """Return the query plan detail lines for a SQL statement."""
-        cur = await self.db.execute(f"EXPLAIN QUERY PLAN {sql}", list(params))
+        rows = await self._read(f"EXPLAIN QUERY PLAN {sql}", list(params))
 
-        return [row["detail"] for row in await cur.fetchall()]
+        return [row["detail"] for row in rows]
+
+
+    @staticmethod
+    async def _open(database: str, **options: Any) -> aiosqlite.Connection:
+        """Open a connection whose rows are addressed by column name."""
+        connection = aiosqlite.connect(database, **options)
+        # aiosqlite runs SQLite on a plain (non-daemon) thread; if startup aborts
+        # before close(), a non-daemon thread would wedge interpreter shutdown.
+        connection.daemon = True
+        db = await connection
+        db.row_factory = aiosqlite.Row
+
+        return db
