@@ -208,8 +208,12 @@ open stream from holding this past compose's `stop_grace_period`.
 
 ## 8. Enrollment & the Qdrant ⊆ Tiler invariant
 
-`/enroll` (`api/enroll.py`) is internally **streaming**. It opens the tiler's
-`POST /tile/stream` and hands the NDJSON event stream to the **`Enroller`**
+`/enroll` (`api/enroll.py`) is **streaming** both ways. The upload is relayed: the form
+is the tiler's own, so the request body goes on to the tiler's `POST /tile/stream` chunk
+by chunk as it arrives (`EnrollUpload`) — virag holds nothing of the document, in memory
+or on disk, and reads only the `metadata` field on the way (`utils.MultipartFields`), for
+the name policy and the tiler's metadata patch. The handler then hands the tiler's
+NDJSON event stream to the **`Enroller`**
 (`enroll.py`) — the procedure that writes a document's points — which accumulates tiles into
 batches of `VIRAG_ENROLL_BATCH_SIZE`, embedding each batch, and upserting its
 vectors to Qdrant as it goes — bounded memory, never the whole document at once. The HTTP
@@ -437,10 +441,10 @@ virag/
   revision.py        # RevisionManager: background revision / rollback job, the flat re-embed of its build, journal sync
   errors.py          # ApiError + the uniform {"error": {...}} envelope
   responses.py       # OrjsonResponse, the app-wide default response class
-  utils.py           # non-domain helpers (error_body, gather, cancel, chunked, unavailable_as_503)
+  utils.py           # non-domain helpers (error_body, gather, cancel, every, chunked, unavailable_as_503, MultipartFields)
   api/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
-    enroll.py            # /enroll: name policy, the tiler's ingest stream → Enroller
+    enroll.py            # /enroll: the upload relayed to the tiler, name policy, the tiler's ingest stream → Enroller
     revision.py          # /revision (start, status) and /revision/rollback
     models.py            # /v1/models: the VLM's entry for VLM_MODEL_NAME
     auth.py              # VIRAG_API_KEY / VIRAG_ADMIN_API_KEY router dependencies

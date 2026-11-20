@@ -369,12 +369,42 @@ def test_tiler_tile_is_checked_against_its_embedded_render_version():
     assert exc.value.details["tiler_render_version"] == "rv-new"
 
 
+async def _body():
+    """An ingest form on its way through, in two chunks."""
+    yield b"--b\r\n"
+    yield b"--b--\r\n"
+
+
+def test_tiler_stream_relays_the_body_with_its_headers():
+    tiler = TilerService("http://tiler", api_key="k", max_retries=0, **_HTTP)
+    sent = {}
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        sent["headers"] = request.headers
+        sent["body"] = request.content
+
+        return httpx2.Response(200, content=b'{"event":"begin"}\n')
+
+    tiler.http = httpx2.AsyncClient(transport=httpx2.MockTransport(handler), headers=tiler.http.headers)
+
+    async def consume():
+        stream = tiler.tile_stream(_body(), content_type="multipart/form-data; boundary=b", content_length="14")
+
+        return [event async for event in stream]
+
+    assert _run(consume()) == [{"event": "begin"}]
+    assert sent["body"] == b"--b\r\n--b--\r\n"
+    assert sent["headers"]["content-type"] == "multipart/form-data; boundary=b"
+    assert sent["headers"]["content-length"] == "14" and "transfer-encoding" not in sent["headers"]
+    assert sent["headers"]["authorization"] == "Bearer k"
+
+
 def test_tiler_stream_is_never_replayed():
     tiler = TilerService("http://tiler", max_retries=3, **_HTTP)
     seen = _mock(tiler, lambda req, n: httpx2.Response(503, text="busy"))
 
     async def consume():
-        return [event async for event in tiler.tile_stream("PDF", document=b"x")]
+        return [event async for event in tiler.tile_stream(_body(), content_type="multipart/form-data; boundary=b")]
 
     with pytest.raises(ApiError) as exc:
         _run(consume())
@@ -393,7 +423,7 @@ def test_tiler_stream_relays_a_document_the_tiler_refuses():
     _mock(tiler, lambda req, n: httpx2.Response(415, json=refusal))
 
     async def consume():
-        return [event async for event in tiler.tile_stream("PDF", document=b"x")]
+        return [event async for event in tiler.tile_stream(_body(), content_type="multipart/form-data; boundary=b")]
 
     with pytest.raises(ApiError) as exc:
         _run(consume())
@@ -408,7 +438,7 @@ def test_tiler_stream_rejecting_our_key_is_not_the_callers_fault():
     _mock(tiler, lambda req, n: httpx2.Response(401, json={"error": {"code": "UNAUTHORIZED", "message": "no"}}))
 
     async def consume():
-        return [event async for event in tiler.tile_stream("PDF", document=b"x")]
+        return [event async for event in tiler.tile_stream(_body(), content_type="multipart/form-data; boundary=b")]
 
     with pytest.raises(ApiError) as exc:
         _run(consume())
@@ -422,7 +452,7 @@ def test_tiler_stream_yields_events():
     _mock(tiler, lambda req, n: httpx2.Response(200, content=b'{"event":"begin"}\n\n{"event":"committed"}\n'))
 
     async def consume():
-        return [event async for event in tiler.tile_stream("PDF", document=b"x")]
+        return [event async for event in tiler.tile_stream(_body(), content_type="multipart/form-data; boundary=b")]
 
     assert _run(consume()) == [{"event": "begin"}, {"event": "committed"}]
 

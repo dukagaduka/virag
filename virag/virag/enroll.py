@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import aclosing
 from typing import AsyncIterator
 
@@ -71,12 +72,19 @@ class Enroller:
         self.batch_size = enroll_settings.batch_size
 
 
-    async def enroll(self, events: AsyncIterator[dict], *, metadata: dict | None = None) -> dict:
+    async def enroll(
+        self,
+        events: AsyncIterator[dict],
+        *,
+        metadata: Callable[[], dict | None] | None = None,
+    ) -> dict:
         """Enroll the document `events` streams and return its summary.
 
-        `metadata` goes to the tiler along with the pending mark: the tiler keeps it for
-        everyone (points carry none) and leaves the metadata of bytes it already holds
-        as it is, so a re-enroll updates it here.
+        `metadata` gives the document's metadata; it is asked at `begin` — an upload
+        relayed to the tiler has only then gone by in full. The metadata goes to the
+        tiler along with the pending mark: the tiler keeps it for everyone (points carry
+        none) and leaves the metadata of bytes it already holds as it is, so a re-enroll
+        updates it here.
 
         Raises what the tiler refused the document with (before `begin`),
         EnrollInProgress when another enroll holds it, and whatever broke the write —
@@ -88,7 +96,8 @@ class Enroller:
             doc_id = begin["doc_id"]
 
             async with self.coordinator.enrolling(doc_id) as collection:
-                await self.tiler.patch_metadata(doc_id, {**(metadata or {}), "virag_enrolled_at": 0})
+                given = metadata() if metadata is not None else None
+                await self.tiler.patch_metadata(doc_id, {**(given or {}), "virag_enrolled_at": 0})
 
                 try:
                     await self.store.delete_by_doc(doc_id, collection=collection)

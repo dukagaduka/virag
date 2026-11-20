@@ -1,5 +1,5 @@
-"""/enroll: name policy, deterministic ids, embed+upsert, zero-tile handling, one enroll
-of a document at a time."""
+"""/enroll: the upload relayed to the tiler, name policy, deterministic ids, embed+upsert,
+zero-tile handling, one enroll of a document at a time."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def test_enroll_success(make_client):
 
 
 def test_enroll_missing_name_is_422(make_client):
-    client, store, _, _ = _client(make_client)
+    client, store, _, tiler = _client(make_client)
 
     r = client.post(
         "/enroll",
@@ -91,6 +91,25 @@ def test_enroll_missing_name_is_422(make_client):
 
     assert r.status_code == 422
     assert store.upserts == []
+    assert tiler.uploads == []                                          # the tiler never got the form whole
+
+
+def test_enroll_without_any_metadata_is_422(make_client):
+    client, store, _, _ = _client(make_client)
+
+    r = client.post("/enroll", data={"doc_type": "PDF"}, files=_pdf_files())
+
+    assert r.status_code == 422 and "metadata.name" in r.json()["error"]["message"]
+    assert store.upserts == []
+
+
+def test_enroll_that_is_not_a_multipart_form_is_422(make_client):
+    client, store, _, tiler = _client(make_client)
+
+    r = client.post("/enroll", json={"doc_type": "PDF"})
+
+    assert r.status_code == 422 and "multipart/form-data" in r.json()["error"]["message"]
+    assert tiler.uploads == [] and store.upserts == []
 
 
 def test_enroll_allow_missing_name_uses_doc_id(make_client):
@@ -169,7 +188,7 @@ def test_enroll_streams_in_batches(make_client):
 def test_enroll_stream_error_rolls_back(make_client):
     client, store, _, tiler = _client(make_client)
 
-    async def bad_stream(doc_type, *, document=None, url=None, metadata=None):
+    async def bad_stream(body, **_):
         yield {"event": "begin", "doc_id": "doc-a", "doc_type": "PDF",
                "source_url": None, "render_version": "rv-test"}
         yield {"event": "error", "code": "INTERNAL", "message": "boom"}
@@ -190,7 +209,7 @@ def test_enroll_stream_error_rolls_back(make_client):
 def test_enroll_relays_a_document_the_tiler_refuses(make_client):
     client, store, _, tiler = _client(make_client)
 
-    async def refusing_stream(doc_type, *, document=None, url=None, metadata=None):
+    async def refusing_stream(body, **_):
         raise ApiError(status_code=415, message="The tiler refused the document: not a PDF")
         yield  # pragma: no cover - makes this an async generator
 
@@ -334,3 +353,75 @@ def test_enroll_that_cannot_mark_pending_keeps_existing_points(make_client):
     assert r.status_code == 503
     assert store.deletes == []                                        # the doc still reads as enrolled: its points stay
     assert _held(client) == {}
+
+
+# ---------------------------------------------------------------------------
+# the upload is relayed, not held
+# ---------------------------------------------------------------------------
+
+def _form(*parts, boundary="xXx") -> tuple[bytes, str]:
+    """A multipart body with its parts in the given order: (name, value) for a text field,
+    (name, filename, bytes) for a file. Returns the body and its Content-Type."""
+    body = b""
+
+    for name, *rest in parts:
+        filename = f'; filename="{rest[0]}"' if len(rest) == 2 else ""
+        value = rest[-1] if isinstance(rest[-1], bytes) else rest[-1].encode()
+        body += f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"{filename}\r\n\r\n'.encode()
+        body += value + b"\r\n"
+
+    return body + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
+def test_enroll_relays_the_form_to_the_tiler_as_it_came(make_client):
+    client, _, _, tiler = _client(make_client)
+    body, content_type = _form(
+        ("doc_type", "PDF"), ("metadata", json.dumps({"name": "Report A"})), ("document", "r.pdf", b"%PDF-bytes"),
+    )
+
+    r = client.post("/enroll", content=body, headers={"Content-Type": content_type})
+
+    assert r.status_code == 200
+    assert tiler.uploads == [{"body": body, "content_type": content_type, "content_length": str(len(body))}]
+    assert tiler.metadata_patches[0][1]["name"] == "Report A"            # read on the way, for the tiler's patch
+
+
+def test_enroll_reads_the_metadata_wherever_it_comes_in_the_form(make_client):
+    client, store, _, tiler = _client(make_client)
+    named, content_type = _form(
+        ("document", "r.pdf", b"%PDF-bytes"), ("doc_type", "PDF"), ("metadata", json.dumps({"name": "Last"})),
+    )
+    unnamed, _ = _form(("document", "r.pdf", b"%PDF-bytes"), ("doc_type", "PDF"), ("metadata", "{}"))
+
+    ok = client.post("/enroll", content=named, headers={"Content-Type": content_type})
+    refused = client.post("/enroll", content=unnamed, headers={"Content-Type": content_type})
+
+    assert ok.status_code == 200 and tiler.metadata_patches[0][1]["name"] == "Last"
+    assert refused.status_code == 422
+    assert len(tiler.uploads) == 1                                      # the unnamed one never went through whole
+
+
+def test_enroll_with_a_malformed_form_is_422(make_client):
+    client, store, _, tiler = _client(make_client)
+
+    r = client.post(
+        "/enroll",
+        content=b"--xXx\r\nthis is not a part header\r\n\r\n--xXx--\r\n",
+        headers={"Content-Type": "multipart/form-data; boundary=xXx"},
+    )
+
+    assert r.status_code == 422 and "malformed" in r.json()["error"]["message"]
+    assert tiler.uploads == [] and store.upserts == []
+
+
+def test_enroll_by_url_needs_no_document(make_client):
+    client, _, _, tiler = _client(make_client)
+
+    r = client.post(
+        "/enroll",
+        data={"doc_type": "URL", "url": "https://example.com", "metadata": json.dumps({"name": "Example"})},
+        files={"placeholder": (None, "")},                              # keeps the body multipart
+    )
+
+    assert r.status_code == 200
+    assert b"https://example.com" in tiler.uploads[0]["body"]

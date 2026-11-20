@@ -331,6 +331,7 @@ class FakeTiler:
         self._info = info or {"volume_id": "vol-test", "render_version": "rv-test"}
         self.get_tile_calls: list[tuple] = []
         self.doc_stream_calls: list[str] = []
+        self.uploads: list[dict] = []                          # ingest forms relayed in full
         self.existing: set[str] = set()
         self.metadata_patches: list[tuple] = []
         self.doc_metadata: dict[str, dict] = {}
@@ -347,7 +348,12 @@ class FakeTiler:
         self.max_concurrency = 0
         self.fail_tiles: set[tuple] = set()
 
-    async def tile_stream(self, doc_type, *, document=None, url=None, metadata=None):
+    async def tile_stream(self, body, *, content_type, content_length=None):
+        """Takes the relayed form in, as the tiler does before `begin`, then streams
+        `_result`."""
+        form = b"".join([chunk async for chunk in body])
+        self.uploads.append({"body": form, "content_type": content_type, "content_length": content_length})
+
         res = self._result
         yield {"event": "begin", "doc_id": res.doc_id, "doc_type": res.doc_type,
                "source_url": res.source_url, "render_version": res.render_version}

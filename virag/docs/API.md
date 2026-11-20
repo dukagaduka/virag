@@ -123,8 +123,19 @@ retrievable. `multipart/form-data`.
 | `doc_type` | form | `PDF \| URL \| MHTML \| IMG` (required). |
 | `document` | file | The bytes (required unless `doc_type=URL`). |
 | `url` | form | The URL (for `doc_type=URL`). |
-| `metadata` | form | A JSON **object** as a string. Should include `name`. |
+| `metadata` | form | A JSON **object** as a string. Should include `name`. Send it before `document`. |
 | `allow_missing_name` | query | Opt out of the name requirement (see below). |
+
+**The upload is relayed, not held.** The form is the tiler's own, so virag sends the
+request body on to the tiler as it arrives and keeps nothing of the document, in memory
+or on disk; the size limit is the tiler's (`TILER_MAX_DOC_BYTES`, `413`). What is wrong
+with the form or the document — a missing or unknown `doc_type` (`400`), a media
+mismatch (`415`), … — is the tiler's to refuse, and comes back with the tiler's status
+(see [Error envelope](#error-envelope)). The one field virag reads on the way is `metadata`: a request
+that is not `multipart/form-data`, a malformed form or metadata that is not a JSON object
+is a `422`. The name is checked as soon as `metadata` has gone by — with `metadata`
+before `document` (as `curl -F` and `misc/enroll_dir.py` send them), an unnamed document
+is refused before it is uploaded.
 
 **Naming policy.** Every enrolled document is named: `metadata.name` must be a
 non-empty string, else `422`. `allow_missing_name=true` is an explicit opt-out — the

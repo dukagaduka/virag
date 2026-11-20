@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterable
 from contextlib import nullcontext
 
 import httpx2
@@ -119,29 +120,37 @@ class TilerService(HttpService):
 
     async def tile_stream(
         self,
-        doc_type: str,
+        body: AsyncIterable[bytes],
         *,
-        document: bytes | None = None,
-        url: str | None = None,
-        metadata: dict | None = None,
+        content_type: str,
+        content_length: str | None = None,
     ):
-        """Ingest a document and stream it as NDJSON events (begin, tile*, committed | error).
+        """Relay an ingest form to the tiler and stream the ingest as NDJSON events
+        (begin, tile*, committed | error).
+
+        `body` is the multipart form as the tiler takes it (`doc_type`, `document` |
+        `url`, `metadata`), sent on as it is read — never held here; `content_type`
+        carries its boundary.
 
         Because tiles arrive as they render, the per-read timeout — not a single
         whole-request deadline — bounds each hop, so an arbitrarily long render never
-        trips `TILER_TIMEOUT_SEC`. Never replayed: events may already be consumed.
+        trips `TILER_TIMEOUT_SEC`. Never replayed: the body is gone once read.
 
         A document the tiler refuses before the stream begins (wrong type, too large,
         invalid metadata, already being ingested, …) raises with the tiler's own status.
         """
+        headers = {"Content-Type": content_type}
+        if content_length is not None:
+            headers["Content-Length"] = content_length
+
         async with self._stream(
             "POST",
             self.tile_stream_route,
             action="the ingest",
             retry=False,
             passthrough_statuses=self.REFUSALS,
-            data=self._ingest_form(doc_type, url, metadata),
-            files=self._ingest_files(document),
+            content=body,
+            headers=headers,
         ) as response:
             if not response.is_success:
                 raise await self._refusal(response)
@@ -325,25 +334,6 @@ class TilerService(HttpService):
                 message=f"Lost {response.url} mid-stream during {action}",
                 details={"error": repr(e)},
             ) from e
-
-
-    @staticmethod
-    def _ingest_form(doc_type: str, url: str | None, metadata: dict | None) -> dict:
-        data: dict = {"doc_type": doc_type}
-        if url is not None:
-            data["url"] = url
-        if metadata is not None:
-            data["metadata"] = orjson.dumps(metadata).decode()
-
-        return data
-
-
-    @staticmethod
-    def _ingest_files(document: bytes | None) -> dict | None:
-        if document is None:
-            return None
-
-        return {"document": ("document", document, "application/octet-stream")}
 
 
     @staticmethod
