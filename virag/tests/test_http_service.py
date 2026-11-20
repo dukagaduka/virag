@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+from contextlib import asynccontextmanager
 
 import httpx2
 import pytest
@@ -43,6 +45,79 @@ def _mock(service: HttpService, handler) -> list[httpx2.Request]:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+@asynccontextmanager
+async def _upstream(delay: float = 0):
+    """A real HTTP upstream on localhost answering every request 200 after `delay`;
+    yields its URL and a dict with the peak number of requests it served at once."""
+    load = {"now": 0, "peak": 0}
+
+    async def serve(reader, writer):
+        try:
+            while await reader.readuntil(b"\r\n\r\n"):
+                load["now"] += 1
+                load["peak"] = max(load["peak"], load["now"])
+                await asyncio.sleep(delay)
+                load["now"] -= 1
+
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                await writer.drain()
+
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}", load
+
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------------------------------
+# connections
+# ---------------------------------------------------------------------------
+
+def test_connections_carry_tcp_keepalive():
+    """What lets the kernel find a vanished upstream dead in ~25 s instead of the read timeout."""
+    async def go():
+        async with _upstream() as (url, _):
+            svc = _Service(url, max_retries=0, **_HTTP)
+
+            try:
+                response = await svc.send("GET", f"{url}/x")
+                sock = response.extensions["network_stream"].get_extra_info("socket")
+
+                return [sock.getsockopt(level, option) for level, option, _ in HttpService.SOCKET_OPTIONS]
+
+            finally:
+                await svc.close()
+
+    assert _run(go()) == [1, 10, 5, 3]
+    assert [option for _, option, _ in HttpService.SOCKET_OPTIONS] == [
+        socket.SO_KEEPALIVE, socket.TCP_KEEPIDLE, socket.TCP_KEEPINTVL, socket.TCP_KEEPCNT,
+    ]
+
+
+def test_the_pool_is_capped_at_max_connections():
+    async def go():
+        async with _upstream(delay=0.02) as (url, load):
+            svc = _Service(url, max_retries=0, **{**_HTTP, "max_connections": 2})
+
+            try:
+                await gather(svc.send("GET", f"{url}/{n}") for n in range(6))
+
+            finally:
+                await svc.close()
+
+            return load["peak"]
+
+    assert _run(go()) == 2
 
 
 # ---------------------------------------------------------------------------

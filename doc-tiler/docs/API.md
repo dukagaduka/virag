@@ -78,7 +78,9 @@ mismatch (`415`), invalid metadata (`422`), a URL that is blocked or cannot be c
 ingest did not complete.
 An ingest that does not commit — an error, a client that went away, a killed process —
 leaves nothing behind: its row and its upload are removed (at the next start, for a
-killed process). Idempotent like `/tile`: bytes already stored and served replay the
+killed process). A client that vanished without closing the connection (its host or
+network went down) is noticed only when the kernel gives the connection up — 15–30 min
+by default; the same bytes answer `409 INGEST_IN_PROGRESS` until then. Idempotent like `/tile`: bytes already stored and served replay the
 stored tiles (regenerated, verified against their hashes) as the same event stream
 without re-rendering.
 

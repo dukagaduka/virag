@@ -122,6 +122,13 @@ Five typed async clients, each built from its settings block and given a
 `check_connection()` used at startup. Each is an API to its backend and nothing more;
 the rules that span virag processes live in the Coordinator (§10).
 
+The HTTP ones share `HttpService`: one pooled client per upstream, retries with jittered
+backoff, one mapping of transport and status errors to `ApiError`, and TCP keepalive on
+every connection — an upstream that vanished without closing its connections is found
+dead by the kernel in about 25 s, so a request waiting on it (an enroll reading the
+tiler's stream, a chat waiting for the VLM) fails then and not at its read timeout,
+which has to cover the upstream's longest silence.
+
 - **`RetrieverClient`** — the retrieval embedding model behind any OpenAI-compatible
   `/embeddings` API. Text goes through the standard `input` field, `RETRIEVER_BATCH_SIZE`
   per request; images go through chat-style `messages`/`image_url` with a `data:` URI (a
@@ -133,10 +140,11 @@ the rules that span virag processes live in the Coordinator (§10).
   and may carry a vLLM `priority`; chat queries bypass both, so an ingest never queues a
   user's query. `check_connection()` also learns the vector size (checked against
   `QDRANT_VECTOR_SIZE`), resolves image batching and verifies the bulk priority.
-- **`TilerService`** — doc-tiler client: `tile()`, `tile_stream()` (the NDJSON stream
-  `/enroll` consumes), `get_tile()`, `get_info()` (for binding), `get_schema()` (metadata
-  schema guard), `patch_metadata()` (the enroll pending markers), `search_docs()` /
-  `iter_docs()` (reconcile), `doc_exists()`.
+- **`TilerService`** — doc-tiler client: `tile_stream()` (the NDJSON ingest stream
+  `/enroll` consumes), `doc_stream()` (the same stream of a stored doc: self-heal, a
+  revision's sync), `get_tile()`, `get_info()` (for binding), `get_schema()` (metadata
+  schema guard), `get_metadata()` / `patch_metadata()` (document names; the enroll's
+  pending marker), `search_docs()` / `iter_docs()` (reconcile), `doc_exists()`.
 - **`QdrantStore`** — speaks **gRPC** to Qdrant: one multiplexed HTTP/2 channel (no pool
   of idle HTTP/1.1 connections to race the server's keep-alive), retries done by the
   channel's service config (`UNAVAILABLE`, idempotent methods only), an unreachable
@@ -392,6 +400,14 @@ over. Valkey unreachable: chat keeps serving, enroll answers `503 NOT_READY`, a 
 fails at its next step without swapping, reconcile skips its pass; past the TTL the
 processes restart on their expired leases. Valkey runs with AOF, so a short restart
 keeps the leases and the journal.
+
+An upstream that vanishes without closing its connections (its host or the network went
+down) is noticed in about 25 s (TCP keepalive, §6): the enroll reading its stream fails,
+rolls back and releases its document. The reverse is slower, and a known limitation: a
+virag process that vanishes the same way mid-enroll of a **new** document leaves the
+tiler writing into a dead connection until its kernel gives up (15–30 min by default),
+and until then that document cannot be enrolled again — the tiler answers
+`409 INGEST_IN_PROGRESS`. It clears by itself; restarting the tiler clears it at once.
 
 ## 11. Module layout
 

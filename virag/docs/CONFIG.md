@@ -115,6 +115,12 @@ per upstream and replays transient failures — connection errors and `429`/`502
 replies — with full-jitter exponential backoff. Read timeouts are never replayed (a slow
 upstream only gets slower under extra load), and neither are tiler ingests.
 
+Every connection has TCP keepalive on (10 s of silence, then 3 probes 5 s apart; not
+configurable): an upstream that vanished without closing its connections — its host or
+the network went down — fails the request waiting on it in about 25 s, whatever the
+read timeout. The `*_TIMEOUT_SEC` deadlines below are for an upstream that is alive and
+silent. The clients take no HTTP proxy from the environment.
+
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `HTTP_RETRY_BACKOFF_BASE_SEC` | no | `0.25` | Backoff base (≥ 0). Each wait is uniform over `[0, min(CAP, BASE · 2^attempt)]`. |
@@ -171,7 +177,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 |---|---|---|---|
 | `TILER_BASE_URL` | no | `http://tiler-virag:8080` | doc-tiler endpoint. |
 | `TILER_API_KEY` | no | `""` | The tiler's own `TILER_API_KEY`, sent as a bearer token; empty = none. A wrong one fails startup (`the tiler rejects TILER_API_KEY`). |
-| `TILER_TIMEOUT_SEC` | no | `120` | Per-read deadline (≥ 1): for the tile stream, the max gap between events, not the whole render. |
+| `TILER_TIMEOUT_SEC` | no | `120` | Per-read deadline (≥ 1): for the tile stream, the max gap between events, not the whole render. It is for a tiler that is alive and silent; one that vanished is found dead in about 25 s (TCP keepalive). |
 | `TILER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `TILER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the tiler (≥ 1). |
 | `TILER_MAX_RETRIES` | no | `3` | Retries for a transient failure on idempotent calls (≥ 0); an ingest is never replayed. |
@@ -184,7 +190,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 | `VLM_BASE_URL` | **yes** | — | Vision model endpoint. The `/v1` suffix is required. |
 | `VLM_MODEL_NAME` | **yes** | — | Model name; used for the startup vision probe. Callers still pass their own `model` in the request body (passed through). |
 | `VLM_API_KEY` | no | `dummy` | Bearer key for the VLM (sent with chat completions and the `/v1/models` lookup). |
-| `VLM_TIMEOUT_SEC` | no | `480` | Per-read deadline on the VLM stream (max silence between chunks; covers a long prefill/TTFT on big pixel-RAG prompts), not total generation time (≥ 1). |
+| `VLM_TIMEOUT_SEC` | no | `480` | Per-read deadline on the VLM stream (max silence between chunks; covers a long prefill/TTFT on big pixel-RAG prompts), not total generation time (≥ 1). A VLM that vanished is found dead in about 25 s (TCP keepalive). |
 | `VLM_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `VLM_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the VLM (≥ 1); must be ≥ `VLM_MAX_CONCURRENCY`. |
 | `VLM_MAX_CONCURRENCY` | no | `0` | Max concurrent upstream chat-completion calls; `0` = unlimited (≥ 0). Cap it to shield a fragile/remote VLM from concurrent multimodal load; excess calls queue. Held for the whole stream. |

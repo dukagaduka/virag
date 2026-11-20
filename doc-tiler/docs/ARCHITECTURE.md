@@ -493,6 +493,15 @@ Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipelin
   away it removes its upload and the row it inserted, even while being cancelled; what
   a killed process left (`complete=0` rows, `.incoming`) is removed at startup, when no
   ingest can be alive.
+- **Known limitation: a client that vanishes without closing the connection.** "Went
+  away" above is what the tiler can see — a closed or reset connection. A stream's
+  client whose host or network went down says nothing: the tiler keeps writing into
+  the connection, and only the kernel's own give-up (about 15–30 min with Linux's
+  default `tcp_retries2=15`) ends the ingest. Until then the doc stays incomplete and
+  the same bytes are refused with `409 INGEST_IN_PROGRESS`; it clears by itself, and a
+  restart of the tiler clears it at once. Left as it is on purpose: the socket-level
+  cure (`TCP_USER_TIMEOUT`) would also cut a client that is alive and merely slow to
+  read.
 - **A stored doc is never touched before a commit.** The one stored doc that is
   rendered again is a quarantined one; its row and tiles stay as they are until the
   new render commits, so a failed attempt costs nothing.

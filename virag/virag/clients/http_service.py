@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import socket
 from abc import ABC, abstractmethod
 from collections.abc import Collection
 from contextlib import asynccontextmanager, nullcontext
@@ -36,6 +37,18 @@ class HttpService(ABC):
         httpx2.RemoteProtocolError,
         httpx2.ReadError,
         httpx2.WriteError,
+    )
+
+    # TCP keepalive on every connection. An upstream that vanished without closing it —
+    # its host or the network went down — is found dead by the kernel after 10 s of
+    # silence and 3 unanswered probes 5 s apart, and the pending read fails at once;
+    # the read timeout, which must cover the upstream's longest silence, is left for
+    # one that is alive and stuck.
+    SOCKET_OPTIONS = (
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5),
+        (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
     )
 
 
@@ -66,11 +79,16 @@ class HttpService(ABC):
         # `timeout` bounds read/write/pool waits (a read deadline is the max silence
         # between bytes, not the whole request); connecting is held to its own,
         # shorter deadline. Keep-alive is sized to the pool so connections are reused.
+        # The transport is our own for the sake of its socket options; with it the
+        # client takes no proxy from the environment.
         self.http = httpx2.AsyncClient(
             timeout=httpx2.Timeout(timeout, connect=connect_timeout),
-            limits=httpx2.Limits(
-                max_connections=max_connections,
-                max_keepalive_connections=max_connections,
+            transport=httpx2.AsyncHTTPTransport(
+                limits=httpx2.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_connections,
+                ),
+                socket_options=self.SOCKET_OPTIONS,
             ),
             headers=headers,
         )
