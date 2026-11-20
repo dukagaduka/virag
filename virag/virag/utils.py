@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Callable, Coroutine, Iterable, Iterator
+import logging
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator
 from itertools import islice
 from typing import Any, TypeVar
 
@@ -11,6 +12,8 @@ import orjson
 
 from virag.errors import ApiError
 
+
+log = logging.getLogger("virag.utils")
 
 T = TypeVar("T")
 
@@ -50,6 +53,22 @@ async def cancel(task: asyncio.Task) -> None:
 
     except asyncio.CancelledError:
         pass
+
+
+async def every(interval_sec: float, job: Callable[[], Awaitable[None]], *, name: str) -> None:
+    """Run `job` every `interval_sec` until cancelled (0 = never). A run that fails is
+    logged and the loop goes on."""
+    if interval_sec <= 0:
+        return
+
+    while True:
+        await asyncio.sleep(interval_sec)
+
+        try:
+            await job()
+
+        except Exception as e:  # noqa: BLE001 - a periodic job must never end its loop
+            log.error("%s failed: %r", name, e)
 
 
 def chunked(items: Iterator[T], size: int) -> Iterator[list[T]]:

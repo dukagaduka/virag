@@ -21,6 +21,14 @@ syncs exactly those docs after the swap:
   5. Sync the journaled docs into the new collection — each enrolled again from the
      tiler's stored tiles, by the Enroller — and enforce the invariant once more.
 
+A job that stops before it moved the alias leaves the serving collection as it was: the
+next request starts from scratch. One that stops after — during steps 4 and 5, or the
+same stretch of a rollback, because its process died, was shut down, or a backend
+failed it — has left the alias on a collection that lacks the journaled docs. Its
+status stays `running`, and any live process finishes it (`resume_orphaned`, at startup
+and on the reconcile interval) from what the job published and Valkey kept: the
+journal, the collections' names, a rollback's `retired_at`.
+
 A collection is bound to the render_version its tiles were embedded from (collection
 metadata; every point carries it too, and chat refuses a tile the tiler now renders by
 another one): a revision starts only while the tiler is serving, and aborts without a
@@ -89,6 +97,10 @@ class RevisionManager:
         # This process's job, if it runs one; `status` is what it publishes.
         self._task: asyncio.Task | None = None
         self.status: dict = {}
+
+        # Whether this process's job has moved the alias: from there on it is finished,
+        # by this process or by another, never failed.
+        self._alias_moved = False
 
 
     @property
@@ -170,8 +182,52 @@ class RevisionManager:
             log.info("revision: not started here: %s", e.message)
 
 
+    async def resume_orphaned(self) -> None:
+        """Finish a job that stopped after moving the alias — its process died or was shut
+        down, or a backend failed it: what is left is the wait for the enrolls in flight
+        and the sync of the journaled docs. Any process may try, at any time; taking the
+        job over settles who does it. A job that stopped before its alias move is left
+        alone."""
+        if self.running or await self._resumable_orphan() is None:
+            return
+
+        if await self.coordinator.acquire_revision() is not None:
+            return                                                  # a live process has it
+
+        try:
+            # Looked at again under the job: it may have been finished since the first look.
+            orphan = await self._resumable_orphan()
+            if orphan is None:
+                await self.coordinator.release_revision()
+
+                return
+
+            self.status = {
+                **{key: value for key, value in orphan.items() if key != "interrupted"},
+                "owner": self.coordinator.identity,
+                "resumed_at": int(time.time()),
+            }
+            await self.coordinator.set_status(self.status)
+
+        except BaseException:
+            await self.coordinator.release_revision()
+            raise
+
+        left_by = orphan["owner"]
+        log.warning("%s: finishing the job %s/%s left after its alias move", orphan["kind"], left_by.get("host"), left_by.get("pid"))
+
+        if orphan["kind"] == "rollback":
+            job = self._after_repoint(orphan["collection"], orphan["abandoned"], orphan["retired_at"])
+        else:
+            job = self._after_swap(orphan["collection"])
+
+        self._task = asyncio.create_task(self._guarded(job))
+
+
     async def close(self) -> None:
-        """Cancel this process's job on shutdown; the next revision rebuilds from scratch."""
+        """Cancel this process's job on shutdown. One still building is failed, and the
+        next revision rebuilds from scratch; one past its alias move is left `running`,
+        for `resume_orphaned` to finish."""
         if not self.running:
             return
 
@@ -254,17 +310,27 @@ class RevisionManager:
 
 
     async def _guarded(self, job) -> None:
-        """Run a job and record its outcome; a failure never escapes the task."""
+        """Run a job and record its outcome; a failure never escapes the task. A job
+        stopped past its alias move is not failed: its status stays `running`, the job
+        is released, and `resume_orphaned` finishes it — here or in another process."""
+        self._alias_moved = False
+
         try:
             await job
 
         except asyncio.CancelledError:
-            self._finish("failed", error="cancelled (shutdown)")
+            if not self._alias_moved:
+                self._finish("failed", error="cancelled (shutdown)")
+
             raise
 
         except Exception as e:  # noqa: BLE001 - surfaced through the status, not the loop
             log.exception("%s failed", self.status["kind"])
-            self._finish("failed", error=repr(e))
+
+            if self._alias_moved:
+                self.status["interrupted"] = repr(e)
+            else:
+                self._finish("failed", error=repr(e))
 
         finally:
             try:
@@ -352,26 +418,25 @@ class RevisionManager:
                 except Exception as e:  # noqa: BLE001 - never mask the original outcome
                     log.error("revision: cannot drop aborted build %s: %r", target, e)
 
-        journal = await coordinator.journal()
+        await self._after_swap(target)
+
+
+    async def _after_swap(self, target: str) -> None:
+        """A revision from its alias swap on — also how a process finishes one that
+        stopped here: it needs the journal, which Valkey keeps, and `target`."""
+        self._alias_moved = True
+
+        journal = await self.coordinator.journal()
         await self._update(phase="syncing")
 
-        if not await coordinator.drain(self.drain_timeout):
-            log.warning("revision: enrolls that may be writing into %s still running after %ss", old, self.drain_timeout)
+        if not await self.coordinator.drain(self.drain_timeout):
+            log.warning("revision: enrolls that may be writing into the replaced collection still running after %ss", self.drain_timeout)
 
         sync_failed = await self._sync(journal)
 
-        await enforce_subset(store, coordinator, self.tiler, collection=target)
+        await enforce_subset(self.store, self.coordinator, self.tiler, collection=target)
 
-        self.status["synced"] = len(journal) - len(sync_failed)
-        log.info("revision: done, %d doc(s) synced after the swap", self.status["synced"])
-
-        if sync_failed:
-            # The swap happened; these docs stay pending, for reconcile to enroll again.
-            self._finish("degraded", sync_failed_doc_ids=sorted(sync_failed))
-
-            return
-
-        self._finish("succeeded")
+        self._conclude(journal, sync_failed)
 
 
     async def _rollback(self, abandoned: str, restored: str) -> None:
@@ -382,21 +447,33 @@ class RevisionManager:
         # collection being dropped.
         await coordinator.start_journal()
 
+        # Published before the repoint: what it takes to finish the job from there on.
+        retired_at = await store.retired_at(restored)
+        await self._update(collection=restored, abandoned=abandoned, retired_at=retired_at, phase="repointing")
+
         if not await coordinator.owns_revision():
             self._finish("failed", error="the job was lost (this process's lease expired); alias not repointed")
 
             return
 
-        retired_at = await store.rollback_alias(restored)
-        journal = await coordinator.journal()
-
-        await self._update(collection=restored, abandoned=abandoned, phase="syncing")
+        await store.rollback_alias(restored)
         log.warning("rollback: alias now → %s; dropping %s once the enrolls in flight are done", restored, abandoned)
 
-        if not await coordinator.drain(self.drain_timeout):
+        await self._after_repoint(restored, abandoned, retired_at)
+
+
+    async def _after_repoint(self, restored: str, abandoned: str, retired_at: int) -> None:
+        """A rollback from its alias repoint on — also how a process finishes one that
+        stopped here."""
+        self._alias_moved = True
+
+        journal = await self.coordinator.journal()
+        await self._update(phase="syncing")
+
+        if not await self.coordinator.drain(self.drain_timeout):
             log.warning("rollback: enrolls that may be writing into %s still running after %ss", abandoned, self.drain_timeout)
 
-        await store.drop_collection(abandoned)
+        await self.store.drop_collection(abandoned)
 
         # Docs enrolled after the original swap exist only in the dropped collection.
         missed = journal | {
@@ -407,11 +484,29 @@ class RevisionManager:
 
         sync_failed = await self._sync(missed)
 
-        await enforce_subset(store, coordinator, self.tiler, collection=restored)
+        await enforce_subset(self.store, self.coordinator, self.tiler, collection=restored)
 
-        self.status["synced"] = len(missed) - len(sync_failed)
+        self._conclude(missed, sync_failed)
+
+
+    async def _resumable_orphan(self) -> dict | None:
+        """The status of a job nobody is running that had moved the alias already — the
+        serving collection is the one it was moving the alias to; None otherwise."""
+        orphan = await self.coordinator.orphaned_job()
+
+        if orphan is None or orphan.get("collection") != await self.store.serving_physical():
+            return None
+
+        return orphan
+
+
+    def _conclude(self, wanted: set[str], sync_failed: set[str]) -> None:
+        """Close a job whose alias has moved by the outcome of its sync."""
+        self.status["synced"] = len(wanted) - len(sync_failed)
+        log.info("%s: done, %d doc(s) synced after the alias move", self.status["kind"], self.status["synced"])
 
         if sync_failed:
+            # The alias has moved; these docs stay pending, for reconcile to enroll again.
             self._finish("degraded", sync_failed_doc_ids=sorted(sync_failed))
 
             return

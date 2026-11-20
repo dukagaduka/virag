@@ -358,6 +358,43 @@ def test_status_of_a_job_whose_owner_died_is_failed():
     assert status["state"] == "failed" and "owner lost" in status["error"]
 
 
+def test_a_job_is_orphaned_when_it_reads_running_and_no_other_live_process_holds_it():
+    store, a, b = _pair()
+    running = {"kind": "revision", "state": "running", "owner": a.identity}
+
+    async def go():
+        seen = {}
+
+        await a.acquire_revision()
+        await a.set_status(running)
+        seen["run by a live process"] = await b.orphaned_job()
+
+        a.valkey.expire(lease_key(a))
+        seen["its process died"] = await b.orphaned_job()
+
+        await b.acquire_revision()                                      # b takes the job over…
+        seen["taken over, still unfinished"] = await b.orphaned_job()
+        await b.set_status({**running, "state": "succeeded", "owner": b.identity})
+        seen["concluded"] = await b.orphaned_job()
+
+        await b.set_status({**running, "owner": b.identity})           # …or stops short and lets go
+        await b.release_revision()
+        seen["released unfinished"] = await b.orphaned_job()
+
+        return seen
+
+    seen = asyncio.run(go())
+
+    assert {case: status is not None for case, status in seen.items()} == {
+        "run by a live process": False,
+        "its process died": True,
+        "taken over, still unfinished": True,
+        "concluded": False,
+        "released unfinished": True,
+    }
+    assert seen["its process died"] == running                         # as it was left
+
+
 def test_status_without_any_job_is_idle():
     _, a, _ = _pair()
 

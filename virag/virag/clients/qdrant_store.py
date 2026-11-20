@@ -434,11 +434,13 @@ class QdrantStore:
 
 
     async def drop_collection(self, name: str) -> None:
-        """Drop a non-serving physical collection (an aborted build, an abandoned one)."""
+        """Drop a non-serving physical collection (an aborted build, an abandoned one);
+        a no-op when it is gone already."""
         if name == await self._alias_target():
             raise ValueError(f"refusing to drop the serving collection {name}")
 
-        await self.qdrant.delete_collection(collection_name=name)
+        if await self.qdrant.collection_exists(name):
+            await self.qdrant.delete_collection(collection_name=name)
 
 
     async def swap_alias(self, new_physical: str, old_physical: str, stale_previous: str | None) -> None:
@@ -457,10 +459,16 @@ class QdrantStore:
             await self.qdrant.delete_collection(collection_name=stale_previous)
 
 
-    async def rollback_alias(self, restored: str) -> int:
-        """Point the serving alias back at `restored`, the retained collection. Returns its
-        `retired_at`: documents enrolled since then live only in the collection it
-        replaces, which the caller drops once the enrolls writing into it are done."""
+    async def retired_at(self, physical: str) -> int:
+        """When `physical` stopped serving (the stamp of the swap that replaced it); 0 for
+        one that never did. Documents enrolled since then are not in it."""
+        return int((await self._collection_metadata(physical)).get("retired_at") or 0)
+
+
+    async def rollback_alias(self, restored: str) -> None:
+        """Point the serving alias back at `restored`, the retained collection, and clear
+        its `retired_at`. The collection it replaces is the caller's to drop, once the
+        enrolls writing into it are done."""
         info = (await self.qdrant.get_collection(restored)).config.params.vectors
         if info.size != self.vector_size:  # type: ignore
             raise ApiError(
@@ -470,13 +478,10 @@ class QdrantStore:
             )
 
         meta = await self._collection_metadata(restored)
-        retired_at = int(meta.get("retired_at") or 0)
 
         # Explicit null: Qdrant merges metadata updates, so an omitted key would survive.
         await self.qdrant.update_collection(collection_name=restored, metadata={**meta, "retired_at": None})
         await self._repoint_alias(restored)
-
-        return retired_at
 
 
     async def _repoint_alias(self, physical: str) -> None:

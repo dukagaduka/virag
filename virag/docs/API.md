@@ -189,7 +189,9 @@ It runs in the **background**, in whichever virag process the request lands on: 
 call returns `202` with the job status at once. One job runs at a time across every
 process — a second call while one runs is `409 CONFLICT` (with that job's status), and
 so is a call while the tiler is not serving (its own revision is pending or running). A
-job whose process died is taken over by the next call, from scratch. Incomplete and quarantined tiler docs
+job that stopped before its swap — its process died, was shut down, or a backend failed
+it — is taken over by the next call, from scratch; one that stopped after the swap is
+finished by virag itself (see `GET /revision`). Incomplete and quarantined tiler docs
 are skipped (they have no servable tiles; re-enroll them). The new collection is stamped
 with the tiler's `render_version`; if the tiler's changes before the swap, the job fails
 without swapping.
@@ -218,10 +220,20 @@ process (it is kept in Valkey):
 ```
 
 `state` is `idle` (no job yet), `running` (`phase`: `building`, then `syncing` after the
-swap), `succeeded`, `degraded` (swapped, but some journaled docs failed to sync — listed
-in `sync_failed_doc_ids`; they stay pending, and reconcile enrolls them again), or `failed` (`error`, and `failed_doc_ids`
-when the alias was not swapped). A job whose process died reads as `failed` with
-`error: "owner lost (<host>/<pid>)"`; `POST /revision` again.
+swap; a rollback: `repointing`, then `syncing`), `succeeded`, `degraded` (swapped, but
+some journaled docs failed to sync — listed in `sync_failed_doc_ids`; they stay pending,
+and reconcile enrolls them again), or `failed` (`error`, and `failed_doc_ids` when the
+alias was not swapped).
+
+**A job is failed only before it moved the alias.** From the swap (a rollback's repoint)
+on, what is left — waiting for the enrolls in flight, syncing the journaled documents —
+is always finished: if the process running it dies, is shut down, or a backend fails
+it, the status stays `running` (with `interrupted: "<the error>"` in the last case) and
+a live virag process picks the job up at startup or at its next reconcile interval,
+adding `resumed_at`. A job whose process died reads meanwhile as `failed` with
+`error: "owner lost (<host>/<pid>)"`: if it had swapped, it turns `running` again by
+itself; if it had not, `POST /revision` again. With `VIRAG_RECONCILE_INTERVAL_SEC=0`
+nothing is picked up between restarts.
 
 ## `POST /revision/rollback`
 

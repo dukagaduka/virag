@@ -300,8 +300,7 @@ def test_rollback_is_refused_across_render_versions():
 def test_rollback_resyncs_docs_enrolled_since_retirement():
     store, tiler = FakeStore(), FakeTiler()
     store.physical_name, store.previous_name = "c__v2", "c__v1"
-    store.collection_metadata = {"c__v1": {"render_version": "rv-test"}}
-    store.rollback_retired_at = 100
+    store.collection_metadata = {"c__v1": {"render_version": "rv-test", "retired_at": 100}}
     tiler.docs = [_doc("old", 1, enrolled_at=50), _doc("new", 1, enrolled_at=150)]
     manager = _manager(store, tiler)
 
@@ -329,6 +328,198 @@ def test_revision_api_starts_in_background_and_reports_status():
 
         status = client.get("/revision").json()
         assert status["kind"] == "revision"
+
+
+# ---------------------------------------------------------------------------
+# a job that stopped after moving the alias
+# ---------------------------------------------------------------------------
+
+def _left_running(store, tiler, *, journal=(), **status):
+    """A job its process left `running` and died; returns the manager of another, live process."""
+    dead = make_coordinator(store)
+    valkey = dead.valkey
+    valkey.values[REVISION_ON] = (dead.token, None)
+    valkey.values[REVISION_STATUS] = ({"state": "running", "owner": dead.identity, **status}, None)
+    valkey.sets["revision:journal"] = set(journal)
+    valkey.expire(lease_key(dead))
+
+    return _manager(store, tiler, make_coordinator(store, valkey=valkey))
+
+
+def test_a_revision_left_after_its_swap_is_finished_by_another_process():
+    store, tiler = FakeStore(), FakeTiler()
+    store.physical_name, store.previous_name = "c__v2", "c__v1"        # the swap happened
+    tiler.docs = [_doc("built", 1), _doc("fresh", 1)]                   # fresh: enrolled during the build
+    manager = _left_running(
+        store, tiler, journal={"fresh"}, kind="revision", collection="c__v2", phase="building", reembedded=1,
+    )
+
+    status = _run_job(manager, manager.resume_orphaned)
+
+    assert status["state"] == "succeeded" and status["synced"] == 1
+    assert status["owner"]["token"] == manager.coordinator.token and "resumed_at" in status
+    assert status["reembedded"] == 1                                    # what the build published stays
+    assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["fresh"]   # the tail only, no rebuild
+    assert {u["collection"] for u in store.upserts} == {"c__v2"}
+    assert REVISION_ON not in manager.coordinator.valkey.values
+
+
+def test_a_revision_left_before_its_swap_is_not_resumed():
+    store, tiler = FakeStore(), FakeTiler()                             # still serving c__v1
+    manager = _left_running(store, tiler, journal={"fresh"}, kind="revision", collection="c__v2", phase="building")
+
+    async def go():
+        await manager.resume_orphaned()
+
+        return await manager.get_status()
+
+    status = asyncio.run(go())
+
+    assert manager._task is None and store.upserts == []
+    assert status["state"] == "failed" and "owner lost" in status["error"]   # POST /revision starts anew
+
+
+def test_a_rollback_left_after_its_repoint_is_finished_by_another_process():
+    store, tiler = FakeStore(), FakeTiler()
+    store.physical_name = "c__v1"                                       # repointed back already
+    tiler.docs = [_doc("old", 1, enrolled_at=50), _doc("new", 1, enrolled_at=150)]
+    manager = _left_running(
+        store, tiler, kind="rollback", collection="c__v1", abandoned="c__v2", retired_at=100, phase="repointing",
+    )
+
+    status = _run_job(manager, manager.resume_orphaned)
+
+    assert status["state"] == "succeeded" and status["synced"] == 1
+    assert store.dropped == ["c__v2"]
+    assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["new"]
+
+
+def test_a_job_another_live_process_runs_is_not_touched():
+    store, tiler = FakeStore(), FakeTiler()
+    store.physical_name = "c__v2"
+    other = make_coordinator(store)
+    manager = _manager(store, tiler, make_coordinator(store, valkey=other.valkey))
+
+    async def go():
+        await other.acquire_revision()
+        await other.set_status({"kind": "revision", "state": "running", "owner": other.identity,
+                                "collection": "c__v2", "phase": "syncing"})
+        await manager.resume_orphaned()
+
+        return await manager.get_status()
+
+    status = asyncio.run(go())
+
+    assert manager._task is None
+    assert status["state"] == "running" and status["owner"]["token"] == other.token
+
+
+def test_of_two_processes_one_finishes_the_job():
+    store, tiler = FakeStore(), FakeTiler()
+    store.physical_name = "c__v2"
+    tiler.docs = [_doc("fresh", 1)]
+    first = _left_running(store, tiler, journal={"fresh"}, kind="revision", collection="c__v2", phase="syncing")
+    second = _manager(store, tiler, make_coordinator(store, valkey=first.coordinator.valkey))
+
+    async def go():
+        await first.resume_orphaned()
+        await second.resume_orphaned()                                  # sees a live process on it
+        await first._task
+        await second.resume_orphaned()                                  # and afterwards a concluded job
+
+        return first.status
+
+    status = asyncio.run(go())
+
+    assert status["state"] == "succeeded"
+    assert second._task is None
+    assert tiler.doc_stream_calls == ["fresh"]                          # synced once
+
+
+def test_a_job_failed_by_a_backend_after_its_swap_stays_running_and_is_finished_later():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    manager = _manager(store, tiler)
+    listing = tiler.iter_docs
+    swap = store.swap_alias
+
+    async def swap_then_the_tiler_goes_away(*args):
+        await swap(*args)
+
+        async def unavailable(*, filters=None):
+            raise ApiError(status_code=503, message="tiler is unavailable")
+
+        tiler.iter_docs = unavailable
+
+    store.swap_alias = swap_then_the_tiler_goes_away
+
+    interrupted = dict(_run_job(manager, manager.start))
+
+    assert interrupted["state"] == "running" and "tiler is unavailable" in interrupted["interrupted"]
+    assert store.swapped_to == "c__v2" and store.dropped == []          # the swap stands
+    assert REVISION_ON not in manager.coordinator.valkey.values         # released, to be taken again
+
+    tiler.iter_docs = listing                                           # the tiler is back
+    status = _run_job(manager, manager.resume_orphaned)
+
+    assert status["state"] == "succeeded" and "interrupted" not in status
+
+
+def test_a_job_shut_down_after_its_swap_is_finished_by_the_next_process():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    manager = _manager(store, tiler)
+    manager.coordinator.DRAIN_POLL_SEC = 0.005
+    valkey = manager.coordinator.valkey
+    enrolling_elsewhere = make_coordinator(store, valkey=valkey)
+    successor = _manager(store, tiler, make_coordinator(store, valkey=valkey))
+
+    async def go():
+        async with enrolling_elsewhere.enrolling("long"):               # the job waits for it after its swap
+            await manager.start()
+
+            while manager.status.get("phase") != "syncing":
+                await asyncio.sleep(0.001)
+
+            await manager.close()                                       # shutdown
+            await manager.coordinator.close()
+
+        left = dict(valkey.values[REVISION_STATUS][0])
+
+        await successor.resume_orphaned()
+        await successor._task
+
+        return left, successor.status
+
+    left, status = asyncio.run(go())
+
+    assert left["state"] == "running" and "error" not in left          # not failed: to be finished
+    assert status["state"] == "succeeded" and status["owner"]["token"] == successor.coordinator.token
+
+
+def test_a_job_shut_down_while_building_is_failed():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.docs = [_doc("a", 1)]
+    manager = _manager(store, tiler)
+    reached = asyncio.Event()
+
+    async def stall():
+        reached.set()
+        await asyncio.sleep(60)
+
+    store.on_build = stall
+
+    async def go():
+        await manager.start()
+        await reached.wait()
+        await manager.close()
+
+        return manager.status
+
+    status = asyncio.run(go())
+
+    assert status["state"] == "failed" and "cancelled" in status["error"]
+    assert not hasattr(store, "swapped_to")
 
 
 # ---------------------------------------------------------------------------

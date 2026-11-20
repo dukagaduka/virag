@@ -1,7 +1,7 @@
 """Enroll self-repair: keep Qdrant a consistent subset of the tiler.
 
-Runs at startup and (optionally) on an interval, in the one process leading it
-(`Coordinator.lead_reconcile`). Two passes:
+Runs at startup and (optionally) on an interval — every process tries, the pass runs
+in the one leading it (`Coordinator.lead_reconcile`). Two passes:
 
   1. Enforce the `Qdrant ⊆ Tiler` invariant — delete any Qdrant points whose doc_id
      the tiler no longer has (a dangling hit would 404 on tile fetch).
@@ -17,7 +17,6 @@ virag metadata, so there are no foreign docs to misjudge.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from virag.clients.qdrant_store import QdrantStore
@@ -46,31 +45,6 @@ async def reconcile(
 
     await enforce_subset(store, coordinator, tiler)
     await finish_abandoned(coordinator, tiler, enroller, settings)
-
-
-async def run_periodic(
-    store: QdrantStore,
-    coordinator: Coordinator,
-    tiler: TilerService,
-    enroller: Enroller,
-    settings: ReconcileSettings,
-) -> None:
-    """Loop reconcile on the configured interval until cancelled (interval 0 = disabled).
-    Every process loops; the pass runs in the one leading it."""
-    if settings.interval_sec <= 0:
-        return
-
-    while True:
-        await asyncio.sleep(settings.interval_sec)
-
-        try:
-            await reconcile(store, coordinator, tiler, enroller, settings)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as e:  # noqa: BLE001 - a periodic sweep must never crash the loop
-            log.error("periodic reconcile failed: %r", e)
 
 
 async def enforce_subset(

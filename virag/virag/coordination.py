@@ -305,6 +305,22 @@ class Coordinator:
         return status
 
 
+    async def orphaned_job(self) -> dict | None:
+        """The status of a job that still reads `running` though no other live process
+        holds it — its process died, or it stopped short of its end — as it was left.
+        None when the last job concluded or another process is running one. (For a
+        process that is not running a job itself.)"""
+        status = await self.valkey.get_json(REVISION_STATUS) or {}
+        if status.get("state") != "running":
+            return None
+
+        holder = await self.valkey.get(REVISION_ON)
+        if holder not in (None, self.token) and not await self._owner_dead(holder):
+            return None
+
+        return status
+
+
     # ------------------------------------------------------------------ #
     # reconcile
     # ------------------------------------------------------------------ #

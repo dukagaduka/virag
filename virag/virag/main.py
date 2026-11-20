@@ -18,9 +18,9 @@ from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding, enforce_metadata_schema
 from virag.coordination import Coordinator
 from virag.enroll import Enroller
-from virag.reconcile import reconcile, run_periodic
+from virag.reconcile import reconcile
 from virag.revision import RevisionManager
-from virag.utils import cancel
+from virag.utils import cancel, every
 from virag.api import enroll as enroll_api
 from virag.api import chat_completions as chat_completions_api
 from virag.api import models as models_api
@@ -169,19 +169,25 @@ async def lifespan(app: FastAPI):
         )
         stack.push_async_callback(revision.close)
 
-        # Repair any partial/orphaned enrolls left by an earlier crash before serving
-        # (in the process leading reconcile).
-        await reconcile(store, coordinator, tiler, enroller, settings.reconcile_settings)
+        async def upkeep() -> None:
+            """What a process repairs at startup and then on the reconcile interval: a
+            job left after its alias move, then the enrolls (in the process leading
+            reconcile)."""
+            await revision.resume_orphaned()
+            await reconcile(store, coordinator, tiler, enroller, settings.reconcile_settings)
+
+        # Repair what an earlier crash left before serving.
+        await upkeep()
 
         # A collection embedded from another render_version answers chat with
         # RENDER_VERSION_MISMATCH until rebuilt; with the flag on it is rebuilt right away.
         await revision.revise_if_stale(auto=settings.revision_settings.revision_on_render_mismatch)
 
         # Registered last, so it is cancelled first — before the clients it uses close.
-        reconcile_task = asyncio.create_task(
-            run_periodic(store, coordinator, tiler, enroller, settings.reconcile_settings)
+        upkeep_task = asyncio.create_task(
+            every(settings.reconcile_settings.interval_sec, upkeep, name="periodic upkeep")
         )
-        stack.push_async_callback(cancel, reconcile_task)
+        stack.push_async_callback(cancel, upkeep_task)
 
         app.state.settings = settings
         app.state.store = store

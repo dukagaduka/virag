@@ -184,10 +184,11 @@ which has to cover the upstream's longest silence.
   §9.
 - **Lease** — the process takes its lease in Valkey and starts the heartbeat that
   renews it (§10).
-- **Reconcile** — one `reconcile()` pass runs before serving (repairing any partial or
-  orphaned enrolls left by an earlier crash) in the process leading reconcile; a
-  background task in every process repeats it on `VIRAG_RECONCILE_INTERVAL_SEC`, and the
-  pass runs in the leader. See §9.
+- **Upkeep** — before serving, a process finishes a revision / rollback job left after
+  its alias move (`RevisionManager.resume_orphaned`, in the background) and runs one
+  `reconcile()` pass (repairing any partial or orphaned enrolls left by an earlier
+  crash; in the process leading reconcile); a background task in every process repeats
+  both on `VIRAG_RECONCILE_INTERVAL_SEC`. See §9.
 - **render_version check** (`RevisionManager.revise_if_stale`) — a collection embedded
   from another `render_version` than the tiler's is logged; with
   `VIRAG_REVISION_ON_RENDER_MISMATCH=true` the revision starts right away, unless
@@ -315,6 +316,18 @@ waits for the enrolls in flight (they may be writing into the abandoned one), dr
 and syncs the docs enrolled since `retired_at`, under the same job lock and journal. It is refused when
 the retained collection was embedded from another `render_version` than the tiler's.
 
+**A job past its alias move is always finished.** Before the swap a job that stops is
+failed and costs nothing: the old collection keeps serving, the next request rebuilds.
+After it the alias points at a collection that lacks the journaled docs, though the
+tiler has them enrolled — invisible to reconcile. So from the alias move on a job that
+stops (its process died or was shut down, a backend failed it) keeps the status
+`running` and lets go of `revision:on`; `resume_orphaned` — every process, at startup
+and on the reconcile interval — finds a `running` job nobody holds whose `collection`
+is the serving one, takes it over and runs only its tail: the wait for the enrolls in
+flight, the sync, the invariant. Everything the tail needs outlives the process: the
+journal in Valkey, and in the status the collections' names and — published before a
+rollback's repoint — its `retired_at`.
+
 **render_version.** The tiler binds `render_version` to its volume like geometry and
 never serves a doc rendered by another one; every tile it returns names its
 `X-Render-Version`. virag records the `render_version` on each point (and on the
@@ -370,7 +383,9 @@ nobody waits out the TTL.
   → `409` with its status; dead → `SET IFEQ` takes it over (the new job starts from
   scratch; a leftover build is dropped). The status is published only while the job is
   still this process's; a `running` status whose owner's lease is gone reads as
-  `failed: owner lost`. Before the swap (or the rollback's repoint) the job checks it
+  `failed: owner lost`. A job that reads `running` while no other live process holds
+  `revision:on` is orphaned (`Coordinator.orphaned_job`): finished if it had moved the
+  alias (§9), left for the next request otherwise. Before the swap (or the rollback's repoint) the job checks it
   still holds `revision:on` and its lease — the fencing that keeps a replaced process
   from swapping. On the way out it publishes the outcome and `DELIFEQ`s the lock.
 - *Enrolls and journal.* An enroll takes its document (`enroll:<doc_id>`; held by a
@@ -394,9 +409,9 @@ nobody waits out the TTL.
 
 **Failure modes.** A process killed outright loses its in-flight requests (the client
 retries, on another process); `restart` brings it back under a new token. The documents it was
-enrolling are free once its lease is gone; a job it ran reads as `owner lost`, the alias untouched (or
-swapped, with the sync left to the next revision), and the next `POST /revision` takes
-over. Valkey unreachable: chat keeps serving, enroll answers `503 NOT_READY`, a job
+enrolling are free once its lease is gone; a job it ran reads as `owner lost`: with the
+alias untouched the next `POST /revision` takes over, and with the alias moved a live
+process finishes it at its next upkeep (§9). Valkey unreachable: chat keeps serving, enroll answers `503 NOT_READY`, a job
 fails at its next step without swapping, reconcile skips its pass; past the TTL the
 processes restart on their expired leases. Valkey runs with AOF, so a short restart
 keeps the leases and the journal.

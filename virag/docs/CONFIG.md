@@ -59,7 +59,7 @@ interval — repairing partial/orphaned enrolls and propagating tiler deletes. S
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `VIRAG_SELF_HEAL` | no | `true` | On reconcile, enroll an abandoned pending doc again from the tiler's stored tiles when the tiler doc is complete and not quarantined (else just drop its partial points and leave it for re-enroll). |
-| `VIRAG_RECONCILE_INTERVAL_SEC` | no | `300` | Seconds between periodic reconcile passes (≥ 0). `0` disables the loop — the one-shot startup pass still runs. |
+| `VIRAG_RECONCILE_INTERVAL_SEC` | no | `300` | Seconds between periodic reconcile passes (≥ 0); on the same beat a process picks up a revision / rollback job left after its alias move. `0` disables the loop — the one-shot startup pass still runs. |
 
 ## Render version & revision
 

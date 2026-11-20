@@ -107,7 +107,6 @@ class FakeStore:
         self.physical_name = "c__v1"                          # where the fake alias points
         self.previous_name: str | None = None
         self.dropped: list[str] = []
-        self.rollback_retired_at = 0
         self.on_build = None                                  # async hook, runs as a revision builds
         self.queries: list[dict] = []
 
@@ -151,10 +150,12 @@ class FakeStore:
         self.previous_name = self.physical_name
         self._serve(new_physical)
 
-    async def rollback_alias(self, restored: str) -> int:
+    async def retired_at(self, physical: str) -> int:
+        return int((await self.get_collection_metadata(collection=physical)).get("retired_at") or 0)
+
+    async def rollback_alias(self, restored: str) -> None:
         self._serve(restored)
         self.previous_name = None
-        return self.rollback_retired_at
 
     async def get_collection_metadata(self, *, collection=None) -> dict:
         if collection not in (None, self.physical_name):
