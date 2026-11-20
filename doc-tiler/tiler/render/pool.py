@@ -47,7 +47,7 @@ class RenderPool:
         self.worker_restarts = 0
         self._pool: pebble.ProcessPool | None = None
         self._rebuild_lock = asyncio.Lock()
-        # Bulk work (ingest) holds at most the bulk slots, so get_tile from an
+        # Bulk work (ingest) holds at most the bulk slots, so a tile request from an
         # interactive caller always finds a free worker / browser.
         self._bulk_cpu = asyncio.Semaphore(settings.bulk_render_workers)
         self._bulk_browser = asyncio.Semaphore(settings.bulk_browsers)

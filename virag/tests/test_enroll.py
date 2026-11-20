@@ -193,7 +193,7 @@ def test_enroll_stream_error_rolls_back(make_client):
                "source_url": None, "render_version": "rv-test"}
         yield {"event": "error", "code": "INTERNAL", "message": "boom"}
 
-    tiler.tile_stream = bad_stream
+    tiler.ingest_stream = bad_stream
 
     r = client.post(
         "/enroll",
@@ -213,7 +213,7 @@ def test_enroll_relays_a_document_the_tiler_refuses(make_client):
         raise ApiError(status_code=415, message="The tiler refused the document: not a PDF")
         yield  # pragma: no cover - makes this an async generator
 
-    tiler.tile_stream = refusing_stream
+    tiler.ingest_stream = refusing_stream
 
     r = client.post(
         "/enroll",

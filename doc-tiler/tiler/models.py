@@ -22,7 +22,7 @@ SearchOp = Literal["eq", "ne", "gt", "gte", "lt", "lte"]
 
 
 class IngestResult(BaseModel):
-    """Result of `/tile`: the stored doc's identity and size, without its tiles."""
+    """Result of `POST /doc`: the stored doc's identity and size, without its tiles."""
 
     doc_id: str
     doc_type: DocType

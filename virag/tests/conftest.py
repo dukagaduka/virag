@@ -310,7 +310,7 @@ class Tile:
 
 @dataclass(slots=True)
 class TileResult:
-    """What FakeTiler.tile_stream emits: one doc's identity and its tiles."""
+    """What FakeTiler.ingest_stream emits: one doc's identity and its tiles."""
 
     doc_id: str
     doc_type: str
@@ -348,7 +348,7 @@ class FakeTiler:
         self.max_concurrency = 0
         self.fail_tiles: set[tuple] = set()
 
-    async def tile_stream(self, body, *, content_type, content_length=None):
+    async def ingest_stream(self, body, *, content_type, content_length=None):
         """Takes the relayed form in, as the tiler does before `begin`, then streams
         `_result`."""
         form = b"".join([chunk async for chunk in body])

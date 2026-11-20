@@ -25,7 +25,8 @@ def keyed_env(tmp_path):
         ("GET", "/schema/metadata"),
         ("GET", "/revision"),
         ("GET", "/doc/" + "0" * 64),
-        ("GET", "/get_tile?doc_id=" + "0" * 64 + "&tile_num=0"),
+        ("GET", "/doc/" + "0" * 64 + "/tiles/0"),
+        ("GET", "/doc/" + "0" * 64 + "/tiles"),
         ("POST", "/docs/search"),
     ],
 )
@@ -46,11 +47,11 @@ async def test_probes_and_metrics_stay_open(keyed_env, path):
 
 async def test_the_right_key_passes(keyed_env):
     async with running_app(keyed_env) as (client, _):
-        assert (await client.post("/tile", **png_form(make_png(875, 1200)))).status_code == 401
+        assert (await client.post("/doc", **png_form(make_png(875, 1200)))).status_code == 401
 
-        r = await client.post("/tile", headers=AUTH, **png_form(make_png(875, 1200)))
+        r = await client.post("/doc", headers=AUTH, **png_form(make_png(875, 1200)))
         assert r.status_code == 200
-        r = await client.get("/get_tile", headers=AUTH, params={"doc_id": r.json()["doc_id"], "tile_num": 0})
+        r = await client.get(f"/doc/{r.json()['doc_id']}/tiles/0", headers=AUTH)
         assert r.status_code == 200
 
 

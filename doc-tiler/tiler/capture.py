@@ -1,7 +1,7 @@
 """URL capture: fetch a page through the SSRF guard and snapshot it as MHTML.
 
 The snapshot, not the live page, is what gets stored and rendered, so ingest and
-/get_tile share one source of truth.
+a tile request share one source of truth.
 """
 
 from __future__ import annotations

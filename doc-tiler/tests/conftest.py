@@ -103,7 +103,7 @@ def make_png(width: int = 1000, height: int = 2600) -> bytes:
 
 
 def upload(doc_type: str, data: bytes, name: str, mime: str, **fields: str) -> dict:
-    """Kwargs for `client.post("/tile", **upload(...))` (or "/tile/stream")."""
+    """Kwargs for `client.post("/doc", **upload(...))`."""
     return {
         "files": {"document": (name, data, mime)},
         "data": {"doc_type": doc_type, **fields},
@@ -123,8 +123,8 @@ def mhtml_form(data: bytes, name: str = "doc.mhtml", **fields: str) -> dict:
 
 
 async def ingest_tiles(client, form: dict, **params: str) -> dict:
-    """Ingest via /tile/stream; return the `committed` fields plus `tiles` (with bytes)."""
-    r = await client.post("/tile/stream", params=params, **form)
+    """Ingest via POST /doc?tiles=true; return the `committed` fields plus `tiles` (with bytes)."""
+    r = await client.post("/doc", params={"tiles": "true", **params}, **form)
     assert r.status_code == 200, r.text
 
     events = [json.loads(line) for line in r.content.splitlines() if line.strip()]

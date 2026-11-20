@@ -9,7 +9,8 @@ operator-declared metadata with fast indexed search.
 **Scope:** ingest (one-shot or streaming), blob storage, deterministic tiling, tile
 regeneration, in-place re-render (revision), original download, metadata search. **Not**
 in scope: embedding, the vector DB, retrieval, the LLM/VLM reader, the RAG gateway. The `(doc_id, tile_num)` pair returned with every tile
-is the contract the embedding stage stores as its payload to later call `/get_tile`.
+is the contract the embedding stage stores as its payload to later ask for the tile
+(`GET /doc/{doc_id}/tiles/{tile_num}`).
 
 ---
 
@@ -21,13 +22,13 @@ cp .env.example .env          # set TILER_API_KEY, adjust geometry/pixel if need
 docker compose up --build
 curl -s localhost:8080/readyz | jq
 
-# ingest a PDF: the answer is its doc_id and tile_count (/tile/stream also streams the tiles)
-curl -s -X POST localhost:8080/tile -H "Authorization: Bearer $TILER_API_KEY" \
+# ingest a PDF: the answer is its doc_id and tile_count (?tiles=true also streams the tiles)
+curl -s -X POST localhost:8080/doc -H "Authorization: Bearer $TILER_API_KEY" \
      -F doc_type=PDF -F document=@paper.pdf \
      -F 'metadata={"project":"atlas","year":2024,"source":{"host":"arxiv.org"}}' | jq
 
-# regenerate one tile
-curl -s 'localhost:8080/get_tile?doc_id=<sha256>&tile_num=3' -o tile3.jpg
+# one tile, rendered again from the stored original
+curl -s localhost:8080/doc/<sha256>/tiles/3 -o tile3.jpg
 
 # search by a declared key
 curl -s -X POST localhost:8080/docs/search -H 'content-type: application/json' \

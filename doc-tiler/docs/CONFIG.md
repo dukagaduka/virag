@@ -57,10 +57,10 @@ stored docs are re-rendered by a revision before the service serves again (see
 |---|---|---|
 | `TILER_N_BROWSERS` | `min(cpu, 4)` | Max concurrent Chromium renders (semaphore). |
 | `TILER_N_RENDER_WORKERS` | `cpu_count` | Process-pool size (PDF raster / PIL / hashing). |
-| `TILER_N_BULK_RENDER_WORKERS` | `render_workers // 2` | Process-pool tasks ingest may hold at once, so interactive `get_tile` always finds a free worker (min 1). |
+| `TILER_N_BULK_RENDER_WORKERS` | `render_workers // 2` | Process-pool tasks ingest may hold at once, so an interactive tile request always finds a free worker (min 1). |
 | `TILER_N_BULK_BROWSERS` | `browsers // 2` | Chromium renders ingest (URL capture, MHTML) may hold at once (min 1). |
 | `TILER_RECYCLE_AFTER` | `500` | Recycle a Chromium process after N renders. |
-| `TILER_RENDER_CACHE_SIZE` | `64` | LRU capacity for `get_tile`. |
+| `TILER_RENDER_CACHE_SIZE` | `64` | LRU capacity of the tile cache (`GET /doc/{id}/tiles/{n}`). |
 
 ## Limits & policy
 
@@ -73,7 +73,7 @@ stored docs are re-rendered by a revision before the service serves again (see
 | `TILER_URL_FETCH_ENABLED` | `true` | Allow `URL` input type. |
 | `TILER_URL_ALLOW_PRIVATE` | `false` | If `false`, SSRF-block private targets (see [SECURITY.md](SECURITY.md)). |
 
-An `image_hash` mismatch on `get_tile?verify=true` always answers `409`: every served doc
+An `image_hash` mismatch on a tile request (`verify=true`) always answers `409`: every served doc
 was rendered by the current `render_version`, so a mismatch is non-determinism, not
 drift. (`TILER_RENDER_MISMATCH_POLICY` is gone; a leftover value is ignored.)
 

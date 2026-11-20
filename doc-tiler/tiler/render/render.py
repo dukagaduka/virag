@@ -3,7 +3,7 @@
 Everything here runs inside the render workers, never on the event loop, and must stay
 picklable: plain functions over the bytes or paths handed in, no app state.
 
-Ingest and /get_tile deliberately share these functions — same decode, same resize,
+Ingest and a tile request deliberately share these functions — same decode, same resize,
 same JPEG encoder settings — so a regenerated tile is byte-identical to the one hashed
 at ingest.
 """
@@ -85,7 +85,7 @@ def open_image(source: str | bytes, min_width: int | None = None) -> Image.Image
     except Exception as exc:
         raise DecodeError(f"cannot decode image: {exc}") from exc
 
-    # Normalise EXIF rotation at decode so ingest and get_tile agree.
+    # Normalise EXIF rotation at decode so ingest and a tile request agree.
     return ImageOps.exif_transpose(img) or img
 
 

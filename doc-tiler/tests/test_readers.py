@@ -96,7 +96,7 @@ def test_a_tile_is_deterministic(tmp_path):
 
 def test_rows_read_apart_join_without_seams(tmp_path):
     """Rows read piece by piece match the page read whole up to resampling noise: a
-    tile depends only on its own rows, which is what lets /get_tile read just them."""
+    tile depends only on its own rows, which is what lets a tile request read just them."""
     path = _file(tmp_path, _text_pdf((595, 842)))
     height, _ = PdfReader(path, PARAMS).layout()
 

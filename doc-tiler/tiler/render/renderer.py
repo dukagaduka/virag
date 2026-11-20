@@ -28,7 +28,7 @@ from ..models import DocType
 from .documents import DOCUMENTS, Document
 from .pool import RenderPool
 
-Purpose = Literal["ingest", "revise", "regenerate"]
+Purpose = Literal["ingest", "revise", "tiles"]
 
 
 class Renderer:

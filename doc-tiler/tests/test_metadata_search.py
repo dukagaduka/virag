@@ -13,7 +13,7 @@ from tiler.store.meta import SearchFilter, build_search_query
 
 async def ingest(client, pages: int, metadata: dict | None = None):
     fields = {"metadata": json.dumps(metadata)} if metadata is not None else {}
-    r = await client.post("/tile", **pdf_form(make_pdf(pages=pages), **fields))
+    r = await client.post("/doc", **pdf_form(make_pdf(pages=pages), **fields))
     assert r.status_code == 200, r.text
     return r.json()["doc_id"]
 
@@ -209,15 +209,15 @@ def _schema():
 
 
 async def test_validation_rejects_bad_types_and_missing_required(client):
-    r = await client.post("/tile", **pdf_form(make_pdf(1), metadata=json.dumps({"year": "abc"})))
+    r = await client.post("/doc", **pdf_form(make_pdf(1), metadata=json.dumps({"year": "abc"})))
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "METADATA_SCHEMA_VIOLATION"
 
-    r = await client.post("/tile", **pdf_form(make_pdf(1), metadata="{not json"))
+    r = await client.post("/doc", **pdf_form(make_pdf(1), metadata="{not json"))
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "INVALID_METADATA_JSON"
 
-    r = await client.post("/tile", **pdf_form(make_pdf(1), metadata=json.dumps(["a"])))
+    r = await client.post("/doc", **pdf_form(make_pdf(1), metadata=json.dumps(["a"])))
     assert r.status_code == 422
 
 
@@ -234,9 +234,9 @@ fields:
     path.write_text(schema)
     env["TILER_METADATA_SCHEMA_PATH"] = str(path)
     async with running_app(env) as (client, _):
-        r = await client.post("/tile", **pdf_form(make_pdf(1), metadata=json.dumps({"x": 1})))
+        r = await client.post("/doc", **pdf_form(make_pdf(1), metadata=json.dumps({"x": 1})))
         assert r.status_code == 422
-        r = await client.post("/tile", **pdf_form(make_pdf(1), metadata=json.dumps({"project": "p"})))
+        r = await client.post("/doc", **pdf_form(make_pdf(1), metadata=json.dumps({"project": "p"})))
         assert r.status_code == 200
 
 

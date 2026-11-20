@@ -293,7 +293,7 @@ async def capture_url_mhtml(
     """Navigate to `url` and snapshot it as MHTML — the archived blob we store.
 
     The blob, not the live page, is what later renders produce tiles from, so
-    ingest and /get_tile share one source of truth.
+    ingest and a tile request share one source of truth.
     """
     async with pool.context(proxy=proxy) as ctx:
         page = await ctx.new_page()

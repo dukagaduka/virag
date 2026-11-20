@@ -81,14 +81,14 @@ async def test_disabled_url_fetching():
 async def test_url_ingest_returns_403(tmp_path):
     env = base_env(tmp_path, TILER_URL_FETCH_ENABLED="true", TILER_BROWSER_ENABLED="false")
     async with running_app(env) as (client, _):
-        r = await client.post("/tile", data={"doc_type": "URL", "url": "http://169.254.169.254/"})
+        r = await client.post("/doc", data={"doc_type": "URL", "url": "http://169.254.169.254/"})
         assert r.status_code == 403
         assert r.json()["error"]["code"] == "SSRF_BLOCKED"
 
 
 async def test_url_without_url_field_is_400(tmp_path):
     async with running_app(base_env(tmp_path, TILER_URL_FETCH_ENABLED="true")) as (client, _):
-        r = await client.post("/tile", data={"doc_type": "URL"})
+        r = await client.post("/doc", data={"doc_type": "URL"})
         assert r.status_code == 400
         assert r.json()["error"]["code"] == "MISSING_URL"
 

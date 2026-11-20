@@ -93,7 +93,7 @@ are not part of it): run `POST /revision?force=true` yourself, then virag's
 `POST /revision`.
 
 Docs that cannot be re-rendered are **quarantined** (`GET /revision` lists them;
-`/get_tile` answers `410`); re-ingest their bytes to restore them.
+their tiles answer `410`); re-ingest their bytes to restore them.
 
 **Rollback:** stop the tiler, put the previous image back, restore the DB from the
 backup (`cp meta.sqlite.bak-<rv> meta.sqlite`, removing `meta.sqlite-wal` / `-shm`), start

@@ -58,7 +58,7 @@ When RAG is on, `_run_rag` runs before the upstream call:
 3. **Search.** Qdrant top-`K` (`top_k`); a `retriever_threshold` goes into the same
    query as Qdrant's `score_threshold`, so Qdrant applies it by the collection's
    distance (a floor for `Cosine`/`Dot`, a ceiling for `Euclid`/`Manhattan`).
-4. **Fetch tiles.** For each hit, call doc-tiler `GET /get_tile?doc_id&tile_num`
+4. **Fetch tiles.** For each hit, call doc-tiler `GET /doc/{doc_id}/tiles/{tile_num}`
    (concurrently) and base64-encode the JPEG. A tile the tiler refuses (`404`, `410`,
    its own hash `409`, …) is logged and **skipped**, not fatal. A tiler that is
    unreachable or not serving (`503`) fails the request with `503 NOT_READY` — virag
@@ -140,7 +140,7 @@ which has to cover the upstream's longest silence.
   and may carry a vLLM `priority`; chat queries bypass both, so an ingest never queues a
   user's query. `check_connection()` also learns the vector size (checked against
   `QDRANT_VECTOR_SIZE`), resolves image batching and verifies the bulk priority.
-- **`TilerService`** — doc-tiler client: `tile_stream()` (the NDJSON ingest stream
+- **`TilerService`** — doc-tiler client: `ingest_stream()` (the NDJSON ingest stream
   `/enroll` consumes), `doc_stream()` (the same stream of a stored doc: self-heal, a
   revision's sync), `get_tile()`, `get_info()` (for binding), `get_schema()` (metadata
   schema guard), `get_metadata()` / `patch_metadata()` (document names; the enroll's
@@ -209,7 +209,7 @@ open stream from holding this past compose's `stop_grace_period`.
 ## 8. Enrollment & the Qdrant ⊆ Tiler invariant
 
 `/enroll` (`api/enroll.py`) is **streaming** both ways. The upload is relayed: the form
-is the tiler's own, so the request body goes on to the tiler's `POST /tile/stream` chunk
+is the tiler's own, so the request body goes on to the tiler's `POST /doc?tiles=true` chunk
 by chunk as it arrives (`EnrollUpload`) — virag holds nothing of the document, in memory
 or on disk, and reads only the `metadata` field on the way (`utils.MultipartFields`), for
 the name policy and the tiler's metadata patch. The handler then hands the tiler's

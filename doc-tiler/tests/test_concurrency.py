@@ -25,7 +25,7 @@ async def test_healthz_stays_fast_during_concurrent_ingests(client):
             await asyncio.sleep(0.005)
 
     poller = asyncio.create_task(poll())
-    results = await asyncio.gather(*(client.post("/tile", **pdf_form(d)) for d in docs))
+    results = await asyncio.gather(*(client.post("/doc", **pdf_form(d)) for d in docs))
     stop.set()
     await poller
 
@@ -37,12 +37,12 @@ async def test_healthz_stays_fast_during_concurrent_ingests(client):
 
 
 async def test_concurrent_tile_requests_render_once(client):
-    manifest = (await client.post("/tile", **png_form(make_png(875, 3000)))).json()
+    manifest = (await client.post("/doc", **png_form(make_png(875, 3000)))).json()
     await client.state.tiles.cache.clear()
-    params = {"doc_id": manifest["doc_id"], "tile_num": 1}
+    tile = f"/doc/{manifest['doc_id']}/tiles/1"
 
     misses_before = client.state.tiles.cache.misses
-    responses = await asyncio.gather(*(client.get("/get_tile", params=params) for _ in range(8)))
+    responses = await asyncio.gather(*(client.get(tile) for _ in range(8)))
 
     assert all(r.status_code == 200 for r in responses)
     assert len({r.content for r in responses}) == 1
@@ -55,7 +55,7 @@ async def test_reads_never_see_a_commit_half_way(client, sample_pdf):
     """A read made while a commit is between its statements sees the doc as it was
     committed last — not the transaction's own view, with the old tiles already gone."""
     store = client.state.store
-    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+    doc_id = (await client.post("/doc", **pdf_form(sample_pdf))).json()["doc_id"]
     before = await store.get_tiles(doc_id)
     assert len(before) == 3
 
@@ -77,7 +77,7 @@ async def test_reads_never_see_a_commit_half_way(client, sample_pdf):
     try:
         assert await store.get_tiles(doc_id) == before
         assert ((await store.get_doc(doc_id)).tile_count, (await store.get_doc(doc_id)).height) != (1, 7)
-        got = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 2})
+        got = await client.get(f"/doc/{doc_id}/tiles/2")
         assert got.status_code == 200, got.text
 
     finally:
@@ -126,7 +126,7 @@ async def test_failed_render_is_not_cached():
 
 
 async def test_metrics_endpoint_exposes_counters(client):
-    await client.post("/tile", **png_form(make_png(875, 1100)))
+    await client.post("/doc", **png_form(make_png(875, 1100)))
     body = (await client.get("/metrics")).text
     assert "tiler_renders_total" in body
     assert "tiler_docs" in body

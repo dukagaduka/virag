@@ -1,10 +1,10 @@
-"""Regenerate tiles from the stored original: one of them, or a document's whole stream."""
+"""A stored document's tiles, rendered from its original: one of them, or the whole stream."""
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from .deps import ERROR_RESPONSES, check_doc_id, ndjson_response
@@ -13,20 +13,42 @@ router = APIRouter()
 
 
 @router.get(
-    "/get_tile",
+    "/doc/{doc_id}/tiles",
+    responses={200: {"content": {"application/x-ndjson": {}}}, **ERROR_RESPONSES},
+    response_class=StreamingResponse,
+    summary="Stream a stored document's tiles as NDJSON, as the ingest of its bytes would.",
+    operation_id="streamDocumentTiles",
+)
+async def stream_document_tiles(request: Request, doc_id: str) -> StreamingResponse:
+    """The event stream `POST /doc?tiles=true` answers to bytes the store already holds
+    — `begin`, the tiles rendered again, `committed` — asked for by doc_id.
+
+    A doc that is unknown, still being ingested or quarantined is an HTTP error; from
+    `begin` on errors surface as an in-stream `error` event.
+    """
+    state = request.app.state
+    check_doc_id(doc_id)
+
+    return await ndjson_response(state.tiles.stream(doc_id), tile_width=state.settings.tile_width)
+
+
+@router.get(
+    "/doc/{doc_id}/tiles/{tile_num}",
     responses={200: {"content": {"image/jpeg": {}}}, **ERROR_RESPONSES},
     response_class=Response,
-    summary="Regenerate a single tile from the stored original.",
+    summary="One tile of a stored document, as JPEG.",
     operation_id="getTile",
 )
 async def get_tile(
     request: Request,
-    doc_id: Annotated[str, Query()],
-    tile_num: Annotated[int, Query(ge=0)],
+    doc_id: str,
+    tile_num: Annotated[int, Path(ge=0)],
     verify: Annotated[bool, Query()] = True,
 ) -> Response:
-    """Regenerate a single tile from the stored original and return it as JPEG."""
+    """Render a single tile from the stored original and return it as JPEG."""
     state = request.app.state
+    check_doc_id(doc_id)
+
     jpeg, tile_row, row = await state.tiles.get(doc_id, tile_num, verify)
 
     return Response(
@@ -42,23 +64,3 @@ async def get_tile(
             "Cache-Control": "public, max-age=31536000, immutable",
         },
     )
-
-
-@router.get(
-    "/doc/{doc_id}/tiles",
-    responses={200: {"content": {"application/x-ndjson": {}}}, **ERROR_RESPONSES},
-    response_class=StreamingResponse,
-    summary="Stream a stored document's tiles as NDJSON, as the ingest of its bytes would.",
-    operation_id="streamDocumentTiles",
-)
-async def stream_document_tiles(request: Request, doc_id: str) -> StreamingResponse:
-    """The event stream `/tile/stream` answers to bytes the store already holds —
-    `begin`, the tiles regenerated, `committed` — asked for by doc_id.
-
-    A doc that is unknown, still being ingested or quarantined is an HTTP error; from
-    `begin` on errors surface as an in-stream `error` event.
-    """
-    state = request.app.state
-    check_doc_id(doc_id)
-
-    return await ndjson_response(state.tiles.stream(doc_id), tile_width=state.settings.tile_width)

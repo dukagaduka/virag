@@ -38,13 +38,8 @@ class TilerService(HttpService):
 
 
     @property
-    def tile_stream_route(self):
-        return f"{self.base_url}/tile/stream"
-
-
-    @property
-    def get_tile_route(self):
-        return f"{self.base_url}/get_tile"
+    def ingest_route(self):
+        return f"{self.base_url}/doc"
 
 
     @property
@@ -73,6 +68,10 @@ class TilerService(HttpService):
 
     def doc_tiles_route(self, doc_id: str) -> str:
         return f"{self.base_url}/doc/{doc_id}/tiles"
+
+
+    def tile_route(self, doc_id: str, tile_num: int) -> str:
+        return f"{self.base_url}/doc/{doc_id}/tiles/{tile_num}"
 
 
     def metadata_route(self, doc_id: str) -> str:
@@ -118,15 +117,15 @@ class TilerService(HttpService):
             )
 
 
-    async def tile_stream(
+    async def ingest_stream(
         self,
         body: AsyncIterable[bytes],
         *,
         content_type: str,
         content_length: str | None = None,
     ):
-        """Relay an ingest form to the tiler and stream the ingest as NDJSON events
-        (begin, tile*, committed | error).
+        """Relay an ingest form to the tiler (`POST /doc?tiles=true`) and stream the
+        ingest as NDJSON events (begin, tile*, committed | error).
 
         `body` is the multipart form as the tiler takes it (`doc_type`, `document` |
         `url`, `metadata`), sent on as it is read — never held here; `content_type`
@@ -145,10 +144,11 @@ class TilerService(HttpService):
 
         async with self._stream(
             "POST",
-            self.tile_stream_route,
+            self.ingest_route,
             action="the ingest",
             retry=False,
             passthrough_statuses=self.REFUSALS,
+            params={"tiles": "true"},
             content=body,
             headers=headers,
         ) as response:
@@ -161,7 +161,7 @@ class TilerService(HttpService):
 
     async def doc_stream(self, doc_id: str):
         """Stream a document the tiler holds, as the ingest of its bytes would: the same
-        events, its tiles regenerated. A doc that is unknown, still being ingested or
+        events, its tiles rendered again. A doc that is unknown, still being ingested or
         quarantined fails before the stream begins."""
         async with self._stream(
             "GET",
@@ -182,25 +182,19 @@ class TilerService(HttpService):
         verify: bool = True,
         bulk: bool = False,
     ) -> bytes:
-        """Regenerate one tile. `bulk` calls (self-heal, revision) are capped by
+        """Fetch one tile, rendered by the tiler from the stored original. `bulk` calls (self-heal, revision) are capped by
         `max_concurrency`; interactive ones (chat RAG) bypass it, so a corpus rebuild
         never starves a user's query of tiles.
 
         `render_version` is the one the caller embedded the tile from: a tile the tiler
         rendered by another one is refused with 409 RENDER_VERSION_MISMATCH.
         """
-        params = {
-            "doc_id": doc_id,
-            "tile_num": tile_num,
-            "verify": verify,
-        }
-
         async with (self._guard() if bulk else nullcontext()):
             response = await self._request(
                 "GET",
-                self.get_tile_route,
+                self.tile_route(doc_id, tile_num),
                 action=f"tile regeneration ({doc_id}, {tile_num})",
-                params=params,
+                params={"verify": verify},
             )
 
         rendered_by = response.headers.get("X-Render-Version")

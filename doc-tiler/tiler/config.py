@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     safe_fullpage_px: int = 30000
     n_browsers: int = 0  # 0 => min(cpu, 4)
     n_render_workers: int = 0  # 0 => cpu count
-    # Slots bulk work (ingest) may hold, so interactive get_tile always finds a free one.
+    # Slots bulk work (ingest) may hold, so an interactive tile request always finds a free one.
     n_bulk_render_workers: int = 0  # 0 => render_workers // 2 (at least 1)
     n_bulk_browsers: int = 0  # 0 => browsers // 2 (at least 1)
     recycle_after: int = 500

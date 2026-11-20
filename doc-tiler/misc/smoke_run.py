@@ -4,10 +4,10 @@
 Point it at a directory of source documents and it will, purely through the HTTP
 API:
 
-  1. INGEST  — POST every file to /tile/stream, saving each streamed tile to disk.
+  1. INGEST  — POST every file to /doc?tiles=true, saving each streamed tile to disk.
   2. SEARCH  — pull the documents back via /docs/search (list-all plus a few
                indexed filters) to exercise metadata search end to end.
-  3. VERIFY  — regenerate every tile via /get_tile and check its bytes hash to
+  3. VERIFY  — fetch every tile again (/doc/{doc_id}/tiles/{tile_num}) and check its bytes hash to
                the image_hash the ingest manifest promised.
 
 Input types are inferred from file extension; a `urls.txt` in the directory (one
@@ -123,7 +123,7 @@ def discover(input_dir: Path) -> list[Item]:
 # Phase 1 — ingest
 # --------------------------------------------------------------------------- #
 def ingest(base_url: str, item: Item, out_root: Path) -> Record | None:
-    """POST one item to /tile/stream, then write every streamed tile to disk."""
+    """POST one item to /doc?tiles=true, then write every streamed tile to disk."""
     data = {"doc_type": item.doc_type, "metadata": json.dumps(item.metadata)}
     files = None
     if item.doc_type == "URL":
@@ -132,18 +132,18 @@ def ingest(base_url: str, item: Item, out_root: Path) -> Record | None:
         files = {"document": (item.path.name, item.path.read_bytes(), item.mime)}
 
     try:
-        resp = SESSION.post(f"{base_url}/tile/stream", data=data, files=files, timeout=300)
+        resp = SESSION.post(f"{base_url}/doc", params={"tiles": "true"}, data=data, files=files, timeout=300)
     except requests.RequestException as exc:
         print(f"  ! {item.name}: request failed: {exc}")
         return None
     if resp.status_code != 200:
-        print(f"  ! {item.name}: /tile/stream -> {resp.status_code} {resp.text[:200]}")
+        print(f"  ! {item.name}: POST /doc -> {resp.status_code} {resp.text[:200]}")
         return None
 
     events = [json.loads(line) for line in resp.content.splitlines() if line.strip()]
 
     if not events or events[-1]["event"] != "committed":
-        print(f"  ! {item.name}: /tile/stream ended with {events[-1] if events else 'nothing'}")
+        print(f"  ! {item.name}: the tile stream ended with {events[-1] if events else 'nothing'}")
         return None
 
     manifest = {
@@ -210,15 +210,15 @@ def search_phase(base_url: str, records: list[Record]) -> None:
 # Phase 3 — verify regeneration
 # --------------------------------------------------------------------------- #
 def verify_phase(base_url: str, records: list[Record]) -> tuple[int, int]:
-    """Regenerate every tile via /get_tile and compare to the stored hash+file."""
+    """Fetch every tile again and compare it to the stored hash+file."""
     ok = bad = 0
     for r in records:
         mism = []
         for tile in r.tiles:
             n = tile["tile_num"]
             resp = SESSION.get(
-                f"{base_url}/get_tile",
-                params={"doc_id": r.doc_id, "tile_num": n, "verify": "true"},
+                f"{base_url}/doc/{r.doc_id}/tiles/{n}",
+                params={"verify": "true"},
                 timeout=120,
             )
             if resp.status_code != 200:

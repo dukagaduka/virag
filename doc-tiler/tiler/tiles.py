@@ -2,7 +2,7 @@
 
 Tiles are never persisted. The store keeps a tile's place in the document image
 (`tiles.offset`, `tiles.height`) and the hash of its bytes; the blob and a deterministic
-render give the bytes back — one tile for /get_tile, or the whole document as the event
+render give the bytes back — one tile at a time, or the whole document as the event
 stream its ingest produced. A tile that does not hash to what was stored is refused
 (RENDER_MISMATCH).
 """
@@ -159,7 +159,7 @@ class Tiles:
         cut = [Tile(tile_row.tile_num, tile_row.offset, tile_row.height) for tile_row in tile_rows]
 
         async with self.renderer.open(
-            row.doc_type, self.blobs.path(row.doc_id), purpose="regenerate", bulk=bulk, height=row.height
+            row.doc_type, self.blobs.path(row.doc_id), purpose="tiles", bulk=bulk, height=row.height
         ) as doc:
             async with aclosing(doc.tiles(cut)) as tiles:
                 async for tile in tiles:

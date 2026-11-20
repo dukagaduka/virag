@@ -25,7 +25,7 @@ async def test_stream_sliced_round_trip(tmp_path):
         TILER_PDF_TILE_OVERLAP="100",
     )
     async with running_app(env) as (client, _state):
-        r = await client.post("/tile/stream", **pdf_form(pdf))
+        r = await client.post("/doc", params={"tiles": "true"}, **pdf_form(pdf))
         assert r.status_code == 200, r.text
         events = _events(r.content)
 
@@ -42,7 +42,7 @@ async def test_stream_sliced_round_trip(tmp_path):
             data = base64.b64decode(t["data"])
             assert hashlib.sha256(data).hexdigest() == t["image_hash"]
             got = await client.get(
-                "/get_tile", params={"doc_id": committed[0]["doc_id"], "tile_num": t["tile_num"]}
+                f"/doc/{committed[0]['doc_id']}/tiles/{t['tile_num']}"
             )
             assert got.status_code == 200, got.text
             assert hashlib.sha256(got.content).hexdigest() == t["image_hash"]
@@ -59,7 +59,7 @@ def _render_count(state, doc_type: str, path: str) -> float:
 
 
 async def test_stream_emits_tiles_then_committed(client, sample_pdf):
-    r = await client.post("/tile/stream", **pdf_form(sample_pdf))
+    r = await client.post("/doc", params={"tiles": "true"}, **pdf_form(sample_pdf))
     assert r.status_code == 200, r.text
 
     events = _events(r.content)
@@ -81,15 +81,15 @@ async def test_stream_emits_tiles_then_committed(client, sample_pdf):
         assert data[:3] == b"\xff\xd8\xff"             # JPEG
 
     # committed ⇒ doc is complete ⇒ tiles are servable.
-    got = await client.get("/get_tile", params={"doc_id": c["doc_id"], "tile_num": 0})
+    got = await client.get(f"/doc/{c['doc_id']}/tiles/0")
     assert got.status_code == 200
 
 
 async def test_stream_idempotent_replay_does_not_re_render(client, sample_pdf):
-    _events((await client.post("/tile/stream", **pdf_form(sample_pdf))).content)
+    _events((await client.post("/doc", params={"tiles": "true"}, **pdf_form(sample_pdf))).content)
     before = _render_count(client.state, "PDF", "ingest")
 
-    second = _events((await client.post("/tile/stream", **pdf_form(sample_pdf))).content)
+    second = _events((await client.post("/doc", params={"tiles": "true"}, **pdf_form(sample_pdf))).content)
     committed = [e for e in second if e["event"] == "committed"][0]
 
     assert committed["tile_count"] == 3
@@ -99,12 +99,12 @@ async def test_stream_idempotent_replay_does_not_re_render(client, sample_pdf):
 
 
 async def test_a_stored_doc_streams_by_its_id(client, sample_pdf):
-    """GET /doc/{id}/tiles answers what /tile/stream answers to bytes already stored,
+    """GET /doc/{id}/tiles answers what POST /doc?tiles=true answers to bytes already stored,
     in one render of the document."""
-    first = _events((await client.post("/tile/stream", **pdf_form(sample_pdf))).content)
-    replayed = _events((await client.post("/tile/stream", **pdf_form(sample_pdf))).content)
+    first = _events((await client.post("/doc", params={"tiles": "true"}, **pdf_form(sample_pdf))).content)
+    replayed = _events((await client.post("/doc", params={"tiles": "true"}, **pdf_form(sample_pdf))).content)
     doc_id = first[0]["doc_id"]
-    before = _render_count(client.state, "PDF", "regenerate")
+    before = _render_count(client.state, "PDF", "tiles")
 
     r = await client.get(f"/doc/{doc_id}/tiles")
     assert r.status_code == 200, r.text
@@ -114,7 +114,7 @@ async def test_a_stored_doc_streams_by_its_id(client, sample_pdf):
     assert [e["event"] for e in events] == ["begin", "tile", "tile", "tile", "committed"]
     assert events == replayed
     assert [e for e in events if e["event"] == "tile"] == [e for e in first if e["event"] == "tile"]
-    assert _render_count(client.state, "PDF", "regenerate") == before + 1   # not one per tile
+    assert _render_count(client.state, "PDF", "tiles") == before + 1   # not one per tile
 
 
 async def test_a_doc_stream_refuses_a_doc_that_is_not_stored(client):
@@ -126,7 +126,7 @@ async def test_a_doc_stream_refuses_a_doc_that_is_not_stored(client):
 async def test_a_drifted_tile_ends_a_doc_stream_with_an_error(client, sample_pdf):
     """The stream has begun, so the tile that no longer reproduces its hash is reported
     in it — and never sent."""
-    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+    doc_id = (await client.post("/doc", **pdf_form(sample_pdf))).json()["doc_id"]
     store = client.state.store
 
     async with store._lock:
@@ -165,12 +165,8 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
     assert (await state.store.get_doc(doc_id)).complete is False
     assert not state.blobs.exists(doc_id) and len(_spooled(state)) == 1    # the upload waits in .incoming
 
-    for route, params in (
-        ("/get_tile", {"doc_id": doc_id, "tile_num": 0}),
-        (f"/doc/{doc_id}", None),
-        (f"/doc/{doc_id}/tiles", None),
-    ):
-        got = await client.get(route, params=params)
+    for route in (f"/doc/{doc_id}/tiles/0", f"/doc/{doc_id}", f"/doc/{doc_id}/tiles"):
+        got = await client.get(route)
         assert got.status_code == 404
         assert got.json()["error"]["code"] == "DOC_INCOMPLETE"
 
@@ -178,8 +174,8 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
     assert [(d["doc_id"], d["complete"]) for d in listed] == [(doc_id, False)]
 
     # Its ingest owns it: the same bytes again, or a delete, are refused meanwhile.
-    for route in ("/tile", "/tile/stream"):
-        late = await client.post(route, **pdf_form(sample_pdf))
+    for tiles in ("false", "true"):
+        late = await client.post("/doc", params={"tiles": tiles}, **pdf_form(sample_pdf))
         assert (late.status_code, late.json()["error"]["code"]) == (409, "INGEST_IN_PROGRESS")
 
     gone = await client.delete(f"/doc/{doc_id}")
@@ -191,7 +187,7 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
 
     assert (await state.store.get_doc(doc_id)).complete is True
     assert state.blobs.exists(doc_id) and _spooled(state) == []            # moved into the store
-    assert (await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})).status_code == 200
+    assert (await client.get(f"/doc/{doc_id}/tiles/0")).status_code == 200
 
 
 async def test_what_fails_before_begin_is_an_http_error(client, sample_pdf):
@@ -199,10 +195,10 @@ async def test_what_fails_before_begin_is_an_http_error(client, sample_pdf):
     state = client.state
 
     files = {"document": ("x.pdf", b"this is not a pdf", "application/pdf")}
-    wrong = await client.post("/tile/stream", files=files, data={"doc_type": "PDF"})
+    wrong = await client.post("/doc", params={"tiles": "true"}, files=files, data={"doc_type": "PDF"})
     assert (wrong.status_code, wrong.json()["error"]["code"]) == (415, "UNSUPPORTED_MEDIA")
 
-    invalid = await client.post("/tile/stream", **pdf_form(sample_pdf, metadata='{"year": "soon"}'))
+    invalid = await client.post("/doc", params={"tiles": "true"}, **pdf_form(sample_pdf, metadata='{"year": "soon"}'))
     assert (invalid.status_code, invalid.json()["error"]["code"]) == (422, "METADATA_SCHEMA_VIOLATION")
 
     assert await state.store.count_docs() == 0
@@ -224,7 +220,7 @@ async def test_an_abandoned_ingest_leaves_nothing(client):
     assert await state.store.get_doc(doc_id) is None
     assert not state.blobs.exists(doc_id) and _spooled(state) == []
 
-    again = await client.post("/tile", **pdf_form(pdf))                # the bytes are welcome again
+    again = await client.post("/doc", **pdf_form(pdf))                # the bytes are welcome again
     assert again.status_code == 200 and again.json()["result"] == "rendered"
 
 
@@ -251,10 +247,10 @@ async def test_a_failed_render_leaves_nothing(client):
     broken = b"%PDF-1.7\n" + b"this is not a pdf at all " * 64
     doc_id = hashlib.sha256(broken).hexdigest()
 
-    r = await client.post("/tile", **pdf_form(broken))
+    r = await client.post("/doc", **pdf_form(broken))
     assert (r.status_code, r.json()["error"]["code"]) == (422, "DECODE_FAILED")
 
-    events = _events((await client.post("/tile/stream", **pdf_form(broken))).content)
+    events = _events((await client.post("/doc", params={"tiles": "true"}, **pdf_form(broken))).content)
     assert [e["event"] for e in events] == ["begin", "error"]
     assert events[-1]["code"] == "DECODE_FAILED"
 
@@ -297,7 +293,7 @@ async def test_startup_removes_what_a_killed_process_left(tmp_path, sample_pdf):
     doc_id = "d" * 64
 
     async with running_app(env) as (client, state):
-        kept = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+        kept = (await client.post("/doc", **pdf_form(sample_pdf))).json()["doc_id"]
 
         # A process killed mid-ingest: the row it inserted and the upload it spooled.
         await state.store.begin_doc(
@@ -309,7 +305,7 @@ async def test_startup_removes_what_a_killed_process_left(tmp_path, sample_pdf):
     async with running_app(env) as (client, state):
         assert await state.store.get_doc(doc_id) is None
         assert _spooled(state) == []
-        assert (await client.get("/get_tile", params={"doc_id": kept, "tile_num": 0})).status_code == 200
+        assert (await client.get(f"/doc/{kept}/tiles/0")).status_code == 200
 
 
 async def test_two_inserts_of_one_doc_let_one_through(client):

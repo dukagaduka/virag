@@ -70,7 +70,7 @@ async def test_mhtml_round_trip_identity(browser_env, tmp_path):
         for tile in manifest["tiles"]:
             assert tile["width"] == 875
             got = await client.get(
-                "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+                f"/doc/{manifest['doc_id']}/tiles/{tile['tile_num']}"
             )
             assert got.status_code == 200, got.text
             # regeneration reproduces the ingest bytes exactly.
@@ -102,7 +102,7 @@ async def test_sequential_strips_reuse_one_full_page_render(browser_env, tmp_pat
         misses_before = state.pool.page_cache.misses
         for tile in manifest["tiles"]:
             await client.get(
-                "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+                f"/doc/{manifest['doc_id']}/tiles/{tile['tile_num']}"
             )
         assert state.pool.page_cache.misses == misses_before + 1
         assert state.pool.page_cache.hits >= manifest["tile_count"] - 1
@@ -124,7 +124,7 @@ async def test_tall_page_uses_the_clip_path(tmp_path):
 
         for tile in manifest["tiles"]:
             got = await client.get(
-                "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+                f"/doc/{manifest['doc_id']}/tiles/{tile['tile_num']}"
             )
             assert got.status_code == 200, got.text
             assert hashlib.sha256(got.content).hexdigest() == tile["image_hash"]
@@ -176,7 +176,7 @@ async def test_url_ingest_end_to_end(tmp_path):
             assert manifest["tile_count"] >= 1
 
             got = await client.get(
-                "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": 0}
+                f"/doc/{manifest['doc_id']}/tiles/0"
             )
             assert got.status_code == 200
             assert (

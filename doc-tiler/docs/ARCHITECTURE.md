@@ -24,7 +24,8 @@ fast search), doc listing.
 **Out of scope:** embedding, Qdrant / vector search, retrieval, the LLM/VLM reader,
 the RAG gateway. The Tiler only produces and serves image bytes + identifiers +
 metadata. The `(doc_id, tile_num)` pair returned with every tile is the contract the
-embedding stage stores as its vector-DB payload to later call `/get_tile`.
+embedding stage stores as its vector-DB payload to later ask for the tile
+(`GET /doc/{doc_id}/tiles/{tile_num}`).
 
 ### Design invariants (non-negotiable)
 
@@ -89,9 +90,9 @@ alone, and there is one way from a file to its tiles — the `Renderer`
 open the document through it (`renderer.open(...)`) and read `doc.tiles()`. The document
 (`render/documents.py`) measures itself and cuts itself into tiles (`plan()`), unless
 the cut is given, and renders them batch by batch (`render()`). Each tile's `offset` and
-`height` are stored with it, so `get_tile` and a stored doc's stream pass that cut back
+`height` are stored with it, so a tile request and a stored doc's stream pass that cut back
 and never cut the document again. The Renderer also records every render in the metrics
-(`path` = ingest / regenerate / revise).
+(`path` = ingest / tiles / revise).
 
 How the rows are produced is the document's own business:
 
@@ -106,7 +107,7 @@ How the rows are produced is the document's own business:
 - `MhtmlDocument` loads the archive in a Chromium tab on the event loop: one full-page
   capture up to `TILER_SAFE_FULLPAGE_PX` (cached per document), a clip capture per tile
   beyond it; the workers encode. The path is chosen by `H` alone, so ingest and
-  `get_tile` always take the same one.
+  a tile request always take the same one.
 
 `RenderPool` (`render/pool.py`) only executes: it runs a task in a render worker or
 hands out a Chromium slot, bounds the work and keeps itself alive, and knows nothing
@@ -116,7 +117,7 @@ document, so a PDF stays parsed. The render params are the same for every task, 
 worker gets them once, at start.
 
 **Memory of a PDF tile.** A tile depends only on its own rows: a read rasterizes those
-rows (plus the resampling margin) and nothing else, so `get_tile` never rasterizes a
+rows (plus the resampling margin) and nothing else, so a tile request never rasterizes a
 page for one strip of it. The supersampling cap (a pixel-tier constant, in
 `render_version`) holds the raster to 4 × `W` wide, so a 1024-row tile takes at most
 ~43 MB of source raster; what a taller tile (an unsliced page) needs is bounded by the
@@ -158,7 +159,7 @@ is expensive to start; keep it warm and shared behind a semaphore.
   `captureSnapshot(mhtml)` → releases → the snapshot is stored and read like any MHTML
   archive → DB → response.
 
-### `get_tile` cache
+### Tile cache
 
 In-process **LRU** (`TILER_RENDER_CACHE_SIZE`), async-safe, with **in-flight
 coalescing** — a per-key future map so concurrent requests for the same tile render
@@ -248,7 +249,7 @@ the FS→S3 and SQLite→Postgres swaps to a driver change.
 
 **The blob is committed before the tile rows** (the reverse of the naive order). A blob
 without its tiles is inert and dedups away on the next ingest; tiles without their blob
-are a permanently broken `/get_tile`.
+are a tile that can never be served.
 
 ---
 
@@ -261,7 +262,7 @@ A document is an image of width exactly `W` and height `H`; a tile is its rows
 `[offset, offset + height)`. `docs.height = H`, and every tile's `offset` and `height`
 are stored in `tiles`.
 
-**Reverse (get_tile):** nothing to compute — the tile's stored rows are read back from
+**Reverse (a tile request):** nothing to compute — the tile's stored rows are read back from
 the blob. Ingest is the only place a document is cut, so the two cannot drift.
 
 ### 5.1 Web / MHTML / IMG — portrait strips
@@ -426,7 +427,7 @@ upgrade changes JPEG bytes exactly like a quality change does.
 `browsers.json` without launching a browser), so the value is stable even in a PDF-only
 deployment.
 
-`image_hash` (stored at ingest or revision) is the anchor: `get_tile?verify=true`
+`image_hash` (stored at ingest or revision) is the anchor: a tile request (`verify=true`, the default)
 recomputes and compares. Since every served doc was rendered by the current
 `render_version`, a mismatch can only be non-determinism (web/MHTML re-render drift, a
 base-image change `render_version` does not see) and always answers `409`. PDF/IMG are
@@ -453,7 +454,7 @@ static MHTML archive and would stall every render. Launch flags:
 disables.
 
 For `doc_type=URL` the browser snapshots the page to MHTML first, and that blob — not
-the live page — is what gets tiled, so ingest and `/get_tile` render the same source.
+the live page — is what gets tiled, so ingest and a tile request render the same source.
 Tall pages (> `TILER_SAFE_FULLPAGE_PX`) are captured per-strip via
 `page.screenshot(clip=...)` with a viewport-relative clip, scrolling into view so lazy
 content rasterizes. Ingest and regeneration call the *same* functions in
@@ -475,12 +476,12 @@ content rasterizes. Ingest and regeneration call the *same* functions in
 
 ### An ingest, step by step
 
-Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipeline:
+`POST /doc`, with `tiles=true` or without (see [API.md](API.md)), runs one pipeline:
 
 1. **Spool.** The upload goes to `.incoming`, hashed on the way: `doc_id`.
 2. **Known already?** A doc that is stored and servable is not rendered: its tiles are
-   replayed (the stream) or its summary returned (`/tile`). The replay — regenerated
-   tiles, each verified against its hash — is also what `GET /doc/{id}/tiles` answers
+   replayed (`tiles=true`) or its summary returned. The replay — the tiles rendered
+   again, each verified against its hash — is also what `GET /doc/{id}/tiles` answers
    to a consumer that has the id but not the bytes.
 3. **Row.** A new doc's row is inserted, `complete=0`, without tiles. The primary key
    settles a race: of two requests bringing the same bytes one inserts, the other is
@@ -490,8 +491,8 @@ Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipelin
 5. **Commit.** The blob is renamed into the store, then one transaction writes every
    tile row, the height and `complete=1`.
 
-- An **incomplete doc is listed but not served**: `GET /get_tile`, `GET /doc/{id}` and
-  `GET /doc/{id}/tiles` answer `404 DOC_INCOMPLETE`, `DELETE` answers `409` — it belongs to its ingest. A
+- An **incomplete doc is listed but not served**: its tiles (`GET /doc/{id}/tiles`,
+  `GET /doc/{id}/tiles/{n}`) and `GET /doc/{id}` answer `404 DOC_INCOMPLETE`, `DELETE` answers `409` — it belongs to its ingest. A
   consumer can already refer to it (its metadata can be patched).
 - **An ingest that does not commit leaves nothing**: on an error or a client that went
   away it removes its upload and the row it inserted, even while being cancelled; what
@@ -544,12 +545,12 @@ PATCH to lose, no ingest in flight, no cached tile of the old layout (the proces
 with empty caches). The gate, like the caches, lives in the one tiler process. The render path is counted under `path="revise"` in the metrics; it never
 touches any downstream (Qdrant).
 
-### Bulk slots (ingest vs `get_tile`)
+### Bulk slots (ingest vs a tile request)
 
-The render pool and the browser pool are FIFO and shared. Background work (`/tile`,
-`/tile/stream`, URL capture, a stored doc's stream `GET /doc/{id}/tiles`) holds at most `TILER_N_BULK_RENDER_WORKERS` pool tasks and
+The render pool and the browser pool are FIFO and shared. Background work (an ingest,
+URL capture, a stored doc's stream `GET /doc/{id}/tiles`) holds at most `TILER_N_BULK_RENDER_WORKERS` pool tasks and
 `TILER_N_BULK_BROWSERS` Chromium renders at once (default: half of each pool), so a
-900-page PDF fanning out over the pool never queues an interactive `get_tile` behind all
+900-page PDF fanning out over the pool never queues an interactive tile request behind all
 its chunks. Bulk slots are granted in task-creation order, so the in-order consumer of a
 sliced PDF stream never waits on a group that is itself waiting for a slot.
 

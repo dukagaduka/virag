@@ -180,7 +180,7 @@ def create_app() -> FastAPI:
     keyed = [Depends(require_api_key)]
     serving = [*keyed, Depends(require_serving)]
 
-    app.include_router(ingest_api.router, tags=["tiles"], dependencies=serving)
+    app.include_router(ingest_api.router, tags=["docs"], dependencies=serving)
     app.include_router(tiles_api.router, tags=["tiles"], dependencies=serving)
     app.include_router(docs_api.router, tags=["docs"], dependencies=serving)
     app.include_router(metadata_api.router, tags=["metadata"], dependencies=serving)

@@ -2,7 +2,7 @@
 
 A document is one image `TILE_WIDTH` wide; a tile is a run of its rows. The cut is made
 once, at ingest, and stored with the tile (`tiles.offset`, `tiles.height`), so
-/get_tile reads a tile's rows back instead of cutting the document again.
+a tile request reads the tile's rows back instead of cutting the document again.
 """
 
 from __future__ import annotations

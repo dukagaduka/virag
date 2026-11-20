@@ -24,7 +24,7 @@ async def test_img_strip_geometry_and_round_trip(client):
 
     for tile in manifest["tiles"]:
         got = await client.get(
-            "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+            f"/doc/{manifest['doc_id']}/tiles/{tile['tile_num']}"
         )
         assert got.status_code == 200
         assert hashlib.sha256(got.content).hexdigest() == tile["image_hash"]
@@ -54,32 +54,29 @@ async def test_overlap_changes_tile_count(tmp_path):
         assert [t["height"] for t in manifest["tiles"]] == [1024, 1024, 1024, 1024, 400]
         for tile in manifest["tiles"]:
             got = await client.get(
-                "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+                f"/doc/{manifest['doc_id']}/tiles/{tile['tile_num']}"
             )
             assert hashlib.sha256(got.content).hexdigest() == tile["image_hash"]
 
 
 async def test_cache_serves_repeated_tiles(client):
-    manifest = (await client.post("/tile", **png_form(make_png(875, 2600)))).json()
-    params = {"doc_id": manifest["doc_id"], "tile_num": 1}
-    await client.get("/get_tile", params=params)
+    manifest = (await client.post("/doc", **png_form(make_png(875, 2600)))).json()
+    tile = f"/doc/{manifest['doc_id']}/tiles/1"
+    await client.get(tile)
     hits_before = client.state.tiles.cache.hits
-    await client.get("/get_tile", params=params)
+    await client.get(tile)
     assert client.state.tiles.cache.hits == hits_before + 1
 
 
 async def test_verify_false_skips_hash_check(client):
-    manifest = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()
-    got = await client.get(
-        "/get_tile",
-        params={"doc_id": manifest["doc_id"], "tile_num": 0, "verify": "false"},
-    )
+    manifest = (await client.post("/doc", **png_form(make_png(875, 1200)))).json()
+    got = await client.get(f"/doc/{manifest['doc_id']}/tiles/0", params={"verify": "false"})
     assert got.status_code == 200
 
 
 async def test_drifted_tile_is_refused(client):
     """A poisoned image_hash simulates render non-determinism → 409, never served."""
-    manifest = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()
+    manifest = (await client.post("/doc", **png_form(make_png(875, 1200)))).json()
     doc_id = manifest["doc_id"]
     store = client.state.store
     async with store._lock:
@@ -90,9 +87,9 @@ async def test_drifted_tile_is_refused(client):
         await store.db.commit()
     await client.state.tiles.cache.clear()
 
-    r = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})
+    r = await client.get(f"/doc/{doc_id}/tiles/0")
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "RENDER_MISMATCH"
 
-    ok = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0, "verify": "false"})
+    ok = await client.get(f"/doc/{doc_id}/tiles/0", params={"verify": "false"})
     assert ok.status_code == 200

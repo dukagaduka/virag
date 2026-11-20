@@ -60,7 +60,7 @@ async def enroll(request: Request, allow_missing_name: bool = False):
     upload = EnrollUpload(request, allow_missing_name=allow_missing_name)
     log.info("enroll request: %s bytes", request.headers.get("content-length", "?"))
 
-    events = tiler.tile_stream(
+    events = tiler.ingest_stream(
         upload.chunks(),
         content_type=request.headers["content-type"],
         content_length=request.headers.get("content-length"),

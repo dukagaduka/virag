@@ -22,7 +22,7 @@ All metric names are prefixed `tiler_`.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `tiler_ingest_total` | counter | `doc_type`, `result` | Successful ingests. `result` is `rendered` or `idempotent` (identical bytes already stored). |
-| `tiler_renders_total` | counter | `doc_type`, `path` | Document renders **actually performed**. A cache hit or an idempotency hit does **not** increment this — it is the anchor for the idempotency tests. `path` ∈ {`ingest` (both `POST /tile` and the `POST /tile/stream` ingest path), `regenerate` (`get_tile`: one tile per render; a stored doc's stream — `GET /doc/{id}/tiles`, or `/tile/stream` replaying stored bytes: the whole doc in one render), `revise` (the revision re-render path)}. |
+| `tiler_renders_total` | counter | `doc_type`, `path` | Document renders **actually performed**. A cache hit or an idempotency hit does **not** increment this — it is the anchor for the idempotency tests. `path` ∈ {`ingest` (`POST /doc`, with `tiles=true` or without), `tiles` (a stored doc's tiles rendered again — `GET /doc/{id}/tiles/{n}`: one tile per render; `GET /doc/{id}/tiles`, or an ingest with `tiles=true` replaying stored bytes: the whole doc in one render), `revise` (the revision re-render path)}. |
 | `tiler_tiles_total` | counter | `doc_type`, `path` | Tiles produced. |
 | `tiler_render_seconds` | histogram | `doc_type`, `path` | Wall time of a full document render. Buckets: `0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120` s. |
 

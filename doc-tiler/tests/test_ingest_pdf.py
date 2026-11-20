@@ -35,7 +35,7 @@ async def test_pdf_sliced_round_trip_identity(tmp_path):
             assert hashlib.sha256(data).hexdigest() == tile["image_hash"]
 
             got = await client.get(
-                "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+                f"/doc/{manifest['doc_id']}/tiles/{tile['tile_num']}"
             )
             assert got.status_code == 200, got.text
             # reverse mapping reproduces the exact bytes hashed at ingest
@@ -43,7 +43,7 @@ async def test_pdf_sliced_round_trip_identity(tmp_path):
 
 
 async def test_tile_returns_the_summary_without_tiles(client, sample_pdf):
-    r = await client.post("/tile", **pdf_form(sample_pdf))
+    r = await client.post("/doc", **pdf_form(sample_pdf))
     assert r.status_code == 200, r.text
 
     summary = r.json()
@@ -62,7 +62,7 @@ async def test_tile_returns_the_summary_without_tiles(client, sample_pdf):
 
     for tile_num in range(3):
         got = await client.get(
-            "/get_tile", params={"doc_id": summary["doc_id"], "tile_num": tile_num}
+            f"/doc/{summary['doc_id']}/tiles/{tile_num}"
         )
         assert got.status_code == 200, got.text
         tile_heights.append(int(got.headers["x-tile-height"]))
@@ -86,7 +86,7 @@ async def test_pdf_ingest_round_trip_identity(client, sample_pdf):
         assert data[:3] == b"\xff\xd8\xff"  # JPEG
 
         got = await client.get(
-            "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
+            f"/doc/{manifest['doc_id']}/tiles/{tile['tile_num']}"
         )
         assert got.status_code == 200, got.text
         assert got.headers["content-type"] == "image/jpeg"
@@ -104,17 +104,17 @@ async def test_pdf_tile_height_is_proportional(client):
 
 
 async def test_idempotent_ingest_does_not_re_render(client, sample_pdf):
-    first = (await client.post("/tile", **pdf_form(sample_pdf))).json()
+    first = (await client.post("/doc", **pdf_form(sample_pdf))).json()
     before = _render_count(client.state, "PDF", "ingest")
 
-    second = (await client.post("/tile", **pdf_form(sample_pdf))).json()
+    second = (await client.post("/doc", **pdf_form(sample_pdf))).json()
     assert second == {**first, "result": "idempotent"}
     assert _render_count(client.state, "PDF", "ingest") == before  # idempotent: no re-render
 
 
 async def test_ingest_of_stored_bytes_leaves_their_metadata(client, sample_pdf):
-    first = (await client.post("/tile", **pdf_form(sample_pdf, metadata='{"project": "a"}'))).json()
-    second = (await client.post("/tile", **pdf_form(sample_pdf, metadata='{"project": "b"}'))).json()
+    first = (await client.post("/doc", **pdf_form(sample_pdf, metadata='{"project": "a"}'))).json()
+    second = (await client.post("/doc", **pdf_form(sample_pdf, metadata='{"project": "b"}'))).json()
 
     assert second["result"] == "idempotent"
     metadata = (await client.get(f"/doc/{first['doc_id']}/metadata")).json()
@@ -122,37 +122,40 @@ async def test_ingest_of_stored_bytes_leaves_their_metadata(client, sample_pdf):
 
 
 async def test_a_deleted_doc_renders_again(client, sample_pdf):
-    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+    doc_id = (await client.post("/doc", **pdf_form(sample_pdf))).json()["doc_id"]
     before = _render_count(client.state, "PDF", "ingest")
 
     assert (await client.delete(f"/doc/{doc_id}")).status_code == 204
-    again = await client.post("/tile", **pdf_form(sample_pdf))
+    again = await client.post("/doc", **pdf_form(sample_pdf))
 
     assert again.status_code == 200 and again.json()["result"] == "rendered"
     assert _render_count(client.state, "PDF", "ingest") == before + 1
 
 
 async def test_tile_num_out_of_range(client, sample_pdf):
-    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
-    r = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 99})
+    doc_id = (await client.post("/doc", **pdf_form(sample_pdf))).json()["doc_id"]
+    r = await client.get(f"/doc/{doc_id}/tiles/99")
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "TILE_OUT_OF_RANGE"
 
+    assert (await client.get(f"/doc/{doc_id}/tiles/first")).status_code == 422
+    assert (await client.get(f"/doc/{doc_id}/tiles/-1")).status_code == 422
+
 
 async def test_unknown_doc_type_and_media_mismatch(client, sample_pdf):
-    r = await client.post("/tile", files={"document": ("x.pdf", sample_pdf, "application/pdf")},
+    r = await client.post("/doc", files={"document": ("x.pdf", sample_pdf, "application/pdf")},
                           data={"doc_type": "DOCX"})
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "UNKNOWN_DOC_TYPE"
 
     r = await client.post(
-        "/tile", data={"doc_type": "PDF"},
+        "/doc", data={"doc_type": "PDF"},
         files={"document": ("x.pdf", b"not a pdf", "application/pdf")},
     )
     assert r.status_code == 415
 
     r = await client.post(
-        "/tile",
+        "/doc",
         data={"doc_type": "IMG"},
         files={"document": ("x.png", b"\x89PNG\r\n\x1a\nbroken", "image/png")},
     )
@@ -162,7 +165,7 @@ async def test_unknown_doc_type_and_media_mismatch(client, sample_pdf):
 async def test_corrupt_pdf_is_unprocessable(client):
     body = b"%PDF-1.4\n garbage that is not a pdf body \n"
     r = await client.post(
-        "/tile",
+        "/doc",
         files={"document": ("x.pdf", body, "application/pdf")},
         data={"doc_type": "PDF"},
     )
@@ -173,13 +176,13 @@ async def test_max_doc_bytes(tmp_path, sample_pdf):
     from conftest import base_env, running_app
 
     async with running_app(base_env(tmp_path, TILER_MAX_DOC_BYTES="1024")) as (client, _):
-        r = await client.post("/tile", **pdf_form(sample_pdf))
+        r = await client.post("/doc", **pdf_form(sample_pdf))
         assert r.status_code == 413
         assert r.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
 
 
 async def test_original_download_and_range(client, sample_pdf):
-    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+    doc_id = (await client.post("/doc", **pdf_form(sample_pdf))).json()["doc_id"]
 
     full = await client.get(f"/doc/{doc_id}")
     assert full.status_code == 200
@@ -203,13 +206,13 @@ async def test_original_download_and_range(client, sample_pdf):
 
 
 async def test_delete_cascades(client, sample_pdf):
-    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+    doc_id = (await client.post("/doc", **pdf_form(sample_pdf))).json()["doc_id"]
     assert client.state.blobs.exists(doc_id)
 
     r = await client.delete(f"/doc/{doc_id}")
     assert r.status_code == 204
     assert not client.state.blobs.exists(doc_id)
-    assert (await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})).status_code == 404
+    assert (await client.get(f"/doc/{doc_id}/tiles/0")).status_code == 404
     assert await client.state.store.get_tiles(doc_id) == []
 
 

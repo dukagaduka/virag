@@ -101,7 +101,7 @@ Citations render **text**, so the chip shows tile metadata rather than the image
 enough to see *which* document and page the model was grounded on.
 
 > **Want the tile as an actual image?** virag does not serve tiles; fetch it from the
-> tiler — `GET /get_tile?doc_id=…&tile_num=…` with `TILER_API_KEY` — and inline it via an
+> tiler — `GET /doc/{doc_id}/tiles/{tile_num}` with `TILER_API_KEY` — and inline it via an
 > `image` event or a markdown image in the stream. That's a deliberate extension beyond
 > this minimal plugin.
 

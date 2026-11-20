@@ -23,9 +23,9 @@ async def test_fresh_volume_records_geometry(tmp_path):
 async def test_same_geometry_reboots_cleanly(tmp_path):
     env = base_env(tmp_path)
     async with running_app(env) as (client, _):
-        doc_id = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()["doc_id"]
+        doc_id = (await client.post("/doc", **png_form(make_png(875, 1200)))).json()["doc_id"]
     async with running_app(env) as (client, _):
-        r = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})
+        r = await client.get(f"/doc/{doc_id}/tiles/0")
         assert r.status_code == 200
 
 

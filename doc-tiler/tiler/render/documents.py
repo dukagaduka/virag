@@ -247,7 +247,7 @@ class MhtmlDocument(Document):
     @property
     def _whole(self) -> bool:
         """Whether the page is captured whole (else tile by tile). By the document's
-        height alone, so ingest and /get_tile always take the same path."""
+        height alone, so ingest and a tile request always take the same path."""
         return self.height <= self.pool.settings.safe_fullpage_px
 
 

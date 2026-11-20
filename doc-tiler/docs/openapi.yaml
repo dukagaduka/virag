@@ -22,79 +22,38 @@ security:
   - bearerAuth: []
 
 paths:
-  /tile:
+  /doc:
     post:
       operationId: ingestDocument
-      summary: Ingest a document into the store; the tiles are served by /get_tile.
+      summary: Ingest a document into the store; `tiles=true` streams its tiles back.
       description: >
         Renders at the fixed geometry and stores the original, one row per tile (offset,
-        height, image_hash) and the metadata. Tiles are not returned: /get_tile
-        regenerates any of them, and /tile/stream is the same ingest that also streams
-        them. Idempotent on doc_id = sha256(blob): bytes already stored and served are
-        not rendered again (result=idempotent) and their metadata stays as it is. Bytes
-        another request is ingesting right now are refused with 409 INGEST_IN_PROGRESS.
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [doc_type]
-              properties:
-                doc_type: { $ref: '#/components/schemas/DocType' }
-                document:
-                  type: string
-                  format: binary
-                  description: Raw document bytes. Required unless doc_type=URL.
-                url:
-                  type: string
-                  format: uri
-                  description: Source URL. Required iff doc_type=URL.
-                metadata:
-                  type: string
-                  description: >
-                    JSON object serialized as a string. Declared keys (see
-                    /schema/metadata) become searchable; other keys are stored but not
-                    searchable.
-            encoding:
-              document: { contentType: application/octet-stream }
-      responses:
-        '503': { $ref: '#/components/responses/NotReady' }
-        '200':
-          description: The stored doc's identity and layout.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/IngestResult' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '409':
-          description: The same bytes are being ingested by another request (INGEST_IN_PROGRESS).
-          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
-        '413': { $ref: '#/components/responses/TooLarge' }
-        '415': { $ref: '#/components/responses/UnsupportedMedia' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
-        '502': { $ref: '#/components/responses/BadGateway' }
-        '504': { $ref: '#/components/responses/GatewayTimeout' }
+        height, image_hash) and the metadata. Idempotent on doc_id = sha256(blob): bytes
+        already stored and served are not rendered again (result=idempotent) and their
+        metadata stays as it is. Bytes another request is ingesting right now are
+        refused with 409 INGEST_IN_PROGRESS.
 
-  /tile/stream:
-    post:
-      operationId: ingestDocumentStream
-      summary: Ingest a document and stream its tiles as NDJSON, then a `committed` event.
-      description: >
-        The /tile ingest (same form fields) that also streams every tile
-        it renders. The response is newline-delimited JSON
+
+        By default the answer is the stored doc's summary (application/json); the tiles
+        are not returned — GET /doc/{doc_id}/tiles/{tile_num} renders any of them again.
+
+
+        With `tiles=true` the same ingest answers as newline-delimited JSON
         (application/x-ndjson), one event object per line, streamed as tiles render: a
         `begin` event first (identity, so a client can build point ids before tiles
         arrive), a `tile` event per tile (in tile_num order, as they render), then a
-        terminal `committed` event on success. The doc's row exists, incomplete, from `begin` on; its tiles and
-        blob reach the store together at `committed`, and an ingest that does not commit
-        leaves nothing behind. Whatever fails before `begin` (unknown doc_type 400,
-        oversize 413, media mismatch 415, invalid metadata 422, a blocked or failed URL
-        capture 403/502/504, the same bytes being ingested by another request 409) is a
-        normal HTTP error; from `begin` on the status is already 200, a failure is
-        reported as an in-stream `error` event and the absence of a `committed` event
-        is the client's signal that ingest did not complete. Bytes already stored and served replay the stored tiles as the same
-        event stream without re-rendering.
+        terminal `committed` event on success. The doc's row exists, incomplete, from
+        `begin` on; its tiles and blob reach the store together at `committed`, and an
+        ingest that does not commit leaves nothing behind. Whatever fails before `begin`
+        (unknown doc_type 400, oversize 413, media mismatch 415, invalid metadata 422, a
+        blocked or failed URL capture 403/502/504, the same bytes being ingested by
+        another request 409) is a normal HTTP error; from `begin` on the status is
+        already 200, a failure is reported as an in-stream `error` event and the absence
+        of a `committed` event is the client's signal that the ingest did not complete.
+        Bytes already stored and served replay the stored doc's tiles as the same event
+        stream.
+      parameters:
+        - { name: tiles, in: query, required: false, schema: { type: boolean, default: false }, description: Answer with the NDJSON stream of the document's tiles instead of its summary. }
       requestBody:
         required: true
         content:
@@ -124,11 +83,13 @@ paths:
         '503': { $ref: '#/components/responses/NotReady' }
         '200':
           description: >
-            The tiling event stream (newline-delimited JSON). Each line is one
-            StreamEvent object. A terminal `committed` event means success; a terminal
-            `error` event (or a stream that ends without `committed`) means the ingest
-            did not complete.
+            The stored doc's identity and layout; with `tiles=true`, the tiling event
+            stream — each line one StreamEvent object. A terminal `committed` event
+            means success; a terminal `error` event (or a stream that ends without
+            `committed`) means the ingest did not complete.
           content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestResult' }
             application/x-ndjson:
               schema: { $ref: '#/components/schemas/StreamEvent' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -139,6 +100,8 @@ paths:
         '413': { $ref: '#/components/responses/TooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMedia' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
 
   /revision:
     get:
@@ -174,14 +137,42 @@ paths:
           description: A revision is already running (REVISION_RUNNING).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
-  /get_tile:
+  /doc/{doc_id}/tiles:
+    get:
+      operationId: streamDocumentTiles
+      summary: Stream a stored document's tiles as NDJSON, as the ingest of its bytes would.
+      description: >
+        The event stream POST /doc?tiles=true answers to bytes the store already holds,
+        asked for by doc_id: `begin`, a `tile` event per tile (rendered again and verified
+        against its stored hash), then `committed` with result=idempotent. Nothing of
+        the doc changes. The tiles render as one background render of the document,
+        held to the bulk slots like an ingest. A doc that is unknown, still being
+        ingested or quarantined is an HTTP error; from `begin` on a failure
+        (RENDER_MISMATCH included) is an in-stream `error` event and the absence of
+        `committed` means the stream did not complete.
+      parameters:
+        - { name: doc_id, in: path, required: true, schema: { type: string } }
+      responses:
+        '503': { $ref: '#/components/responses/NotReady' }
+        '200':
+          description: NDJSON stream of events (begin, tile*, committed | error).
+          content:
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/StreamEvent' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: The doc is quarantined — a revision could not re-render it (QUARANTINED). Re-ingest its bytes to restore it.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /doc/{doc_id}/tiles/{tile_num}:
     get:
       operationId: getTile
-      summary: Regenerate a single tile from the stored original.
+      summary: One tile of a stored document, as JPEG.
+      description: Renders the tile from the stored original, deterministically.
       parameters:
-        - { name: doc_id,   in: query, required: true,  schema: { type: string } }
-        - { name: tile_num, in: query, required: true,  schema: { type: integer, minimum: 0 } }
-        - { name: verify,   in: query, required: false, schema: { type: boolean, default: true }, description: Compare regenerated bytes against the stored image_hash. }
+        - { name: doc_id,   in: path,  required: true,  schema: { type: string } }
+        - { name: tile_num, in: path,  required: true,  schema: { type: integer, minimum: 0 }, description: 0-based. }
+        - { name: verify,   in: query, required: false, schema: { type: boolean, default: true }, description: Compare the rendered bytes against the stored image_hash. }
       responses:
         '503': { $ref: '#/components/responses/NotReady' }
         '200':
@@ -202,39 +193,12 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Regenerated tile hash does not match the stored hash (RENDER_MISMATCH) — non-determinism, since every served doc was rendered by the current render_version.
+          description: The rendered tile does not hash to the stored hash (RENDER_MISMATCH) — non-determinism, since every served doc was rendered by the current render_version.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '410':
           description: The doc is quarantined — a revision could not re-render it (QUARANTINED). Re-ingest its bytes to restore it.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '422': { $ref: '#/components/responses/Unprocessable' }
-
-  /doc/{doc_id}/tiles:
-    get:
-      operationId: streamDocumentTiles
-      summary: Stream a stored document's tiles as NDJSON, as the ingest of its bytes would.
-      description: >
-        The event stream /tile/stream answers to bytes the store already holds, asked
-        for by doc_id: `begin`, a `tile` event per tile (regenerated and verified
-        against its stored hash), then `committed` with result=idempotent. Nothing of
-        the doc changes. The tiles render as one background render of the document,
-        held to the bulk slots like an ingest. A doc that is unknown, still being
-        ingested or quarantined is an HTTP error; from `begin` on a failure
-        (RENDER_MISMATCH included) is an in-stream `error` event and the absence of
-        `committed` means the stream did not complete.
-      parameters:
-        - { name: doc_id, in: path, required: true, schema: { type: string } }
-      responses:
-        '503': { $ref: '#/components/responses/NotReady' }
-        '200':
-          description: NDJSON stream of events (begin, tile*, committed | error).
-          content:
-            application/x-ndjson:
-              schema: { $ref: '#/components/schemas/StreamEvent' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '410':
-          description: The doc is quarantined — a revision could not re-render it (QUARANTINED). Re-ingest its bytes to restore it.
-          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /doc/{doc_id}:
     get:
@@ -433,7 +397,7 @@ components:
         doc_id:         { type: string }
         doc_type:       { $ref: '#/components/schemas/DocType' }
         tile_count:     { type: integer }
-        complete:       { type: boolean, default: true, description: False while the doc's first ingest is still in flight; such a doc is not servable via /get_tile. }
+        complete:       { type: boolean, default: true, description: False while the doc's first ingest is still in flight; its tiles are not served yet. }
         quarantined:    { type: boolean, default: false, description: True when a revision could not re-render the doc; its tiles answer 410 until it is re-ingested. }
         render_version: { type: [string, "null"], description: The render_version stamped on the doc at ingest. }
         created_at:     { type: integer, description: Unix epoch seconds. }
@@ -442,7 +406,7 @@ components:
 
     StreamEvent:
       description: >
-        One line of an NDJSON tile stream (/tile/stream, /doc/{doc_id}/tiles). The `event`
+        One line of an NDJSON tile stream (POST /doc?tiles=true, GET /doc/{doc_id}/tiles). The `event`
         field discriminates:
         `begin` (identity, emitted first), `tile` (one per tile; data is base64 JPEG),
         `committed` (terminal success), `error` (terminal failure).
