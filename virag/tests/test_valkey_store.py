@@ -81,26 +81,36 @@ def test_an_expired_lease_is_never_renewed_back():
 
 
 @needs_valkey
-def test_json_hashes_and_sets_round_trip():
+def test_json_and_sets_round_trip():
     async def check(store):
         await store.set_json("status", {"state": "running", "n": 1})
-        await store.hset_json("writers", {"w1": {"doc_id": "a"}, "w2": {"doc_id": "b"}})
-        await store.hdel("writers", "w1")
         await store.sadd("journal", "a", "b", "a")
 
         return (
             await store.get_json("status"),
-            await store.hgetall_json("writers"),
             await store.smembers("journal"),
             await store.exists_each(["status", "missing"]),
         )
 
     assert _run(check) == (
         {"state": "running", "n": 1},
-        {"w2": {"doc_id": "b"}},
         {"a", "b"},
         [True, False],
     )
+
+
+@needs_valkey
+def test_names_are_listed_by_pattern_and_read_in_one_trip():
+    async def check(store):
+        await store.set_nx("enroll:a", "t1")
+        await store.set_nx("enroll:b", "t2")
+        await store.set_nx("revision:on", "t1")
+
+        names = sorted(await store.names("enroll:*"))
+
+        return names, await store.get_each([*names, "enroll:missing"]), await store.names("nothing:*")
+
+    assert _run(check) == (["enroll:a", "enroll:b"], ["t1", "t2", None], [])
 
 
 def test_unreachable_valkey_is_503():

@@ -17,6 +17,7 @@ from virag.clients.valkey_store import ValkeyStore
 from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding, enforce_metadata_schema
 from virag.coordination import Coordinator
+from virag.enroll import Enroller
 from virag.reconcile import reconcile, run_periodic
 from virag.revision import RevisionManager
 from virag.utils import cancel
@@ -155,6 +156,8 @@ async def lifespan(app: FastAPI):
         heartbeat_task = asyncio.create_task(coordinator.heartbeat())
         stack.push_async_callback(cancel, heartbeat_task)
 
+        enroller = Enroller(store, coordinator, tiler, retriever, settings.enroll_settings)
+
         revision = RevisionManager(
             store,
             coordinator,
@@ -182,6 +185,7 @@ async def lifespan(app: FastAPI):
         app.state.settings = settings
         app.state.store = store
         app.state.coordinator = coordinator
+        app.state.enroller = enroller
         app.state.retriever = retriever
         app.state.reranker = reranker
         app.state.tiler = tiler

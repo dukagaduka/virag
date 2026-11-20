@@ -82,7 +82,8 @@ virag/
   binding.py         the collection ↔ tiler volume binding + tiler metadata-schema guard
   reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic, in the leading process)
   revision.py        /revision re-embed and /revision/rollback jobs
-  coordination.py    Coordinator: process leases, writers + journal, revision lock/status, reconcile lead
+  coordination.py    Coordinator: process leases, documents being enrolled + journal, revision lock/status, reconcile lead
+  enroll.py          Enroller: a tile stream of the tiler → a document's points
   errors.py          ApiError + the uniform {"error": {...}} envelope
   api/               chat_completions, models, enroll, revision, ops, auth
   clients/           retriever_client, reranker_client, qdrant_store, valkey_store, tiler_client, vlm_client

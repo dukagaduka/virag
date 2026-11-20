@@ -9,7 +9,8 @@ Runs at startup and (optionally) on an interval, in the one process leading it
      older than the TTL is a crashed/partial enroll; drop its partial points.
 
 The TTL gate (`virag_started_at < now - pending_ttl_sec`) skips in-flight enrolls,
-whose `virag_started_at` is ~now. Because the collection is bound to the tiler's volume
+whose `virag_started_at` is ~now. Neither pass touches a document that is being
+enrolled right now (`Coordinator.enrolling`): it is its enroll's to finish. Because the collection is bound to the tiler's volume
 and only virag holds TILER_API_KEY, every tiler doc carries virag metadata, so there are
 no foreign docs to misjudge.
 
@@ -26,11 +27,11 @@ import logging
 import time
 from collections.abc import Iterable
 
-from virag.api.enroll import point_id
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.tiler_client import TilerService
-from virag.coordination import Coordinator
+from virag.coordination import Coordinator, EnrollInProgress
+from virag.enroll import point_id
 from virag.settings import EnrollSettings, ReconcileSettings
 from virag.utils import chunked, gather
 
@@ -79,12 +80,14 @@ async def enforce_subset(
     qdrant_ids = await store.iter_doc_ids(collection=collection)
     docs = await tiler.iter_docs()
 
-    dangling = qdrant_ids - {doc["doc_id"] for doc in docs}
+    # Read last, right before the delete: a document being enrolled now is left to its
+    # enroll — the tiler lists it from `begin`, and a re-enroll lifts a quarantine.
+    enrolling = set(await coordinator.enrolling_now())
 
-    # A quarantined doc's tiles answer 410, so its points only crowd live hits out of
-    # top_k. One being written right now is a re-enroll lifting the quarantine.
-    quarantined = {doc["doc_id"] for doc in docs if doc.get("quarantined")} & qdrant_ids
-    quarantined -= await coordinator.writing()
+    dangling = qdrant_ids - {doc["doc_id"] for doc in docs} - enrolling
+
+    # A quarantined doc's tiles answer 410, so its points only crowd live hits out of top_k.
+    quarantined = ({doc["doc_id"] for doc in docs if doc.get("quarantined")} & qdrant_ids) - enrolling
 
     if dangling:
         log.warning("reconcile: %d dangling doc_id(s) in qdrant not in tiler; deleting", len(dangling))
@@ -123,41 +126,50 @@ async def _clear_stale_pending(
 
     log.warning("reconcile: %d stale pending enroll(s); clearing partial points", len(stale))
 
-    # Registered as writers so a concurrent revision journals and later syncs these docs.
-    async with coordinator.writer(doc["doc_id"] for doc in stale) as physical:
-        await store.delete_by_docs([doc["doc_id"] for doc in stale], collection=physical)  # always clear the partial first
+    healed = 0
 
-        # An incomplete or quarantined tiler doc can't be re-embedded (no servable tiles);
-        # leave it for a re-enroll to restore.
-        healable = [doc for doc in stale if settings.self_heal and embeddable(doc)]
+    for doc in stale:
+        doc_id = doc["doc_id"]
 
-        for doc in stale:
-            if doc not in healable:
-                log.info("reconcile: doc_id=%s left for re-enroll (self-heal off, or tiler doc incomplete or quarantined)", doc["doc_id"])
+        try:
+            # Held like an enroll: no enroll of the doc starts meanwhile, and a concurrent
+            # revision journals and later syncs it.
+            async with coordinator.enrolling(doc_id) as physical:
+                await store.delete_by_doc(doc_id, collection=physical)  # always clear the partial first
 
-        if not healable:
-            return
+                # An incomplete or quarantined tiler doc can't be re-embedded (no servable
+                # tiles); leave it for a re-enroll to restore.
+                if not (settings.self_heal and embeddable(doc)):
+                    log.info("reconcile: doc_id=%s left for re-enroll (self-heal off, or tiler doc incomplete or quarantined)", doc_id)
+                    continue
 
-        failed = await reembed_docs(
-            store,
-            tiler,
-            retriever,
-            healable,
-            batch_size=enroll_settings.batch_size,
-            collection=physical,
-            mark_enrolled=True,
-        )
+                failed = await reembed_docs(
+                    store,
+                    tiler,
+                    retriever,
+                    [doc],
+                    batch_size=enroll_settings.batch_size,
+                    collection=physical,
+                    mark_enrolled=True,
+                )
 
-        if failed:
-            # Leave no partial points behind; the docs stay pending for the next sweep.
-            await store.delete_by_docs(sorted(failed), collection=physical)
-            log.error("reconcile: self-heal failed for %d doc(s): %s", len(failed), sorted(failed))
+                if failed:
+                    # Leave no partial points behind; the doc stays pending for the next sweep.
+                    await store.delete_by_doc(doc_id, collection=physical)
+                    log.error("reconcile: self-heal failed for doc_id=%s", doc_id)
+                    continue
 
-        log.info("reconcile: self-healed %d doc(s)", len(healable) - len(failed))
+                healed += 1
+
+        except EnrollInProgress:
+            log.info("reconcile: doc_id=%s is being enrolled; left to its enroll", doc_id)
+
+    log.info("reconcile: self-healed %d doc(s)", healed)
 
 
 async def sync_docs(
     store: QdrantStore,
+    coordinator: Coordinator,
     tiler: TilerService,
     retriever: RetrieverClient,
     doc_ids: Iterable[str],
@@ -167,9 +179,10 @@ async def sync_docs(
 ) -> set[str]:
     """Make `collection` mirror the tiler for these docs: drop their points, then
     re-embed the ones the tiler holds complete and enrolled. Docs gone, incomplete or
-    still pending stay dropped — exactly as the serving collection treats them.
+    still pending stay dropped — exactly as the serving collection treats them. A doc
+    being enrolled right now is left to its enroll, which writes it there whole.
     Returns the doc_ids that failed to re-embed."""
-    wanted = set(doc_ids)
+    wanted = set(doc_ids) - set(await coordinator.enrolling_now())
     if not wanted:
         return set()
 

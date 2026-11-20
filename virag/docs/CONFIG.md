@@ -74,7 +74,7 @@ Chat answers `409 RENDER_VERSION_MISMATCH` for a tile the tiler renders by anoth
 ## Coordination (Valkey)
 
 Any number of virag processes — replicas, uvicorn workers — share one Valkey for their
-leases, the writers registry, the revision job and the reconcile lead. See
+leases, the documents being enrolled, the revision job and the reconcile lead. See
 [ARCHITECTURE.md](ARCHITECTURE.md) §10.
 
 | Variable | Required | Default | Meaning |
@@ -83,7 +83,7 @@ leases, the writers registry, the revision job and the reconcile lead. See
 | `VALKEY_PREFIX` | no | `virag` | Prefix of every key. Deployments sharing one Valkey need distinct prefixes (or databases). |
 | `VALKEY_TIMEOUT_SEC` | no | `2` | Connect and per-command deadline (> 0); past it the call is a `503`. |
 | `VALKEY_MAX_CONNECTIONS` | no | `64` | Connection pool size (≥ 1). |
-| `VIRAG_PROCESS_TTL_SEC` | no | `30` | Lease TTL (≥ 3), renewed every third of it. A process silent this long counts as dead: its revision job, reconcile lead and writers are taken over or ignored. Lower = faster takeover, less tolerance for a stalled event loop or a Valkey blip. |
+| `VIRAG_PROCESS_TTL_SEC` | no | `30` | Lease TTL (≥ 3), renewed every third of it. A process silent this long counts as dead: its revision job, its reconcile lead and the documents it was enrolling are free to take over. Lower = faster takeover, less tolerance for a stalled event loop or a Valkey blip. |
 
 The bulk concurrency caps (`RETRIEVER_MAX_CONCURRENCY`, `TILER_MAX_CONCURRENCY`),
 `VLM_MAX_CONCURRENCY` and `RERANKER_MAX_CONCURRENCY` are per process: N processes allow

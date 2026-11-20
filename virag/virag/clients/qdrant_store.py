@@ -460,7 +460,7 @@ class QdrantStore:
     async def rollback_alias(self, restored: str) -> int:
         """Point the serving alias back at `restored`, the retained collection. Returns its
         `retired_at`: documents enrolled since then live only in the collection it
-        replaces, which the caller drops once that one's writers are done."""
+        replaces, which the caller drops once the enrolls writing into it are done."""
         info = (await self.qdrant.get_collection(restored)).config.params.vectors
         if info.size != self.vector_size:  # type: ignore
             raise ApiError(

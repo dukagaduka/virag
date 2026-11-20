@@ -143,6 +143,12 @@ later; a new one the tiler drops itself, since its ingest never committed. Enrol
 bytes the tiler already holds does not render them again; the `metadata` sent with the
 enroll is merged into the document's metadata in the tiler.
 
+**One enroll of a document at a time.** While a document is being enrolled — by
+`/enroll` on any virag process, or by reconcile's self-heal — another enroll of the
+same document (the same bytes, whatever the name) answers `409 ENROLL_IN_PROGRESS` and
+changes nothing; retry once the first is done. A process that died mid-enroll holds its
+documents for up to `VIRAG_PROCESS_TTL_SEC` more.
+
 **Where metadata lives.** In the tiler only. A Qdrant point carries what fetching and
 checking its tile takes (`doc_id`, `tile_num`, `image_hash`, `render_version`) and no
 copy of the metadata, so a metadata change in the tiler needs no re-enroll.
@@ -260,6 +266,7 @@ Every error uses one shape:
 | `401` | `UNAUTHORIZED` | Missing or wrong `VIRAG_API_KEY` / `VIRAG_ADMIN_API_KEY` (with `WWW-Authenticate: Bearer`). |
 | `403` | `FORBIDDEN` | The user key on an admin route (`/enroll`, `/revision*`). |
 | `409` | `RENDER_VERSION_MISMATCH` | A retrieved tile is rendered by another `render_version` than it was embedded from — rebuild with `POST /revision`. |
+| `409` | `ENROLL_IN_PROGRESS` | `/enroll` of a document another request is enrolling right now (`details.doc_id`); retry once it is done. |
 | `422` | `UNPROCESSABLE` | Bad request body/JSON, invalid `rag` field, RAG on with no query text, bad `metadata`. |
 | `502` | `UPSTREAM_FAILURE` | A backend (VLM, tiler, retriever, Qdrant) could not be reached. |
 | `503` | `NOT_READY` | Queried before startup finished wiring backends; the tiler is unreachable / not serving during a RAG chat; Valkey is unreachable during an enroll or a revision call. |

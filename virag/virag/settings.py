@@ -104,7 +104,7 @@ class QdrantStoreSettings(_Section):
 
 
 class ValkeySettings(_Section):
-    """Valkey: where virag processes coordinate (leases, writers, the revision lock)."""
+    """Valkey: where virag processes coordinate (leases, documents being enrolled, the revision job, the reconcile lead)."""
 
     model_config = SettingsConfigDict(env_prefix="VALKEY_")
 

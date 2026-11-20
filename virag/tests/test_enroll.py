@@ -1,15 +1,24 @@
-"""/enroll: name policy, deterministic ids, embed+upsert, zero-tile handling."""
+"""/enroll: name policy, deterministic ids, embed+upsert, zero-tile handling, one enroll
+of a document at a time."""
 
 from __future__ import annotations
 
 import json
 
-from virag.api.enroll import point_id
+from virag.enroll import point_id
 from virag.errors import ApiError
 
 from virag.settings import EnrollSettings
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, make_settings, sample_tile_result
+from conftest import (
+    FakeRetriever,
+    FakeStore,
+    FakeTiler,
+    lease_key,
+    make_coordinator,
+    make_settings,
+    sample_tile_result,
+)
 
 
 def _client(make_client, *, n_tiles=2, batch_size=16):
@@ -22,6 +31,21 @@ def _client(make_client, *, n_tiles=2, batch_size=16):
 
 def _pdf_files():
     return {"document": ("f.pdf", b"%PDF-bytes", "application/pdf")}
+
+
+def _enroll(client):
+    return client.post(
+        "/enroll",
+        data={"doc_type": "PDF", "metadata": json.dumps({"name": "Report A"})},
+        files=_pdf_files(),
+    )
+
+
+def _held(client) -> dict:
+    """doc_id -> the token holding it, as Valkey has it."""
+    values = client.app.state.coordinator.valkey.values
+
+    return {name.removeprefix("enroll:"): value for name, (value, _) in values.items() if name.startswith("enroll:")}
 
 
 def test_point_id_is_deterministic_and_unique():
@@ -53,6 +77,7 @@ def test_enroll_success(make_client):
     # A point carries what fetching and checking its tile takes, and no metadata.
     assert set(up["payloads"][0]) == {"doc_id", "tile_num", "image_hash", "render_version"}
     assert up["payloads"][0]["image_hash"]                              # carried for integrity
+    assert _held(client) == {}                                          # the document is released
 
 
 def test_enroll_missing_name_is_422(make_client):
@@ -230,3 +255,82 @@ def test_enroll_without_valkey_is_503_and_keeps_existing_points(make_client):
     assert r.json()["error"]["code"] == "NOT_READY"
     assert store.deletes == []                                        # an earlier enroll's points stay
     assert tiler.metadata_patches == []
+
+
+# ---------------------------------------------------------------------------
+# one enroll of a document at a time
+# ---------------------------------------------------------------------------
+
+def test_enroll_of_a_document_being_enrolled_is_409(make_client):
+    client, store, _, tiler = _client(make_client)
+    coordinator = client.app.state.coordinator
+    other = make_coordinator(store, valkey=coordinator.valkey)        # another process…
+    coordinator.valkey.values["enroll:doc-a"] = (other.token, None)   # …is enrolling the doc
+
+    r = _enroll(client)
+
+    assert (r.status_code, r.json()["error"]["code"]) == (409, "ENROLL_IN_PROGRESS")
+    assert store.deletes == [] and store.upserts == []                # nothing of the doc is touched
+    assert tiler.metadata_patches == []
+    assert _held(client) == {"doc-a": other.token}                    # and it stays the other's
+
+
+def test_enroll_takes_over_a_document_of_a_dead_process(make_client):
+    client, store, _, _ = _client(make_client)
+    coordinator = client.app.state.coordinator
+    dead = make_coordinator(store, valkey=coordinator.valkey)
+    coordinator.valkey.values["enroll:doc-a"] = (dead.token, None)
+    coordinator.valkey.expire(lease_key(dead))                        # it died mid-enroll
+
+    r = _enroll(client)
+
+    assert r.status_code == 200 and r.json()["enrolled"] == 2
+    assert _held(client) == {}
+
+
+def test_a_failed_enroll_releases_the_document(make_client):
+    client, store, _, _ = _client(make_client)
+
+    async def boom(*a, **k):
+        raise RuntimeError("qdrant down")
+
+    store.upsert = boom
+
+    assert _enroll(client).status_code == 500
+    assert _held(client) == {}
+
+
+def test_a_failed_enroll_that_lost_the_document_deletes_nothing(make_client):
+    """A process that stalled past its lease: another one enrolls the document meanwhile,
+    and the stale enroll's rollback must leave the points that one wrote."""
+    client, store, _, _ = _client(make_client)
+    coordinator = client.app.state.coordinator
+    other = make_coordinator(store, valkey=coordinator.valkey)
+
+    async def boom(*a, **k):
+        coordinator.valkey.expire(lease_key(coordinator))                # stalled past the lease…
+        coordinator.valkey.values["enroll:doc-a"] = (other.token, None)  # …and the doc was taken over
+        raise RuntimeError("tiler lost mid-stream")
+
+    store.upsert = boom
+
+    r = _enroll(client)
+
+    assert r.status_code == 500
+    assert store.deletes == ["doc-a"]                                 # the start clear; no rollback delete
+    assert _held(client) == {"doc-a": other.token}
+
+
+def test_enroll_that_cannot_mark_pending_keeps_existing_points(make_client):
+    client, store, _, tiler = _client(make_client)
+
+    async def unavailable(doc_id, patch):
+        raise ApiError(status_code=503, message="tiler is unavailable")
+
+    tiler.patch_metadata = unavailable
+
+    r = _enroll(client)
+
+    assert r.status_code == 503
+    assert store.deletes == []                                        # the doc still reads as enrolled: its points stay
+    assert _held(client) == {}

@@ -3,9 +3,9 @@
 One job at a time across every virag process: a job holds `revision:on` (the
 Coordinator) and any process answers its status; a second request gets 409, and a job
 whose process died is taken over by the next request. Writes that land while it builds
-are not mirrored into the new collection; instead every writer (enroll, self-heal)
-active at the start or starting meanwhile is journaled, and the job syncs exactly those
-docs after the swap:
+are not mirrored into the new collection; instead every document being enrolled (by
+/enroll or by self-heal) at the start, or taken meanwhile, is journaled, and the job
+syncs exactly those docs after the swap:
 
   1. Resolve the serving collection, drop any leftover target, create `<serving>__vN+1`,
      start the journal.
@@ -13,10 +13,10 @@ docs after the swap:
      Docs still failing abort the job without a swap — the old collection keeps serving.
   3. Enforce `Qdrant ⊆ Tiler` on the new collection, stamp it with the tiler's
      render_version, check the job is still this process's, then swap the alias. The
-     replaced collection is retained as the rollback target; writers pinned from now
-     on write into the new one.
-  4. Read the journal, wait (up to the pending TTL) for writers pinned to the old
-     collection.
+     replaced collection is retained as the rollback target; whoever takes a document
+     from now on writes into the new one.
+  4. Read the journal, wait (up to the pending TTL) for the enrolls in flight: one of
+     them may still be writing into the old collection.
   5. Sync the journaled docs into the new collection, enforce the invariant once more.
 
 A collection is bound to the render_version its tiles were embedded from (collection
@@ -26,8 +26,9 @@ swap if the tiler's render_version changed meanwhile. It is how virag follows a 
 tiler render (by POST /revision, or at startup with VIRAG_REVISION_ON_RENDER_MISMATCH)
 and how a new retriever model is rolled out.
 
-A rollback repoints the alias to the retained collection, waits for the writers of the
-abandoned one, drops it and syncs the docs enrolled since the retained one was retired;
+A rollback repoints the alias to the retained collection, waits for the enrolls in
+flight (they may be writing into the abandoned one), drops it and syncs the docs
+enrolled since the retained one was retired;
 it is refused when that collection was embedded from another render_version than the
 tiler's.
 """
@@ -331,11 +332,12 @@ class RevisionManager:
         journal = await coordinator.journal()
         await self._update(phase="syncing")
 
-        if not await coordinator.drain(old, self.drain_timeout):
-            log.warning("revision: writers of %s still running after %ss; reconcile will pick them up", old, self.drain_timeout)
+        if not await coordinator.drain(self.drain_timeout):
+            log.warning("revision: enrolls that may be writing into %s still running after %ss", old, self.drain_timeout)
 
         sync_failed = await sync_docs(
             store,
+            coordinator,
             self.tiler,
             self.retriever,
             journal,
@@ -361,7 +363,7 @@ class RevisionManager:
         store = self.store
         coordinator = self.coordinator
 
-        # Same journal as a revision: writers straddling the repoint wrote into the
+        # Same journal as a revision: enrolls straddling the repoint wrote into the
         # collection being dropped.
         await coordinator.start_journal()
 
@@ -374,10 +376,10 @@ class RevisionManager:
         journal = await coordinator.journal()
 
         await self._update(collection=restored, abandoned=abandoned, phase="syncing")
-        log.warning("rollback: alias now → %s; dropping %s once its writers are done", restored, abandoned)
+        log.warning("rollback: alias now → %s; dropping %s once the enrolls in flight are done", restored, abandoned)
 
-        if not await coordinator.drain(abandoned, self.drain_timeout):
-            log.warning("rollback: writers of %s still running after %ss; reconcile will pick them up", abandoned, self.drain_timeout)
+        if not await coordinator.drain(self.drain_timeout):
+            log.warning("rollback: enrolls that may be writing into %s still running after %ss", abandoned, self.drain_timeout)
 
         await store.drop_collection(abandoned)
 
@@ -390,6 +392,7 @@ class RevisionManager:
 
         sync_failed = await sync_docs(
             store,
+            coordinator,
             self.tiler,
             self.retriever,
             missed,

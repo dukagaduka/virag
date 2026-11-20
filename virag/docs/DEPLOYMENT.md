@@ -41,7 +41,7 @@ separate stack in `deploy/retriever/` that virag reaches over `RETRIEVER_BASE_UR
 | `virag` | the gateway | built from this repo; waits for its backends to be healthy. |
 | `tiler-virag` | doc-tiler | built from `../../doc-tiler`; mounts `tiler_metadata_schema.yaml` (see below). |
 | `qdrant-virag` | Qdrant | vector store. |
-| `valkey-virag` | Valkey 9 | coordination of virag processes (leases, writers, the revision job, the reconcile lead); AOF on, no port published. |
+| `valkey-virag` | Valkey 9 | coordination of virag processes (leases, documents being enrolled, the revision job, the reconcile lead); AOF on, no port published. |
 
 ### Connecting virag to the retriever stack
 
@@ -183,8 +183,8 @@ caps (`*_MAX_CONCURRENCY`) multiply with the process count — size them accordi
 - **Logs** — structured lines to stdout at `LOG_LEVEL` (default `INFO`). virag has no
   metrics endpoint; operational visibility is the log stream. Notable lines: the
   `ready: …` summary at startup (all backends + `render_version`), `lease: <token>
-  (<host>/<pid>)` naming the process in Valkey, `taking over from dead process` when a
-  revision job or the reconcile lead moves, `lease: … expired` (critical) when a process
+  (<host>/<pid>)` naming the process in Valkey, `<key>: taken over from dead process` when a
+  revision job, the reconcile lead or a document being enrolled moves, `lease: … expired` (critical) when a process
   stops itself, `reranker: off` (warning) when none is configured, per-request `rag
   query` / `rag retrieved` / `rag reranked` / `rag injected` counts, `rag rerank failed`
   (a warning for an outage, an error for a refusal) when a chat fell back to the

@@ -148,8 +148,8 @@ the rules that span virag processes live in the Coordinator (§10).
   serving collection and the rollback target from Qdrant, since another process may
   swap it at any time.
 - **`ValkeyStore`** — plain and JSON values, conditional writes (`SET NX`, `SET XX` with a
-  TTL, `SET IFEQ`, `DELIFEQ` — Valkey 9.0+, checked at startup), hashes and sets, every key
-  under `VALKEY_PREFIX`; an unreachable Valkey surfaced as `503`. It knows nothing of
+  TTL, `SET IFEQ`, `DELIFEQ` — Valkey 9.0+, checked at startup), sets, names listed by
+  pattern, every key under `VALKEY_PREFIX`; an unreachable Valkey surfaced as `503`. It knows nothing of
   what the keys mean.
 - **`VLMClient`** — the upstream generator: `complete()` (buffered passthrough,
   any status) and `stream()` (an async context manager yielding the live SSE
@@ -199,8 +199,9 @@ open stream from holding this past compose's `stop_grace_period`.
 
 ## 8. Enrollment & the Qdrant ⊆ Tiler invariant
 
-`/enroll` (`api/enroll.py`) is internally **streaming**. It calls the tiler's
-`POST /tile/stream` and consumes the NDJSON event stream, accumulating tiles into
+`/enroll` (`api/enroll.py`) is internally **streaming**. It opens the tiler's
+`POST /tile/stream` and hands the NDJSON event stream to the **`Enroller`**
+(`enroll.py`) — the procedure that writes a document's points — which accumulates tiles into
 batches of `VIRAG_ENROLL_BATCH_SIZE`, embedding each batch, and upserting its
 vectors to Qdrant as it goes — bounded memory, never the whole document at once. The HTTP
 contract is unchanged (see [API.md](API.md)); what changed is that it no longer buffers a
@@ -217,18 +218,27 @@ documents enroll fully.
   *then* virag writes points; the tiles are served once the ingest commits) and by
   reconcile. A query therefore never returns a hit whose tile the tiler can't
   regenerate.
-- **Pending markers.** At the start of an enroll virag stamps the tiler's indexed
+- **One enroll of a document at a time.** At `begin` — the first moment the `doc_id` is
+  known — the enroll takes the document: the key `enroll:<doc_id>` in Valkey, holding
+  its process's token (`Coordinator.enrolling`, §10), released when the enroll ends. A
+  second enroll of the same document answers `409 ENROLL_IN_PROGRESS` and touches
+  nothing; reconcile and a revision's sync leave a held document to its enroll. So the
+  points of a document are written, and rolled back, by one request only.
+- **Pending markers.** Having taken the document, the enroll stamps the tiler's indexed
   metadata with `virag_started_at` (epoch at start) and `virag_enrolled_at` (`0` while
-  pending); on success it sets `virag_enrolled_at` to the epoch. On any mid-enroll failure
-  the partial points are rolled back out of Qdrant; a doc the tiler held before stays in
-  place and pending for reconcile to heal, a new one the tiler drops with its ingest.
-- **One collection per write.** At `begin` the enroll registers as a writer and is pinned
-  to the physical collection the alias resolves to then (`Coordinator.writer`); every
-  upsert and the rollback delete go there. A revision swapping the alias meanwhile never
-  splits a document across two collections: the writer is in its journal, and the
-  revision syncs the document into the new collection once the writer is done. With
-  Valkey unreachable the writer cannot register, and the enroll answers `503 NOT_READY`
-  before touching anything.
+  pending) and drops the document's earlier points; on success it sets
+  `virag_enrolled_at` to the epoch. On any failure after the pending mark the partial
+  points are rolled back out of Qdrant; a doc the tiler held before stays in place and
+  pending for reconcile to heal, a new one the tiler drops with its ingest. An enroll
+  that could not even mark the document pending leaves its points as they were. Before
+  the rollback delete the enroll checks the document is still its own (fencing): a
+  process that stalled past its lease may find another enroll writing it already.
+- **One collection per write.** Taking the document also pins the enroll to the physical
+  collection the alias resolves to then; every upsert and the rollback delete go there.
+  A revision swapping the alias meanwhile never splits a document across two
+  collections: the document is in its journal, and the revision syncs it into the new
+  collection once the enroll is done. With Valkey unreachable the document cannot be
+  taken, and the enroll answers `503 NOT_READY` before touching anything.
 
 ## 9. Reconcile, the collection scheme & revision
 
@@ -247,13 +257,14 @@ the one process leading it (§10). Two passes:
    This is also how a document deleted from the tiler gets its stale points removed
    (delete-propagation) — on the next reconcile pass. Points of a doc the tiler
    quarantined go too: its tiles answer `410`, so they would only crowd live hits out
-   of `top_k`. A doc with a write in flight anywhere in the cluster (a re-enroll lifting
-   the quarantine) is left alone; a re-enroll brings the points back.
+   of `top_k`; a re-enroll brings the points back. A doc being enrolled anywhere in the
+   cluster is left to its enroll: the keys are read last, right before the delete.
 2. *Clear stale pending.* Find docs with `virag_enrolled_at == 0` **and**
    `virag_started_at < now − VIRAG_PENDING_TTL_SEC` (the TTL gate skips in-flight
-   enrolls), delete their partial points, and — if `VIRAG_SELF_HEAL` is on and the tiler
-   doc is complete and not quarantined — re-embed the doc from the tiler to restore it.
-   Otherwise it is left for a re-enroll.
+   enrolls), and for each — held like an enroll (`enroll:<doc_id>`; one that is held
+   already is skipped) — delete its partial points, and — if `VIRAG_SELF_HEAL` is on and
+   the tiler doc is complete and not quarantined — re-embed the doc from the tiler to
+   restore it. Otherwise it is left for a re-enroll.
 
 **Re-embed stream.** Self-heal, revision and rollback sync share one re-embed
 (`reembed_docs`): every `(doc_id, tile_num)` of the docs is cut into batches of
@@ -265,24 +276,25 @@ failed batch fails the docs it touched; they are retried once in per-document ba
 **Revision** (`virag/revision.py`, `POST /revision`) is a background full re-embed with a
 blue-green swap: take the job (`revision:on`, one across the cluster, §10); refuse while
 the tiler is not serving, and note its `render_version`; resolve the serving collection;
-drop any leftover `__vN+1` and create it; start the writer journal; re-embed every
+drop any leftover `__vN+1` and create it; start the journal; re-embed every
 complete, non-quarantined tiler doc into it; abort without a swap (dropping the build)
 if docs still fail; enforce `Qdrant ⊆ Tiler` on it; abort likewise if the tiler's
 `render_version` changed meanwhile, else stamp it on the build; check the job is still
 this process's (fencing: a process whose lease expired may have been replaced); swap the
 alias, keeping the replaced collection (stamped `retired_at`) as the rollback target;
-read the journal; wait up to `VIRAG_PENDING_TTL_SEC` for writers pinned to the old
-collection; sync the journaled docs into the new collection (drop, then re-embed if the
-tiler holds them complete and enrolled); enforce the invariant again. New writes are
-never mirrored into the build — the journal of writers (enroll, self-heal, in any
-process; including those already in flight at the start) plus the post-swap sync closes
-the gap. Use it after a retriever-model change and after a tiler render change. The
+read the journal; wait up to `VIRAG_PENDING_TTL_SEC` for the enrolls in flight at that
+moment (one of them may still be writing into the old collection); sync the journaled
+docs into the new collection (drop, then re-embed if the tiler holds them complete and
+enrolled; a doc being enrolled is left to its enroll, which writes it there whole);
+enforce the invariant again. New writes are never mirrored into the build — the journal
+of documents enrolled meanwhile (by `/enroll` or self-heal, in any process; including
+those already in flight at the start) plus the post-swap sync closes the gap. Use it after a retriever-model change and after a tiler render change. The
 request may land on any process: that process runs the job, and every process answers
 `GET /revision`.
 
 **Rollback** (`POST /revision/rollback`) repoints the alias to the retained collection,
-waits for the writers still pinned to the abandoned one, drops it and syncs the docs
-enrolled since `retired_at`, under the same job lock and journal. It is refused when
+waits for the enrolls in flight (they may be writing into the abandoned one), drops it
+and syncs the docs enrolled since `retired_at`, under the same job lock and journal. It is refused when
 the retained collection was embedded from another `render_version` than the tiler's.
 
 **render_version.** The tiler binds `render_version` to its volume like geometry and
@@ -304,17 +316,23 @@ stays the source of truth for the collections — the alias is the one atomic po
 the serving collection, resolved afresh wherever it matters:
 
 1. the revision / rollback job — one at a time, its status readable from any process;
-2. the journal of documents written while the job runs;
-3. the registry of in-flight writers — seeding the journal, the drain after a swap, and
-   reconcile sparing a doc being re-enrolled;
+2. the journal of documents enrolled while the job runs;
+3. the documents being enrolled — one enroll of a document at a time; they also seed
+   the journal, are what the job waits for after a swap, and are left alone by
+   reconcile and the sync;
 4. the reconcile pass — one per interval across the cluster.
 
 **Leases.** Every process holds one key with a TTL, `procs:<token>`
 (`VIRAG_PROCESS_TTL_SEC`, 30 s), renewed every ttl/3 with `SET XX` — only while it still
-exists, so an expired lease never comes back: a dead token stays dead. Whatever a
-process owns records its token and has no TTL of its own. A resource whose owner's
-lease is gone is free and is taken over with `SET IFEQ <dead token>`, so of two
-processes racing for it exactly one wins. A process finding its own lease expired (its
+exists, so an expired lease never comes back: a dead token stays dead.
+
+**What a process holds** is one key each, and they are all alike: the *name* says what
+is held, the *value* is the holder's token, and there is no TTL. It is taken with
+`SET NX`; once the holder's lease is gone it is free and is taken over with
+`SET IFEQ <dead token>`, so of two processes racing for it exactly one wins; it is
+released with `DELIFEQ <own token>`, which never removes another holder's key. Before
+an irreversible step the holder checks the key is still its own and its lease alive
+(fencing). A process finding its own lease expired (its
 event loop stalled, or Valkey was gone, longer than the TTL) stops itself with SIGTERM:
 the others already count it dead. On a graceful shutdown it hands the lease back, so
 nobody waits out the TTL.
@@ -322,11 +340,11 @@ nobody waits out the TTL.
 | Key (under `VALKEY_PREFIX`) | Holds |
 |---|---|
 | `procs:<token>` | the lease: `{host, pid, started_at}`, with the TTL |
-| `writers` | hash `writer_id → {proc, doc_id, physical}`: in-flight document writes |
-| `revision:on` | the token of the process running the revision / rollback; while it exists, writers journal themselves |
-| `revision:status` | the job status, with its `owner` |
-| `revision:journal` | the doc_ids written while the job ran |
+| `enroll:<doc_id>` | the token of the process enrolling this document |
+| `revision:on` | the token of the process running the revision / rollback; while it exists, enrolls journal their documents |
 | `reconcile:on` | the token of the reconcile leader |
+| `revision:status` | the job status, with its `owner` |
+| `revision:journal` | the doc_ids enrolled while the job ran |
 
 **Rules.**
 
@@ -337,23 +355,28 @@ nobody waits out the TTL.
   `failed: owner lost`. Before the swap (or the rollback's repoint) the job checks it
   still holds `revision:on` and its lease — the fencing that keeps a replaced process
   from swapping. On the way out it publishes the outcome and `DELIFEQ`s the lock.
-- *Writers and journal.* A writer registers (`HSET`), then journals itself if
-  `revision:on` exists, then resolves the alias and records its `physical`. The job sets
-  `revision:on` first, then snapshots the live writers into the journal. Each writer is
-  therefore in the snapshot or sees the flag — no transaction needed; one that finished
-  before the snapshot finished before the job read the tiler. The journal is read right
-  after the swap: a writer that resolved the old collection journaled itself before it
-  resolved.
-- *Drain* polls the registry until no live writer is pinned to the old collection — or
-  is still unpinned, since it may yet resolve to it. Writers of dead processes are
-  ignored and pruned; their documents stay pending in the tiler for reconcile.
+- *Enrolls and journal.* An enroll takes its document (`enroll:<doc_id>`; held by a
+  live process → `409 ENROLL_IN_PROGRESS`), then journals it if `revision:on` exists,
+  then resolves the alias. The job sets `revision:on` first, then snapshots the
+  documents being enrolled into the journal. Each enroll is therefore in the snapshot or
+  sees the flag — no transaction needed; one that finished before the snapshot finished
+  before the job read the tiler. The journal is read right after the swap: an enroll
+  that resolved the old collection journaled its document before it resolved.
+- *Drain.* Right after the swap the job notes the documents being enrolled and polls
+  until those enrolls are over: any of them may have resolved the old collection, while
+  whoever takes a document later resolves the new one. Which collection an enroll
+  writes is therefore not kept in Valkey. Documents held by dead processes are ignored
+  and their keys dropped; they stay pending in the tiler for reconcile.
+- *Who only looks.* Reconcile's cleanup and the sync after a swap never take a
+  document: they list the documents being enrolled (a scan of `enroll:*`) and skip
+  them.
 - *Reconcile lead.* Each tick, every process: lead already → run; `reconcile:on` free →
   `SET NX`; leader dead → `SET IFEQ`; else skip. The lead stays while the leader lives
   and moves within one TTL plus one interval after it dies.
 
 **Failure modes.** A process killed outright loses its in-flight requests (the client
-retries, on another process); `restart` brings it back under a new token. Its writers are ignored
-once its lease is gone; a job it ran reads as `owner lost`, the alias untouched (or
+retries, on another process); `restart` brings it back under a new token. The documents it was
+enrolling are free once its lease is gone; a job it ran reads as `owner lost`, the alias untouched (or
 swapped, with the sync left to the next revision), and the next `POST /revision` takes
 over. Valkey unreachable: chat keeps serving, enroll answers `503 NOT_READY`, a job
 fails at its next step without swapping, reconcile skips its pass; past the TTL the
@@ -367,7 +390,8 @@ virag/
   main.py            # app, lifespan (clients, dependency checks, binding, lease, reconcile, render_version check), router order
   settings.py        # pydantic-settings sections: every env var, its default and bounds
   binding.py         # the collection ↔ tiler volume binding + tiler metadata-schema guard
-  coordination.py    # Coordinator: leases, writers + journal, drain, the revision job lock, the reconcile lead
+  coordination.py    # Coordinator: leases, documents being enrolled + journal, drain, the revision job, the reconcile lead
+  enroll.py          # Enroller: a tile stream of the tiler → a document's points (take, pending, embed + upsert, promote / roll back)
   reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and the shared re-embed stream
   revision.py        # RevisionManager: background revision / rollback job, journal sync
   errors.py          # ApiError + the uniform {"error": {...}} envelope
@@ -375,7 +399,7 @@ virag/
   utils.py           # non-domain helpers (error_body, gather, cancel, chunked, unavailable_as_503)
   api/
     chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
-    enroll.py            # /enroll: streaming tile → embed → upsert
+    enroll.py            # /enroll: name policy, the tiler's ingest stream → Enroller
     revision.py          # /revision (start, status) and /revision/rollback
     models.py            # /v1/models: the VLM's entry for VLM_MODEL_NAME
     auth.py              # VIRAG_API_KEY / VIRAG_ADMIN_API_KEY router dependencies

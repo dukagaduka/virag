@@ -1,5 +1,5 @@
-"""Coordinator over an in-memory Valkey: leases, writers and the journal, drain, the
-revision job's lock, the reconcile lead."""
+"""Coordinator over an in-memory Valkey: leases, documents being enrolled and the
+journal, drain, the revision job, the reconcile lead."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import signal
 
 import pytest
 
-from virag.coordination import RECONCILE_ON, REVISION_ON, WRITERS
+from virag.coordination import RECONCILE_ON, REVISION_ON, EnrollInProgress
 from virag.errors import ApiError
 
 from conftest import FakeStore, FakeValkey, lease_key, make_coordinator
@@ -100,54 +100,104 @@ def test_close_hands_back_the_lease_and_the_reconcile_lead():
 
 
 # ---------------------------------------------------------------------------
-# writers, journal, drain
+# documents being enrolled, journal, drain
 # ---------------------------------------------------------------------------
 
-def test_writer_is_pinned_to_the_serving_collection_and_unregistered_after():
-    store, a, _ = _pair()
+def test_enrolling_holds_the_document_pinned_to_the_serving_collection():
+    _, a, _ = _pair()
 
     async def go():
-        async with a.writer(["doc"]) as physical:
-            registered = await a.valkey.hgetall_json(WRITERS)
+        async with a.enrolling("doc") as physical:
+            held = dict(a.valkey.values)
 
-        return physical, registered
+        return physical, held
 
-    physical, registered = asyncio.run(go())
+    physical, held = asyncio.run(go())
 
     assert physical == "c__v1"
-    assert [w["physical"] for w in registered.values()] == ["c__v1"]
-    assert not a.valkey.hashes.get(WRITERS)
+    assert held["enroll:doc"][0] == a.token                             # the name: what, the value: who
+    assert "enroll:doc" not in a.valkey.values                          # released
 
 
-def test_writing_spans_processes_and_drops_dead_ones():
+def test_a_document_is_enrolled_by_one_request_at_a_time():
     _, a, b = _pair()
 
     async def go():
-        async with a.writer(["from-a"]):
-            async with b.writer(["from-b"]):
-                both = await a.writing()
-                a.valkey.expire(lease_key(b))                           # b's process died mid-write
-                alive = await a.writing()
-                pruned = len(await a.valkey.hgetall_json(WRITERS))
+        refused = []
 
-        return both, alive, pruned
+        async with a.enrolling("doc"):
+            for coordinator in (a, b):                                  # the same process, and another
+                with pytest.raises(EnrollInProgress) as exc:
+                    async with coordinator.enrolling("doc"):
+                        pass
 
-    both, alive, pruned = asyncio.run(go())
+                refused.append((exc.value.status_code, exc.value.code))
 
-    assert both == {"from-a", "from-b"}
-    assert alive == {"from-a"}
-    assert pruned == 1                                                  # the dead entry is gone
+            still = await a.holds_enroll("doc")                         # a refused enroll releases nothing
+
+            async with b.enrolling("other"):                            # another document is free
+                pass
+
+        async with b.enrolling("doc"):                                  # and this one, once released
+            pass
+
+        return refused, still
+
+    refused, still = asyncio.run(go())
+
+    assert refused == [(409, "ENROLL_IN_PROGRESS")] * 2
+    assert still is True
 
 
-def test_journal_holds_writers_in_flight_and_the_ones_starting_after():
+def test_a_document_of_a_dead_process_is_taken_over():
+    _, stalled, b = _pair()
+
+    async def go():
+        stale = stalled.enrolling("doc")
+        await stale.__aenter__()
+        stalled.valkey.expire(lease_key(stalled))                       # stalled past its lease
+
+        async with b.enrolling("doc"):
+            holds = (await stalled.holds_enroll("doc"), await b.holds_enroll("doc"))
+            await stale.__aexit__(None, None, None)                     # the stale enroll ends meanwhile
+
+            return holds, await b.holds_enroll("doc")
+
+    holds, kept = asyncio.run(go())
+
+    assert holds == (False, True)
+    assert kept is True                                                 # it released nothing of b's
+
+
+def test_enrolling_now_spans_processes_and_drops_dead_ones():
     _, a, b = _pair()
 
     async def go():
-        async with b.writer(["early"]):                                 # before the job, elsewhere
+        async with a.enrolling("from-a"):
+            async with b.enrolling("from-b"):
+                both = await a.enrolling_now()
+                a.valkey.expire(lease_key(b))                           # b's process died mid-enroll
+                alive = await a.enrolling_now()
+                left = sorted(name for name in a.valkey.values if name.startswith("enroll:"))
+
+        return both, alive, left
+
+    both, alive, left = asyncio.run(go())
+
+    assert both == {"from-a": a.token, "from-b": b.token}
+    assert alive == {"from-a": a.token}
+    assert left == ["enroll:from-a"]                                    # the dead one's key is gone
+
+
+def test_journal_holds_enrolls_in_flight_and_the_ones_starting_after():
+    _, a, b = _pair()
+
+    async def go():
+        async with b.enrolling("early"):                                # before the job, elsewhere
             assert await a.acquire_revision() is None
             await a.start_journal()
 
-            async with b.writer(["during"]):
+            async with b.enrolling("during"):
                 pass
 
         return await a.journal()
@@ -155,11 +205,11 @@ def test_journal_holds_writers_in_flight_and_the_ones_starting_after():
     assert asyncio.run(go()) == {"early", "during"}
 
 
-def test_writers_without_a_job_are_not_journaled():
+def test_enrolls_without_a_job_are_not_journaled():
     _, a, _ = _pair()
 
     async def go():
-        async with a.writer(["no-job"]):
+        async with a.enrolling("no-job"):
             pass
 
         return await a.journal()
@@ -172,7 +222,7 @@ def test_start_journal_drops_the_last_jobs():
 
     async def go():
         await a.acquire_revision()
-        async with a.writer(["last-job"]):
+        async with a.enrolling("last-job"):
             pass
         await a.start_journal()
 
@@ -181,63 +231,52 @@ def test_start_journal_drops_the_last_jobs():
     assert asyncio.run(go()) == set()
 
 
-def test_drain_waits_for_writers_of_the_old_collection_only():
-    store, a, b = _pair()
+def test_drain_waits_for_the_enrolls_in_flight_and_no_later_one():
+    _, a, b = _pair()
     a.DRAIN_POLL_SEC = 0.005
 
     async def go():
         release = asyncio.Event()
 
-        async def slow_writer():
-            async with b.writer(["long"]):                              # pinned to c__v1
+        async def slow_enroll():
+            async with b.enrolling("long"):                             # may write the old collection
                 await release.wait()
 
-        task = asyncio.create_task(slow_writer())
+        task = asyncio.create_task(slow_enroll())
         await asyncio.sleep(0)
 
-        store.physical_name = "c__v2"                                   # swapped meanwhile
+        assert await a.drain(timeout=0.02) is False                     # still enrolling
 
-        async with a.writer(["new-collection"]):
-            assert await a.drain("c__v1", timeout=0.02) is False       # still writing
+        draining = asyncio.create_task(a.drain(timeout=1))
+        await asyncio.sleep(0)                                          # it has seen who is in flight
 
+        async with a.enrolling("late"):                                 # taken after the swap
             release.set()
-            assert await a.drain("c__v1", timeout=1) is True           # ignores c__v2 writers
+            assert await draining is True                               # not waited for
 
         await task
 
     asyncio.run(go())
 
 
-def test_drain_waits_for_a_writer_not_pinned_yet():
-    _, a, b = _pair()
-    a.DRAIN_POLL_SEC = 0.005
-
-    async def go():
-        await a.valkey.hset_json(WRITERS, {"w": {"proc": b.token, "doc_id": "doc"}})  # registered, not resolved
-
-        return await a.drain("c__v1", timeout=0.02)
-
-    assert asyncio.run(go()) is False
-
-
-def test_drain_ignores_writers_of_dead_processes():
+def test_drain_ignores_documents_of_dead_processes():
     _, a, b = _pair()
 
     async def go():
-        async with b.writer(["orphan"]):
+        async with b.enrolling("orphan"):
             a.valkey.expire(lease_key(b))
 
-            return await a.drain("c__v1", timeout=0.05)
+            return await a.drain(timeout=0.05)
 
     assert asyncio.run(go()) is True
 
 
-def test_writer_fails_as_not_ready_while_valkey_is_unreachable():
+def test_enrolling_fails_as_not_ready_while_valkey_is_unreachable():
     _, a, _ = _pair()
     a.valkey.down = True
 
     async def go():
-        async with a.writer(["doc"]):
+        async with a.enrolling("doc"):
             pass
 
     with pytest.raises(ApiError) as exc:

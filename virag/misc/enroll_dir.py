@@ -120,8 +120,10 @@ def enroll(
     *,
     headers: dict,
     timeout: float,
-) -> tuple[bool, str]:
-    """POST one file to /enroll. Returns (ok, one-line summary for logging)."""
+) -> tuple[str, str]:
+    """POST one file to /enroll. Returns the outcome — "enrolled", "busy" (another
+    request is enrolling the same document right now) or "failed" — and a one-line
+    summary for logging."""
     metadata = {**base_meta, "name": item.name}
     data = {"doc_type": item.doc_type, "metadata": json.dumps(metadata, ensure_ascii=False)}
     files = {"document": (item.path.name, item.path.read_bytes(), item.mime)}
@@ -136,17 +138,20 @@ def enroll(
         )
 
     except requests.RequestException as exc:
-        return False, f"request failed: {exc}"
+        return "failed", f"request failed: {exc}"
 
     if resp.status_code in (401, 403):
-        return False, f"HTTP {resp.status_code}: pass VIRAG_ADMIN_API_KEY with --api-key or the env variable"
+        return "failed", f"HTTP {resp.status_code}: pass VIRAG_ADMIN_API_KEY with --api-key or the env variable"
+
+    if resp.status_code == 409:
+        return "busy", "being enrolled by another request"
 
     if resp.status_code != 200:
-        return False, f"HTTP {resp.status_code} {resp.text[:200]}"
+        return "failed", f"HTTP {resp.status_code} {resp.text[:200]}"
 
     body = resp.json()
 
-    return True, (
+    return "enrolled", (
         f"doc_id={body['doc_id'][:12]}… tiles={body['tile_count']} "
         f"enrolled={body['enrolled']}"
     )
@@ -218,10 +223,11 @@ def main() -> int:
     print(f"enrolling {len(items)} document(s) into {endpoint}")
 
     ok = 0
+    busy: list[str] = []
     failures: list[str] = []
 
     for item in tqdm(items, desc="enroll", unit="doc"):
-        succeeded, summary = enroll(
+        outcome, summary = enroll(
             endpoint,
             item,
             base_meta,
@@ -229,14 +235,23 @@ def main() -> int:
             timeout=args.timeout,
         )
 
-        if succeeded:
+        if outcome == "enrolled":
             ok += 1
             _log(f"  + {item.name}: {summary}")
+        elif outcome == "busy":
+            busy.append(str(item.path))
+            _log(f"  ~ {item.name}: {summary}")
         else:
             failures.append(f"{item.path}: {summary}")
             _log(f"  ! {item.name}: {summary}")
 
-    print(f"\ndone: {ok}/{len(items)} enrolled, {len(failures)} failed")
+    print(f"\ndone: {ok}/{len(items)} enrolled, {len(busy)} busy, {len(failures)} failed")
+
+    if busy:
+        print("  busy: another request was enrolling these; run again to make sure they got in")
+
+    for line in busy:
+        print(f"  ~ {line}")
 
     for line in failures:
         print(f"  ! {line}")

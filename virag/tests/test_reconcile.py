@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from virag.api.enroll import point_id
+from virag.enroll import point_id
 from virag.reconcile import reconcile, reembed_docs, sync_docs
 from virag.settings import EnrollSettings, ReconcileSettings
 
@@ -48,12 +48,32 @@ def test_reconcile_deletes_points_of_quarantined_docs():
     coordinator = make_coordinator(store)
 
     async def go():
-        async with coordinator.writer(["reenrolling"]):        # a re-enroll is lifting it
+        async with coordinator.enrolling("reenrolling"):       # a re-enroll is lifting it
             await reconcile(store, coordinator, tiler, retriever, _settings(), _ENROLL)
 
     asyncio.run(go())
 
     assert store.deletes == ["quarantined"]
+
+
+def test_reconcile_leaves_a_document_being_enrolled_to_its_enroll():
+    """Neither its points (dangling as the listing saw them) nor its stale pending mark
+    are reconcile's to touch while an enroll holds the document."""
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    store._doc_ids = {"dangling", "enrolling"}                  # neither is in the tiler's listing
+    tiler.pending_docs = [_doc("enrolling", 1, enrolled_at=0), _doc("abandoned", 1, enrolled_at=0)]
+    coordinator = make_coordinator(store)
+    other = make_coordinator(store, valkey=coordinator.valkey)
+
+    async def go():
+        async with other.enrolling("enrolling"):
+            await reconcile(store, coordinator, tiler, retriever, _settings(), _ENROLL)
+
+    asyncio.run(go())
+
+    assert sorted(store.deletes) == ["abandoned", "dangling"]
+    assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["abandoned"]   # healed
+    assert [doc_id for doc_id, _ in tiler.metadata_patches] == ["abandoned"]
 
 
 def test_reconcile_self_heals_complete_pending():
@@ -177,11 +197,27 @@ def test_sync_mirrors_tiler_state_for_given_docs():
     ]
 
     failed = asyncio.run(sync_docs(
-        store, tiler, retriever, {"live", "pending", "partial", "gone"},
+        store, make_coordinator(store), tiler, retriever, {"live", "pending", "partial", "gone"},
         batch_size=4, collection="c__v2",
     ))
 
     assert failed == set()
     assert sorted(store.deletes) == ["gone", "live", "partial", "pending"]  # all dropped first
     assert set(store.delete_collections) == {"c__v2"}
+    assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["live"]
+
+
+def test_sync_leaves_a_document_being_enrolled_to_its_enroll():
+    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    tiler.docs = [_doc("live", 1), _doc("enrolling", 1)]
+    coordinator = make_coordinator(store)
+
+    async def go():
+        async with coordinator.enrolling("enrolling"):
+            return await sync_docs(
+                store, coordinator, tiler, retriever, {"live", "enrolling"}, batch_size=4, collection="c__v2",
+            )
+
+    assert asyncio.run(go()) == set()
+    assert store.deletes == ["live"]
     assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["live"]

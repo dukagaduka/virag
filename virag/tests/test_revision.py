@@ -58,7 +58,7 @@ def test_revision_builds_swaps_and_syncs_journal():
     async def iter_docs(*, filters=None):
         if not getattr(tiler, "enrolled_fresh", False):
             tiler.enrolled_fresh = True
-            async with manager.coordinator.writer(["fresh"]):         # enrolled while building
+            async with manager.coordinator.enrolling("fresh"):        # enrolled while building
                 pass
         return await listing(filters=filters)
 
@@ -302,7 +302,7 @@ def test_rollback_resyncs_docs_enrolled_since_retirement():
 
     assert status["state"] == "succeeded"
     assert status["collection"] == "c__v1" and status["abandoned"] == "c__v2"
-    assert store.dropped == ["c__v2"]                                   # once its writers drained
+    assert store.dropped == ["c__v2"]                                   # once the enrolls in flight ended
     assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["new"]
     assert {u["collection"] for u in store.upserts} == {"c__v1"}
 

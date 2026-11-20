@@ -21,8 +21,8 @@ JsonValue: TypeAlias = dict[str, Any] | list[Any] | str | int | float | bool | N
 
 
 class ValkeyStore:
-    """Async API to Valkey: plain and JSON values, conditional writes, hashes and sets,
-    every key under one prefix. It knows nothing of what the keys mean — that is the
+    """Async API to Valkey: plain and JSON values, conditional writes and sets, every
+    key under one prefix. It knows nothing of what the keys mean — that is the
     Coordinator's."""
 
     # SET … IFEQ arrived in Valkey 8.1, DELIFEQ in 9.0: compare-and-set / -delete
@@ -167,6 +167,25 @@ class ValkeyStore:
 
 
     @_unavailable_as_503
+    async def get_each(self, names: Iterable[str]) -> list[str | None]:
+        """The value of each of `names` (None where there is none), in one round trip."""
+        names = list(names)
+        if not names:
+            return []
+
+        return await self.redis.mget([self._key(name) for name in names])
+
+
+    @_unavailable_as_503
+    async def names(self, pattern: str) -> list[str]:
+        """Every name matching the glob `pattern`. A scan of the whole keyspace: for the
+        few keys virag keeps, never on a request's path."""
+        prefix = self._key("")
+
+        return [key.removeprefix(prefix) async for key in self.redis.scan_iter(match=self._key(pattern), count=1000)]
+
+
+    @_unavailable_as_503
     async def delete(self, *names: str) -> None:
         if names:
             await self.redis.delete(*(self._key(name) for name in names))
@@ -176,31 +195,6 @@ class ValkeyStore:
     async def delete_ifeq(self, name: str, expected: str) -> bool:
         """Delete `name` only if it holds `expected` now. True if it was deleted."""
         return bool(await self.redis.execute_command("DELIFEQ", self._key(name), expected))
-
-
-    # ------------------------------------------------------------------ #
-    # hashes (JSON fields)
-    # ------------------------------------------------------------------ #
-    @_unavailable_as_503
-    async def hset_json(self, name: str, fields: dict[str, JsonValue]) -> None:
-        if fields:
-            await self.redis.hset(
-                self._key(name),
-                mapping={field: orjson.dumps(value) for field, value in fields.items()},
-            )
-
-
-    @_unavailable_as_503
-    async def hgetall_json(self, name: str) -> dict[str, JsonValue]:
-        raw = await self.redis.hgetall(self._key(name))
-
-        return {field: orjson.loads(value) for field, value in raw.items()}
-
-
-    @_unavailable_as_503
-    async def hdel(self, name: str, *fields: str) -> None:
-        if fields:
-            await self.redis.hdel(self._key(name), *fields)
 
 
     # ------------------------------------------------------------------ #

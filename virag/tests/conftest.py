@@ -12,6 +12,7 @@ import hashlib
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ from qdrant_client.models import Distance
 from virag.clients.reranker_client import RerankerClient
 from virag.clients.tiler_client import TilerService
 from virag.coordination import Coordinator
+from virag.enroll import Enroller
 from virag.errors import ApiError, install_error_handlers
 from virag.main import include_routers
 from virag.settings import (
@@ -187,7 +189,6 @@ class FakeValkey:
 
     def __init__(self):
         self.values: dict[str, tuple[Any, float | None]] = {}  # name -> (value, expires_at)
-        self.hashes: dict[str, dict[str, Any]] = {}
         self.sets: dict[str, set[str]] = {}
         self.down = False
 
@@ -245,16 +246,22 @@ class FakeValkey:
 
     async def exists(self, name) -> bool:
         self._check()
-        return self._value(name) is not None or bool(self.hashes.get(name)) or bool(self.sets.get(name))
+        return self._value(name) is not None or bool(self.sets.get(name))
 
     async def exists_each(self, names) -> list[bool]:
         return [await self.exists(name) for name in names]
+
+    async def get_each(self, names) -> list:
+        return [await self.get(name) for name in names]
+
+    async def names(self, pattern) -> list[str]:
+        self._check()
+        return [name for name in list(self.values) if fnmatchcase(name, pattern) and self._value(name) is not None]
 
     async def delete(self, *names) -> None:
         self._check()
         for name in names:
             self.values.pop(name, None)
-            self.hashes.pop(name, None)
             self.sets.pop(name, None)
 
     async def delete_ifeq(self, name, expected) -> bool:
@@ -263,19 +270,6 @@ class FakeValkey:
             return False
         del self.values[name]
         return True
-
-    async def hset_json(self, name, fields) -> None:
-        self._check()
-        self.hashes.setdefault(name, {}).update({k: dict(v) for k, v in fields.items()})
-
-    async def hgetall_json(self, name) -> dict:
-        self._check()
-        return {k: dict(v) for k, v in self.hashes.get(name, {}).items()}
-
-    async def hdel(self, name, *fields) -> None:
-        self._check()
-        for field_ in fields:
-            self.hashes.get(name, {}).pop(field_, None)
 
     async def sadd(self, name, *members) -> None:
         self._check()
@@ -508,6 +502,10 @@ def build_app(*, settings=None, store=None, coordinator=None, retriever=None, re
         app.state.tiler = tiler
     if vlm is not None:
         app.state.vlm = vlm
+    if store is not None and tiler is not None and retriever is not None:
+        app.state.enroller = Enroller(
+            store, app.state.coordinator, tiler, retriever, app.state.settings.enroll_settings
+        )
     return app
 
 
