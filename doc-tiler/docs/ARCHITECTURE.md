@@ -475,7 +475,9 @@ Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipelin
 
 1. **Spool.** The upload goes to `.incoming`, hashed on the way: `doc_id`.
 2. **Known already?** A doc that is stored and servable is not rendered: its tiles are
-   replayed (the stream) or its summary returned (`/tile`).
+   replayed (the stream) or its summary returned (`/tile`). The replay — regenerated
+   tiles, each verified against its hash — is also what `GET /doc/{id}/tiles` answers
+   to a consumer that has the id but not the bytes.
 3. **Row.** A new doc's row is inserted, `complete=0`, without tiles. The primary key
    settles a race: of two requests bringing the same bytes one inserts, the other is
    refused (`409 INGEST_IN_PROGRESS`), as is any later one until the first ends.
@@ -484,8 +486,8 @@ Both `POST /tile` and `POST /tile/stream` (see [API.md](API.md)) run one pipelin
 5. **Commit.** The blob is renamed into the store, then one transaction writes every
    tile row, the height and `complete=1`.
 
-- An **incomplete doc is listed but not served**: `GET /get_tile` and `GET /doc/{id}`
-  answer `404 DOC_INCOMPLETE`, `DELETE` answers `409` — it belongs to its ingest. A
+- An **incomplete doc is listed but not served**: `GET /get_tile`, `GET /doc/{id}` and
+  `GET /doc/{id}/tiles` answer `404 DOC_INCOMPLETE`, `DELETE` answers `409` — it belongs to its ingest. A
   consumer can already refer to it (its metadata can be patched).
 - **An ingest that does not commit leaves nothing**: on an error or a client that went
   away it removes its upload and the row it inserted, even while being cancelled; what
@@ -531,8 +533,8 @@ touches any downstream (Qdrant).
 
 ### Bulk slots (ingest vs `get_tile`)
 
-The render pool and the browser pool are FIFO and shared. Ingest work (`/tile`,
-`/tile/stream`, URL capture) holds at most `TILER_N_BULK_RENDER_WORKERS` pool tasks and
+The render pool and the browser pool are FIFO and shared. Background work (`/tile`,
+`/tile/stream`, URL capture, a stored doc's stream `GET /doc/{id}/tiles`) holds at most `TILER_N_BULK_RENDER_WORKERS` pool tasks and
 `TILER_N_BULK_BROWSERS` Chromium renders at once (default: half of each pool), so a
 900-page PDF fanning out over the pool never queues an interactive `get_tile` behind all
 its chunks. Bulk slots are granted in task-creation order, so the in-order consumer of a

@@ -85,9 +85,8 @@ paths:
         it renders. The response is newline-delimited JSON
         (application/x-ndjson), one event object per line, streamed as tiles render: a
         `begin` event first (identity, so a client can build point ids before tiles
-        arrive), a `tile` event per tile (for PDFs, streamed group-by-group as each group
-        finishes — order is not guaranteed monotonic), then a terminal `committed` event
-        on success. The doc's row exists, incomplete, from `begin` on; its tiles and
+        arrive), a `tile` event per tile (in tile_num order, as they render), then a
+        terminal `committed` event on success. The doc's row exists, incomplete, from `begin` on; its tiles and
         blob reach the store together at `committed`, and an ingest that does not commit
         leaves nothing behind. Whatever fails before `begin` (unknown doc_type 400,
         oversize 413, media mismatch 415, invalid metadata 422, a blocked or failed URL
@@ -209,6 +208,33 @@ paths:
           description: The doc is quarantined — a revision could not re-render it (QUARANTINED). Re-ingest its bytes to restore it.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /doc/{doc_id}/tiles:
+    get:
+      operationId: streamDocumentTiles
+      summary: Stream a stored document's tiles as NDJSON, as the ingest of its bytes would.
+      description: >
+        The event stream /tile/stream answers to bytes the store already holds, asked
+        for by doc_id: `begin`, a `tile` event per tile (regenerated and verified
+        against its stored hash), then `committed` with result=idempotent. Nothing of
+        the doc changes. The tiles render as one background render of the document,
+        held to the bulk slots like an ingest. A doc that is unknown, still being
+        ingested or quarantined is an HTTP error; from `begin` on a failure
+        (RENDER_MISMATCH included) is an in-stream `error` event and the absence of
+        `committed` means the stream did not complete.
+      parameters:
+        - { name: doc_id, in: path, required: true, schema: { type: string } }
+      responses:
+        '503': { $ref: '#/components/responses/NotReady' }
+        '200':
+          description: NDJSON stream of events (begin, tile*, committed | error).
+          content:
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/StreamEvent' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: The doc is quarantined — a revision could not re-render it (QUARANTINED). Re-ingest its bytes to restore it.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /doc/{doc_id}:
     get:
@@ -416,7 +442,8 @@ components:
 
     StreamEvent:
       description: >
-        One line of the /tile/stream NDJSON response. The `event` field discriminates:
+        One line of an NDJSON tile stream (/tile/stream, /doc/{doc_id}/tiles). The `event`
+        field discriminates:
         `begin` (identity, emitted first), `tile` (one per tile; data is base64 JPEG),
         `committed` (terminal success), `error` (terminal failure).
       oneOf:

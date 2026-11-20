@@ -98,6 +98,51 @@ async def test_stream_idempotent_replay_does_not_re_render(client, sample_pdf):
     assert _render_count(client.service, "PDF", "ingest") == before   # replay from store
 
 
+async def test_a_stored_doc_streams_by_its_id(client, sample_pdf):
+    """GET /doc/{id}/tiles answers what /tile/stream answers to bytes already stored,
+    in one render of the document."""
+    first = _events((await client.post("/tile/stream", **pdf_form(sample_pdf))).content)
+    replayed = _events((await client.post("/tile/stream", **pdf_form(sample_pdf))).content)
+    doc_id = first[0]["doc_id"]
+    before = _render_count(client.service, "PDF", "regenerate")
+
+    r = await client.get(f"/doc/{doc_id}/tiles")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+
+    events = _events(r.content)
+    assert [e["event"] for e in events] == ["begin", "tile", "tile", "tile", "committed"]
+    assert events == replayed
+    assert [e for e in events if e["event"] == "tile"] == [e for e in first if e["event"] == "tile"]
+    assert _render_count(client.service, "PDF", "regenerate") == before + 1   # not one per tile
+
+
+async def test_a_doc_stream_refuses_a_doc_that_is_not_stored(client):
+    for doc_id in ("0" * 64, "not-a-doc-id"):
+        r = await client.get(f"/doc/{doc_id}/tiles")
+        assert (r.status_code, r.json()["error"]["code"]) == (404, "UNKNOWN_DOC")
+
+
+async def test_a_drifted_tile_ends_a_doc_stream_with_an_error(client, sample_pdf):
+    """The stream has begun, so the tile that no longer reproduces its hash is reported
+    in it — and never sent."""
+    doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
+    store = client.service.store
+
+    async with store._lock:
+        await store.db.execute(
+            "UPDATE tiles SET image_hash = ? WHERE doc_id = ? AND tile_num = 1", ("0" * 64, doc_id)
+        )
+        await store.db.commit()
+
+    r = await client.get(f"/doc/{doc_id}/tiles")
+    assert r.status_code == 200
+
+    events = _events(r.content)
+    assert [e["event"] for e in events] == ["begin", "tile", "error"]
+    assert events[-1]["code"] == "RENDER_MISMATCH"
+
+
 def _spooled(svc) -> list:
     return sorted(svc.blobs.incoming_dir.iterdir())
 
@@ -120,7 +165,11 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
     assert (await svc.store.get_doc(doc_id)).complete is False
     assert not svc.blobs.exists(doc_id) and len(_spooled(svc)) == 1    # the upload waits in .incoming
 
-    for route, params in (("/get_tile", {"doc_id": doc_id, "tile_num": 0}), (f"/doc/{doc_id}", None)):
+    for route, params in (
+        ("/get_tile", {"doc_id": doc_id, "tile_num": 0}),
+        (f"/doc/{doc_id}", None),
+        (f"/doc/{doc_id}/tiles", None),
+    ):
         got = await client.get(route, params=params)
         assert got.status_code == 404
         assert got.json()["error"]["code"] == "DOC_INCOMPLETE"

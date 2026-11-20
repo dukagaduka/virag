@@ -109,6 +109,9 @@ async def test_unrenderable_doc_is_quarantined(tmp_path):
         assert gone.status_code == 410
         assert gone.json()["error"]["code"] == "QUARANTINED"
 
+        gone = await client.get(f"/doc/{bad_id}/tiles")
+        assert (gone.status_code, gone.json()["error"]["code"]) == (410, "QUARANTINED")
+
         listed = (await client.post("/docs/search", json={})).json()["items"]
         assert {d["doc_id"]: d["quarantined"] for d in listed} == {good_id: False, bad_id: True}
         assert (await client.get("/readyz")).json()["checks"]["quarantined"] == 1

@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import aclosing
 from typing import Annotated
 
-import orjson
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
@@ -13,7 +11,14 @@ from ..errors import bad_request
 from ..models import DocType, IngestResult
 from ..service import TilerService
 from ..store.blobs import Incoming
-from .deps import ERROR_RESPONSES, capped_chunks, check_declared_size, parse_metadata_field, service
+from .deps import (
+    ERROR_RESPONSES,
+    capped_chunks,
+    check_declared_size,
+    ndjson_response,
+    parse_metadata_field,
+    service,
+)
 
 router = APIRouter()
 
@@ -103,16 +108,6 @@ async def ingest_document_stream(
     meta_obj = parse_metadata_field(metadata)
     upload = await _spool(svc, doc_type, document)
 
-    events = svc.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj)
-
-    # Awaited before the response starts, so a failure up to `begin` keeps its HTTP status.
-    begin = await anext(events)
-
-    async def ndjson():
-        async with aclosing(events):
-            yield orjson.dumps(begin) + b"\n"
-
-            async for event in events:
-                yield orjson.dumps(event) + b"\n"
-
-    return StreamingResponse(ndjson(), media_type="application/x-ndjson")
+    return await ndjson_response(
+        svc.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj)
+    )

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hmac
+from contextlib import aclosing
 from typing import Any, AsyncIterator
 
 import orjson
 from fastapi import Request, Security, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ..errors import not_found, not_ready, too_large, unauthorized, unprocessable
@@ -100,6 +102,21 @@ async def capped_chunks(upload: UploadFile, limit: int) -> AsyncIterator[bytes]:
             )
 
         yield chunk
+
+
+async def ndjson_response(events: AsyncIterator[dict[str, Any]]) -> StreamingResponse:
+    """An event stream as an NDJSON response. Its first event is awaited before the
+    response starts, so whatever fails up to it keeps its HTTP status."""
+    first = await anext(events)
+
+    async def lines() -> AsyncIterator[bytes]:
+        async with aclosing(events):
+            yield orjson.dumps(first) + b"\n"
+
+            async for event in events:
+                yield orjson.dumps(event) + b"\n"
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson")
 
 
 def parse_metadata_field(raw: str | None) -> dict[str, Any] | None:

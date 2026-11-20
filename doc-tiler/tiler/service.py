@@ -127,7 +127,7 @@ class TilerService:
         return summary
 
 
-    async def ingest_stream(
+    def ingest_stream(
         self,
         *,
         doc_type: DocType,
@@ -135,18 +135,30 @@ class TilerService:
         url: str | None,
         metadata: dict[str, Any] | None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream an ingest as NDJSON events: `begin`, one `tile` per tile, then `committed`.
+        """Stream an ingest as NDJSON events: `begin`, one `tile` per tile, then `committed`."""
+        return self._stream(
+            self._ingest(doc_type=doc_type, upload=upload, url=url, metadata=metadata, replay=True)
+        )
+
+
+    def doc_stream(self, doc_id: str) -> AsyncIterator[dict[str, Any]]:
+        """Stream a stored doc as the ingest of its bytes would: the same events, its
+        tiles regenerated. Nothing of the doc changes."""
+        return self._stream(self._stored(doc_id))
+
+
+    async def _stream(self, events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
+        """Pipeline events as they go on the wire, each tile with its bytes.
 
         A failure before `begin` raises: the response has not started, so it can still
         be an HTTP error. From `begin` on the response is already 200 and a failure
         surfaces as an `error` event; the absence of `committed` is the client's signal
         to roll back.
         """
-        events = self._ingest(doc_type=doc_type, upload=upload, url=url, metadata=metadata, replay=True)
         begun = False
 
         try:
-            # Closed with this stream: a client that goes away ends the ingest at once.
+            # Closed with this stream: a client that goes away ends the work at once.
             async with aclosing(events):
                 async for event in events:
                     begun = True  # the first event is `begin`
@@ -170,7 +182,7 @@ class TilerService:
             if not begun:
                 raise
 
-            log.exception("streaming ingest crashed")
+            log.exception("tile stream crashed")
             yield {"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)}
 
 
@@ -343,9 +355,18 @@ class TilerService:
             await self.render.page_cache.invalidate(lambda k: k == path)
 
 
+    async def _stored(self, doc_id: str) -> AsyncIterator[dict[str, Any]]:
+        """The events of a doc the store serves, by its id."""
+        row = await self._served(doc_id)
+
+        async with aclosing(self._replay_from_store(row, replay=True)) as events:
+            async for event in events:
+                yield event
+
+
     async def _replay_from_store(self, row: DocRow, replay: bool) -> AsyncIterator[dict[str, Any]]:
-        """An idempotent hit: `begin`, the stored tiles regenerated (only when `replay`
-        is set), then `committed`."""
+        """A stored doc as an ingest's events: `begin`, its tiles regenerated (only when
+        `replay` is set), then `committed`."""
         yield {
             "event": "begin",
             "doc_id": row.doc_id,
@@ -355,18 +376,9 @@ class TilerService:
         }
 
         if replay:
-            for tile in await self.store.get_tiles(row.doc_id):
-                jpeg, _, _ = await self.get_tile(row.doc_id, tile.tile_num, verify=True)
-                yield {
-                    "event": "tile",
-                    "tile": RenderedTile(
-                        tile_num=tile.tile_num,
-                        offset=tile.offset,
-                        height=tile.height,
-                        jpeg=jpeg,
-                        image_hash=tile.image_hash,
-                    ),
-                }
+            async with aclosing(self._regenerate_all(row)) as tiles:
+                async for tile in tiles:
+                    yield {"event": "tile", "tile": tile}
 
         yield {
             "event": "committed",
@@ -456,22 +468,7 @@ class TilerService:
     # ------------------------------------------------------------------ #
     async def get_tile(self, doc_id: str, tile_num: int, verify: bool) -> tuple[bytes, TileRow, DocRow]:
         """Return a single tile's bytes, regenerating and caching it on demand."""
-        row = await self.store.get_doc(doc_id)
-
-        if row is None:
-            raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
-
-        if not row.complete:
-            raise not_found(
-                f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id
-            )
-
-        if row.quarantined:
-            raise gone(
-                f"doc_id {doc_id!r} is quarantined: {row.quarantine_reason}",
-                doc_id=doc_id,
-                reason=row.quarantine_reason,
-            )
+        row = await self._served(doc_id)
 
         if tile_num < 0 or tile_num >= row.tile_count:
             raise bad_request(
@@ -490,22 +487,31 @@ class TilerService:
         jpeg = await self.tile_cache.get_or_create(key, lambda: self._regenerate(row, tile_row))
 
         if verify:
-            actual = sha256_hex(jpeg)
-
-            # Every served doc was rendered by this render_version (revision guarantees
-            # it), so a mismatch here is non-determinism — a bug, never expected drift.
-            if actual != tile_row.image_hash:
-                metrics.MISMATCHES.labels(doc_type=row.doc_type).inc()
-
-                message = (
-                    f"regenerated tile ({doc_id}, {tile_num}) hashes to {actual} but "
-                    f"{tile_row.image_hash} was stored at render_version {row.render_version}"
-                )
-                log.warning("%s — refusing", message)
-
-                raise conflict(message, "RENDER_MISMATCH", doc_id=doc_id, tile_num=tile_num)
+            self._verify(row, tile_row, sha256_hex(jpeg))
 
         return jpeg, tile_row, row
+
+
+    async def _served(self, doc_id: str) -> DocRow:
+        """The row of a doc whose tiles are served: stored, complete, not quarantined."""
+        row = await self.store.get_doc(doc_id)
+
+        if row is None:
+            raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
+
+        if not row.complete:
+            raise not_found(
+                f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id
+            )
+
+        if row.quarantined:
+            raise gone(
+                f"doc_id {doc_id!r} is quarantined: {row.quarantine_reason}",
+                doc_id=doc_id,
+                reason=row.quarantine_reason,
+            )
+
+        return row
 
 
     async def _regenerate(self, row: DocRow, tile_row: TileRow) -> bytes:
@@ -518,6 +524,46 @@ class TilerService:
                 [image] = await doc.render([tile])
 
         return image.jpeg
+
+
+    async def _regenerate_all(self, row: DocRow) -> AsyncIterator[RenderedTile]:
+        """Re-render every tile of a stored doc in one background render, in tile order,
+        each verified against its stored hash."""
+        self._require_blob(row)
+
+        stored = {tile_row.tile_num: tile_row for tile_row in await self.store.get_tiles(row.doc_id)}
+        tiles = [Tile(tile_row.tile_num, tile_row.offset, tile_row.height) for tile_row in stored.values()]
+        count = [0]
+
+        with self._measured(row.doc_type, "regenerate", count):
+            async with self._document(
+                row.doc_type, self.blobs.path(row.doc_id), bulk=True, height=row.height
+            ) as doc:
+                async with aclosing(doc.render_all(tiles)) as batches:
+                    async for batch in batches:
+                        for tile in batch:
+                            self._verify(row, stored[tile.tile_num], tile.image_hash)
+                            count[0] += 1
+
+                            yield tile
+
+
+    def _verify(self, row: DocRow, tile_row: TileRow, actual: str) -> None:
+        """Refuse a regenerated tile whose hash is not the one stored at ingest."""
+        if actual == tile_row.image_hash:
+            return
+
+        # Every served doc was rendered by this render_version (revision guarantees
+        # it), so a mismatch here is non-determinism — a bug, never expected drift.
+        metrics.MISMATCHES.labels(doc_type=row.doc_type).inc()
+
+        message = (
+            f"regenerated tile ({row.doc_id}, {tile_row.tile_num}) hashes to {actual} but "
+            f"{tile_row.image_hash} was stored at render_version {row.render_version}"
+        )
+        log.warning("%s — refusing", message)
+
+        raise conflict(message, "RENDER_MISMATCH", doc_id=row.doc_id, tile_num=tile_row.tile_num)
 
 
     def _require_blob(self, row: DocRow) -> None:

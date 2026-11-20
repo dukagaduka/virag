@@ -60,8 +60,8 @@ object per line:
 - `{"event":"begin","doc_id","doc_type","source_url","render_version"}` — emitted first,
   so a client can build point ids before any tile arrives.
 - `{"event":"tile","tile_num","width","height","image_hash","data"}` — one per tile;
-  `data` is base64 JPEG. For PDFs, tiles stream **group-by-group** as each group finishes
-  rendering, so their order is **not guaranteed monotonic**.
+  `data` is base64 JPEG. Tiles arrive **in `tile_num` order**, as they render (batches
+  render in parallel and are sent in order).
 - `{"event":"committed","doc_id","doc_type","source_url","render_version","height","tile_count","result"}`
   — terminal **success** event; `result` is `rendered` or `idempotent`, as in `/tile`.
 - `{"event":"error","code","message"}` — terminal **failure** event.
@@ -81,6 +81,24 @@ leaves nothing behind: its row and its upload are removed (at the next start, fo
 killed process). Idempotent like `/tile`: bytes already stored and served replay the
 stored tiles (regenerated, verified against their hashes) as the same event stream
 without re-rendering.
+
+### `GET /doc/{doc_id}/tiles` — a stored document's tile stream (NDJSON)
+
+The stream `POST /tile/stream` answers to bytes the store already holds, asked for by
+`doc_id`: `begin`, every tile regenerated and verified against its hash, `committed`
+with `result: idempotent`. For a consumer that has the id but not the bytes and needs
+the whole document again (re-embedding it). Nothing of the doc changes. The tiles
+render as one background render of the document, held to the bulk slots like an
+ingest — unlike a `get_tile` per tile, which renders each on its own and at chat's
+priority.
+
+A doc that is unknown or still being ingested (`404`) or quarantined (`410`) is an HTTP
+error; from `begin` on a failure — a tile that no longer reproduces its hash
+(`RENDER_MISMATCH`) included — is an in-stream `error` event.
+
+```bash
+curl -sN localhost:8080/doc/<sha256>/tiles | jq -c 'del(.data)'
+```
 
 ### Revision — `GET /revision`, `POST /revision`
 
