@@ -1,11 +1,11 @@
-"""FastAPI app: startup wiring (guard, pools, DB, metadata indexes) and route registration."""
+"""FastAPI app: startup wiring (guard, DB, metadata indexes, pools, revision gate) and route registration."""
 
 from __future__ import annotations
 
 import logging
 import os
 import sys
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
@@ -18,11 +18,17 @@ from .api import revision as revision_api
 from .api import search as search_api
 from .api import tiles as tiles_api
 from .api.deps import require_api_key, require_serving
-from .config import ConfigError, Settings, load_settings
+from .capture import UrlCapture
+from .config import ConfigError, load_settings
 from .errors import install_error_handlers
-from .meta.schema import MetadataSchema, SchemaError, index_statements, load_schema
+from .ingest import Ingester
+from .meta.schema import SchemaError, index_statements, load_schema
+from .render.pool import RenderPool
 from .responses import OrjsonResponse
-from .service import TilerService
+from .revision import Revision
+from .store.blobs import BlobStore
+from .store.meta import MetaStore
+from .tiles import Tiles
 
 log = logging.getLogger("tiler")
 
@@ -42,71 +48,6 @@ def configure_logging() -> None:
     )
 
 
-async def bootstrap(settings: Settings, schema: MetadataSchema) -> TilerService:
-    """Everything that must succeed before the first request is served."""
-    svc = TilerService(settings, schema)
-
-    os.makedirs(os.path.dirname(os.path.abspath(settings.db_path)) or ".", exist_ok=True)
-    os.makedirs(settings.temp_dir, exist_ok=True)
-    svc.blobs.ensure_root()
-
-    await svc.store.connect()
-
-    try:
-        await svc.store.create_tables()
-        # Hard geometry gate: refuse to start against a volume built with different geometry.
-        svc.volume_id = (await guard.enforce(svc.store, settings)).volume_id
-
-    except BaseException:
-        await svc.store.close()
-        raise
-
-    # No ingest outlives its process: drop what a killed one left half-done.
-    unfinished = await svc.store.delete_incomplete()
-    spooled = svc.blobs.purge_incoming()
-
-    if unfinished or spooled:
-        log.warning(
-            "removed %d unfinished ingest(s) and %d spooled upload(s) the previous run left behind",
-            unfinished,
-            spooled,
-        )
-
-    created = await svc.store.create_metadata_indexes(index_statements(schema))
-    dropped = await svc.store.drop_stale_metadata_indexes({f.index_name for f in schema.fields})
-
-    log.info(
-        "metadata schema v%s: %d searchable field(s) %s%s",
-        schema.version,
-        len(schema.fields),
-        [f.key for f in schema.fields],
-        f"; dropped stale index(es) {dropped}" if dropped else "",
-    )
-    log.debug("index statements: %s", created)
-
-    # Give the planner statistics; without them a selective range filter can lose
-    # out to the created_at index (see README, "search and the query planner").
-    await svc.store.optimize()
-
-    await svc.start_pools()
-    metrics.DOCS.set(await svc.store.count_docs())
-
-    # Opens the gate, or starts / awaits the revision of docs from another render_version.
-    await svc.revision.prepare()
-    state = "ready" if svc.revision.serving else f"not serving (revision {svc.revision.status['state']})"
-
-    log.info(
-        "%s: geometry=%s render_version=%s browsers=%d render_workers=%d",
-        state,
-        settings.geometry,
-        settings.render_version,
-        settings.browsers,
-        settings.render_workers,
-    )
-
-    return svc
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
@@ -119,32 +60,107 @@ async def lifespan(app: FastAPI):
         log.critical("FATAL: %s", exc)
         raise SystemExit(1) from exc
 
-    try:
-        svc = await bootstrap(settings, schema)
+    os.makedirs(os.path.dirname(os.path.abspath(settings.db_path)) or ".", exist_ok=True)
+    os.makedirs(settings.temp_dir, exist_ok=True)
 
-    except guard.GeometryMismatch as exc:
-        # Never serve a single request against a mismatched volume.
-        raise SystemExit(1) from exc
+    store = MetaStore(settings.db_path)
+    blobs = BlobStore(settings.blob_dir)
+    render = RenderPool(settings)
+    capture = UrlCapture(settings, render)
 
-    app.state.service = svc
-    app.state.settings = settings
+    tiles = Tiles(store, blobs, render, settings)
+    ingester = Ingester(store, blobs, render, capture, tiles, schema, settings)
+    revision = Revision(store, blobs, render, tiles, settings)
 
-    if not settings.api_key:
-        log.warning("TILER_API_KEY is empty: every route is open to anyone who reaches the port")
+    # Everything below must succeed before the first request is served. Whatever is
+    # started registers its own shutdown at once, so a failed step still closes what
+    # was already opened (LIFO).
+    async with AsyncExitStack() as stack:
+        blobs.ensure_root()
 
-    if not settings.render_worker_memory:
-        log.warning(
-            "TILER_RENDER_WORKER_MEMORY is 0: a heavy document can exhaust the container's "
-            "memory and draw the OOM killer instead of failing on its own"
+        await store.connect()
+        stack.push_async_callback(store.close)
+
+        await store.create_tables()
+
+        try:
+            # Hard geometry gate: refuse to start against a volume built with different geometry.
+            volume_id = (await guard.enforce(store, settings)).volume_id
+
+        except guard.GeometryMismatch as exc:
+            # Never serve a single request against a mismatched volume.
+            raise SystemExit(1) from exc
+
+        # No ingest outlives its process: drop what a killed one left half-done.
+        unfinished = await store.delete_incomplete()
+        spooled = blobs.purge_incoming()
+
+        if unfinished or spooled:
+            log.warning(
+                "removed %d unfinished ingest(s) and %d spooled upload(s) the previous run left behind",
+                unfinished,
+                spooled,
+            )
+
+        created = await store.create_metadata_indexes(index_statements(schema))
+        dropped = await store.drop_stale_metadata_indexes({f.index_name for f in schema.fields})
+
+        log.info(
+            "metadata schema v%s: %d searchable field(s) %s%s",
+            schema.version,
+            len(schema.fields),
+            [f.key for f in schema.fields],
+            f"; dropped stale index(es) {dropped}" if dropped else "",
+        )
+        log.debug("index statements: %s", created)
+
+        # Give the planner statistics; without them a selective range filter can lose
+        # out to the created_at index (see README, "search and the query planner").
+        await store.optimize()
+
+        # The SSRF guard proxy first: Chromium starts knowing whether it goes through one.
+        await capture.start()
+        stack.push_async_callback(capture.stop)
+
+        await render.start(browser=settings.browser_enabled, per_context_proxy=capture.proxied)
+        stack.push_async_callback(render.stop)
+
+        metrics.DOCS.set(await store.count_docs())
+
+        # Opens the gate, or starts / awaits the revision of docs from another render_version.
+        stack.push_async_callback(revision.close)
+        await revision.prepare()
+
+        app.state.settings = settings
+        app.state.schema = schema
+        app.state.volume_id = volume_id
+        app.state.store = store
+        app.state.blobs = blobs
+        app.state.render = render
+        app.state.capture = capture
+        app.state.tiles = tiles
+        app.state.ingester = ingester
+        app.state.revision = revision
+
+        log.info(
+            "%s: geometry=%s render_version=%s browsers=%d render_workers=%d",
+            "ready" if revision.serving else f"not serving (revision {revision.status['state']})",
+            settings.geometry,
+            settings.render_version,
+            settings.browsers,
+            settings.render_workers,
         )
 
-    try:
-        yield
+        if not settings.api_key:
+            log.warning("TILER_API_KEY is empty: every route is open to anyone who reaches the port")
 
-    finally:
-        await svc.revision.close()
-        await svc.stop_pools()
-        await svc.store.close()
+        if not settings.render_worker_memory:
+            log.warning(
+                "TILER_RENDER_WORKER_MEMORY is 0: a heavy document can exhaust the container's "
+                "memory and draw the OOM killer instead of failing on its own"
+            )
+
+        yield
 
 
 def create_app() -> FastAPI:

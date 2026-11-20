@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
@@ -14,7 +15,6 @@ from .. import __version__
 from .. import metrics as m
 from ..models import MetadataSchemaModel
 from ..responses import OrjsonResponse
-from .deps import service
 
 router = APIRouter()
 keyed_router = APIRouter()
@@ -28,7 +28,7 @@ keyed_router = APIRouter()
 )
 async def get_metadata_schema(request: Request) -> MetadataSchemaModel:
     """Return the operator-declared metadata schema."""
-    return MetadataSchemaModel(**service(request).schema.as_dict())
+    return MetadataSchemaModel(**request.app.state.schema.as_dict())
 
 
 @router.get("/healthz", summary="Liveness.", operation_id="healthz")
@@ -42,8 +42,54 @@ async def healthz() -> dict[str, str]:
     "/readyz", summary="Readiness (DB, blob dir, Chromium pool, revision gate).", operation_id="readyz"
 )
 async def readyz(request: Request) -> Response:
-    """Readiness probe checking the DB, blob dir, Chromium pool and revision gate."""
-    ok, checks = await service(request).ready()
+    """Readiness probe checking the DB, blob dir, render pool, Chromium and revision gate."""
+    state = request.app.state
+    checks: dict[str, Any] = {}
+    ok = True
+
+    try:
+        await state.store.ping()
+        checks["db"] = "ok"
+
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+        ok = False
+
+    try:
+        await asyncio.to_thread(state.blobs.ensure_root)
+        checks["blobs"] = "ok"
+
+    except Exception as exc:
+        checks["blobs"] = f"error: {exc}"
+        ok = False
+
+    pool_ok = await state.render.healthy()
+    checks["render_pool"] = "ok" if pool_ok else "down"
+
+    if not pool_ok:
+        ok = False
+
+    browser = state.render.browser
+
+    if state.settings.browser_enabled:
+        checks["browser"] = "ok" if browser.available else f"unavailable: {browser.start_error}"
+
+        if not browser.available:
+            ok = False
+
+    else:
+        checks["browser"] = "disabled"
+
+    # Not ready while docs from another render_version remain (see GET /revision).
+    checks["revision"] = state.revision.status["state"]
+
+    if not state.revision.serving:
+        ok = False
+
+    # Counted live: a re-ingest lifts a quarantine without any revision running.
+    quarantined = await state.store.count_quarantined()
+    m.QUARANTINED.set(quarantined)
+    checks["quarantined"] = quarantined
 
     return OrjsonResponse(
         status_code=200 if ok else 503,
@@ -62,32 +108,33 @@ async def metrics_endpoint() -> Response:
 @keyed_router.get("/info", summary="Effective geometry, render_version and cache stats.")
 async def info(request: Request) -> dict[str, Any]:
     """Report effective geometry, render_version, revision gate, policy, pools and cache stats."""
-    svc = service(request)
+    state = request.app.state
+    settings = state.settings
 
     return {
         "version": __version__,
-        "geometry": svc.settings.geometry,
-        "render_version": svc.settings.render_version,
-        "volume_id": svc.volume_id,
-        "pixel_tier": svc.settings.pixel_tier,
-        "revision": svc.revision.status,
+        "geometry": settings.geometry,
+        "render_version": settings.render_version,
+        "volume_id": state.volume_id,
+        "pixel_tier": settings.pixel_tier,
+        "revision": state.revision.status,
         "policy": {
-            "revision_on_render_mismatch": svc.settings.revision_on_render_mismatch,
-            "url_fetch_enabled": svc.settings.url_fetch_enabled,
-            "url_allow_private": svc.settings.url_allow_private,
-            "allow_delete": svc.settings.allow_delete,
-            "ssrf_guard_proxy": svc.capture.guard_proxy.url if svc.capture.guard_proxy else None,
+            "revision_on_render_mismatch": settings.revision_on_render_mismatch,
+            "url_fetch_enabled": settings.url_fetch_enabled,
+            "url_allow_private": settings.url_allow_private,
+            "allow_delete": settings.allow_delete,
+            "ssrf_guard_proxy": state.capture.guard_proxy.url if state.capture.guard_proxy else None,
         },
         "pools": {
-            "browsers": svc.settings.browsers,
-            "render_workers": svc.settings.render_workers,
-            "bulk_browsers": svc.settings.bulk_browsers,
-            "bulk_render_workers": svc.settings.bulk_render_workers,
-            "browser_available": svc.render.browser.available,
-            "render_worker_memory": svc.settings.render_worker_memory,
-            "render_timeout_sec": svc.settings.render_timeout_sec,
-            "render_worker_restarts": svc.render.worker_restarts,
+            "browsers": settings.browsers,
+            "render_workers": settings.render_workers,
+            "bulk_browsers": settings.bulk_browsers,
+            "bulk_render_workers": settings.bulk_render_workers,
+            "browser_available": state.render.browser.available,
+            "render_worker_memory": settings.render_worker_memory,
+            "render_timeout_sec": settings.render_timeout_sec,
+            "render_worker_restarts": state.render.worker_restarts,
         },
-        "cache": {"tile": svc.tile_cache.stats(), "page": svc.render.page_cache.stats()},
-        "docs": await svc.store.count_docs(),
+        "cache": {"tile": state.tiles.cache.stats(), "page": state.render.page_cache.stats()},
+        "docs": await state.store.count_docs(),
     }

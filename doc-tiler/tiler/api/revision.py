@@ -7,7 +7,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Query, Request
 
 from ..responses import OrjsonResponse
-from .deps import ERROR_RESPONSES, service
+from .deps import ERROR_RESPONSES
 
 router = APIRouter()
 
@@ -19,7 +19,7 @@ router = APIRouter()
 )
 async def revision_status(request: Request) -> dict[str, Any]:
     """Report the gate (`serving`) and the job's state and progress."""
-    return service(request).revision.status
+    return request.app.state.revision.status
 
 
 @router.post(
@@ -36,4 +36,4 @@ async def start_revision(
     """Re-render, from their stored blobs, the docs rendered by another render_version
     (every doc with `force`). Data routes answer 503 NOT_READY until it finishes; a doc
     that cannot be re-rendered is quarantined. 409 while a revision is running."""
-    return OrjsonResponse(status_code=202, content=service(request).revision.start(force))
+    return OrjsonResponse(status_code=202, content=request.app.state.revision.start(force))

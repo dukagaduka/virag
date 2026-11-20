@@ -1,7 +1,7 @@
-"""Result types shared by the render workers, the service and the store.
+"""Result types shared by the render workers, the documents and the store.
 
 `EncodedImage` is what the render workers return, so it must stay a plain module-level
-dataclass (picklable). `RenderedTile` is what the service assembles from it.
+dataclass (picklable). `RenderedTile` is what a document assembles from it.
 """
 
 from __future__ import annotations

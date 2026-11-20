@@ -1,4 +1,4 @@
-"""Documents: a stored document opened for rendering, as the service sees it.
+"""Documents: a stored document opened for rendering, as the rest of the tiler sees it.
 
 Whatever its format, a document is one image `TILE_WIDTH` wide and `height` tall:
 `plan()` measures it and cuts it into tiles, `render()` returns the JPEGs of some of
@@ -20,6 +20,7 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from itertools import islice
+from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
 from ..models import DocType
@@ -56,6 +57,20 @@ class Document(ABC):
         self.path = path
         self.bulk = bulk
         self._height = height
+
+
+    @staticmethod
+    def open(
+        pool: RenderPool,
+        doc_type: DocType,
+        path: str | Path,
+        *,
+        bulk: bool = False,
+        height: int | None = None,
+    ) -> Document:
+        """The document in the file at `path` (a stored blob or a spooled upload), as
+        the class of its type."""
+        return DOCUMENTS[doc_type](pool, doc_type, str(path), bulk=bulk, height=height)
 
 
     async def __aenter__(self) -> Document:

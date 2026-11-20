@@ -36,14 +36,16 @@ import asyncio
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from typing import Any, AsyncIterator
 
 from . import metrics
+from .config import Settings
 from .errors import ApiError, conflict
-from .store.meta import DocRow
-
-if TYPE_CHECKING:
-    from .service import TilerService
+from .render.documents import Document
+from .render.pool import RenderPool
+from .store.blobs import BlobStore
+from .store.meta import DocRow, MetaStore, TileRow
+from .tiles import Tiles
 
 log = logging.getLogger("tiler.revision")
 
@@ -58,8 +60,25 @@ class Revision:
     INFRASTRUCTURE = frozenset({"WORKER_CRASH", "BROWSER_UNAVAILABLE"})
 
 
-    def __init__(self, svc: TilerService):
-        self.svc = svc
+    def __init__(
+        self,
+        store: MetaStore,
+        blobs: BlobStore,
+        render: RenderPool,
+        tiles: Tiles,
+        settings: Settings,
+    ):
+
+        self.store  = store
+        self.blobs  = blobs
+        self.render = render
+        self.tiles  = tiles
+
+        self.render_version = settings.render_version
+        self.on_mismatch    = settings.revision_on_render_mismatch
+        self.concurrency    = settings.revision_concurrency
+        self.db_path        = settings.db_path
+
         self.serving = False
         self._task: asyncio.Task | None = None
         self._status: dict[str, Any] = {"state": "idle"}
@@ -80,14 +99,11 @@ class Revision:
 
     async def prepare(self) -> None:
         """At startup: serve right away, start the revision, or wait for POST /revision."""
-        settings = self.svc.settings
-        store = self.svc.store
-
-        stale = await store.count_revisable(settings.render_version)
+        stale = await self.store.count_revisable(self.render_version)
         self._status = {
             "state": "idle",
-            "render_version": settings.render_version,
-            "quarantined_total": await store.count_quarantined(),
+            "render_version": self.render_version,
+            "quarantined_total": await self.store.count_quarantined(),
         }
 
         if not stale:
@@ -98,10 +114,10 @@ class Revision:
             "%d doc(s) were rendered by another render_version than %s; not serving until "
             "they are revised",
             stale,
-            settings.render_version,
+            self.render_version,
         )
 
-        if settings.revision_on_render_mismatch:
+        if self.on_mismatch:
             self.start()
             return
 
@@ -123,7 +139,7 @@ class Revision:
         self._started = self._reported = time.monotonic()
         self._status = {
             "state": "running",
-            "render_version": self.svc.settings.render_version,
+            "render_version": self.render_version,
             "force": force,
             "started_at": int(time.time()),
             "total": None,
@@ -174,20 +190,19 @@ class Revision:
 
 
     async def _revise(self, force: bool) -> None:
-        store = self.svc.store
-        current = self.svc.settings.render_version
-
-        total = await store.count_revisable(current, force=force)
+        total = await self.store.count_revisable(self.render_version, force=force)
         self._status["total"] = total
-        log.info("revision: %d doc(s) to re-render at render_version %s (force=%s)", total, current, force)
+        log.info(
+            "revision: %d doc(s) to re-render at render_version %s (force=%s)", total, self.render_version, force
+        )
 
         await self._backup()
 
-        slots = asyncio.Semaphore(self.svc.settings.revision_concurrency)
+        slots = asyncio.Semaphore(self.concurrency)
 
         async def run(row: DocRow) -> None:
             try:
-                await self._revise_one(row, current)
+                await self._revise_one(row)
 
             finally:
                 slots.release()
@@ -195,15 +210,15 @@ class Revision:
 
         try:
             async with asyncio.TaskGroup() as group:
-                async for row in self._candidates(current, force):
+                async for row in self._candidates(force):
                     await slots.acquire()
                     group.create_task(run(row))
 
         except BaseExceptionGroup as eg:
             raise eg.exceptions[0]
 
-        remaining = await store.count_revisable(current)
-        quarantined = await store.count_quarantined()
+        remaining = await self.store.count_revisable(self.render_version)
+        quarantined = await self.store.count_quarantined()
 
         self._status["quarantined_total"] = quarantined
         metrics.QUARANTINED.set(quarantined)
@@ -222,12 +237,12 @@ class Revision:
         await self._open()
 
 
-    async def _candidates(self, render_version: str, force: bool) -> AsyncIterator[DocRow]:
+    async def _candidates(self, force: bool) -> AsyncIterator[DocRow]:
         """Every revisable doc, page by page in doc_id order."""
         after = ""
 
-        while rows := await self.svc.store.list_revisable(
-            render_version, force=force, after=after, limit=self.PAGE
+        while rows := await self.store.list_revisable(
+            self.render_version, force=force, after=after, limit=self.PAGE
         ):
             for row in rows:
                 yield row
@@ -235,11 +250,11 @@ class Revision:
             after = rows[-1].doc_id
 
 
-    async def _revise_one(self, row: DocRow, render_version: str) -> None:
+    async def _revise_one(self, row: DocRow) -> None:
         """Re-render one doc, retrying once; quarantine it if it still fails."""
         for attempt in (1, 2):
             try:
-                await self.svc.revise_doc(row)
+                await self._revise_doc(row)
 
             except ApiError as exc:
                 if exc.code in self.INFRASTRUCTURE:
@@ -257,7 +272,7 @@ class Revision:
 
             log.warning("revision: doc_id=%s failed (attempt %d): %s", row.doc_id, attempt, reason)
 
-        await self.svc.store.quarantine(row.doc_id, render_version, reason)
+        await self.store.quarantine(row.doc_id, self.render_version, reason)
 
         self._status["quarantined"] += 1
         metrics.REVISION_DOCS.labels(result="quarantined").inc()
@@ -268,10 +283,36 @@ class Revision:
         log.error("revision: doc_id=%s quarantined: %s", row.doc_id, reason)
 
 
+    async def _revise_doc(self, row: DocRow) -> None:
+        """Re-render one stored doc from its blob and swap its tiles and height in place
+        at the current render_version (doc_id and metadata are untouched)."""
+        self.blobs.require(row.doc_id)
+        staged: list[TileRow] = []
+        count = [0]
+
+        with metrics.measured(row.doc_type, "revise", count):
+            async with Document.open(self.render, row.doc_type, self.blobs.path(row.doc_id)) as doc:
+                async for batch in doc.render_all(await doc.plan()):
+                    staged.extend(TileRow.from_rendered(row.doc_id, tile) for tile in batch)
+
+                height = doc.height
+
+            count[0] = len(staged)
+
+        await self.store.replace_render(
+            row.doc_id,
+            height=height,
+            tile_count=len(staged),
+            render_version=self.render_version,
+            tiles=staged,
+        )
+        await self.tiles.forget(row.doc_id)
+
+
     async def _backup(self) -> None:
         """Copy the DB aside once per source render_version, before the first write."""
-        meta = await self.svc.store.get_service_meta()
-        path = f"{self.svc.settings.db_path}.bak-{meta.render_version}"
+        meta = await self.store.get_service_meta()
+        path = f"{self.db_path}.bak-{meta.render_version}"
 
         if os.path.exists(path):
             log.info("revision: keeping the existing backup %s", path)
@@ -283,7 +324,7 @@ class Revision:
             if os.path.exists(partial):
                 os.remove(partial)
 
-            await self.svc.store.backup(partial)
+            await self.store.backup(partial)
             os.replace(partial, path)
             log.info("revision: backed up the DB to %s", path)
 
@@ -315,12 +356,10 @@ class Revision:
 
     async def _open(self) -> None:
         """Nothing revisable is left: stamp the volume and start serving."""
-        store = self.svc.store
-        current = self.svc.settings.render_version
-        meta = await store.get_service_meta()
+        meta = await self.store.get_service_meta()
 
-        if meta is not None and meta.render_version != current:
-            await store.update_render_version(current)
+        if meta is not None and meta.render_version != self.render_version:
+            await self.store.update_render_version(self.render_version)
 
         metrics.QUARANTINED.set(self._status.get("quarantined_total", 0))
         metrics.SERVING.set(1)

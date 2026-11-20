@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import orjson
 import yaml
+
+from ..errors import unprocessable
 
 log = logging.getLogger("tiler.schema")
 
@@ -62,6 +65,24 @@ class MetadataSchema:
     def get(self, key: str) -> Field | None:
         """Return the declared field for `key`, or None if undeclared."""
         return self._by_key.get(key)
+
+
+    def validated(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """The metadata as it is stored: declared fields validated and coerced. Raises
+        422 on a violation, or when the object cannot be stored as JSON."""
+        try:
+            validated = validate_metadata(metadata, self)
+
+        except MetadataViolation as exc:
+            raise unprocessable(str(exc), "METADATA_SCHEMA_VIOLATION", key=exc.key) from exc
+
+        try:
+            orjson.dumps(validated)
+
+        except orjson.JSONEncodeError as exc:  # e.g. an integer beyond 64 bits
+            raise unprocessable(f"metadata is not storable as JSON: {exc}", "INVALID_METADATA_JSON") from exc
+
+        return validated
 
 
     @property

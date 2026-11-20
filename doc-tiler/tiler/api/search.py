@@ -9,7 +9,6 @@ from fastapi import APIRouter, Request
 from ..errors import bad_request
 from ..models import DocList, DocSummary, SearchRequest
 from ..store.meta import DocRow, SearchError, SearchFilter
-from .deps import service
 
 
 router = APIRouter()
@@ -42,11 +41,11 @@ def summarize(rows: Sequence[DocRow]) -> list[dict[str, Any]]:
 )
 async def search_docs(request: Request, body: SearchRequest) -> DocList:
     """List documents or filter them by declared metadata keys."""
-    svc = service(request)
+    state = request.app.state
     filters = [SearchFilter(key=f.key, op=f.op, value=f.value) for f in body.filters]
 
     try:
-        rows, next_cursor = await svc.store.search(filters, svc.schema, body.limit, body.cursor)
+        rows, next_cursor = await state.store.search(filters, state.schema, body.limit, body.cursor)
 
     except SearchError as exc:
         raise bad_request(str(exc), "UNDECLARED_FILTER_KEY", key=exc.key) from exc

@@ -170,7 +170,7 @@ async def test_ingest_reports_a_too_large_document_in_band(tmp_path):
     _blank_png(big, 20_000)
     env = base_env(tmp_path, TILER_RENDER_WORKER_MEMORY=str(256 << 20))
 
-    async with running_app(env) as (client, svc):
+    async with running_app(env) as (client, state):
         r = await client.post("/tile", **png_form(big.read_bytes()))
         assert r.status_code == 422, r.text
         assert r.json()["error"]["code"] == "RENDER_TOO_LARGE"

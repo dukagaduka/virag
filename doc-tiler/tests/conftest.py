@@ -48,7 +48,8 @@ def base_env(tmp_path: Path, **overrides: str) -> dict[str, str]:
 
 @contextlib.asynccontextmanager
 async def running_app(env: dict[str, str]):
-    """Start a fresh app (running its real lifespan) against the given environment."""
+    """Start a fresh app (running its real lifespan) against the given environment;
+    yields its client and its state (the components `main` wires)."""
     from tiler.main import create_app
 
     previous = {k: os.environ.get(k) for k in env}
@@ -58,7 +59,7 @@ async def running_app(env: dict[str, str]):
         async with app.router.lifespan_context(app):
             transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://tiler") as client:
-                yield client, app.state.service
+                yield client, app.state
     finally:
         for key, value in previous.items():
             if value is None:
@@ -69,8 +70,8 @@ async def running_app(env: dict[str, str]):
 
 @pytest_asyncio.fixture
 async def client(tmp_path):
-    async with running_app(base_env(tmp_path)) as (client, service):
-        client.service = service
+    async with running_app(base_env(tmp_path)) as (client, state):
+        client.state = state
         yield client
 
 

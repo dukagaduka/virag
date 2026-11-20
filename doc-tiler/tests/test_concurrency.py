@@ -38,23 +38,23 @@ async def test_healthz_stays_fast_during_concurrent_ingests(client):
 
 async def test_concurrent_tile_requests_render_once(client):
     manifest = (await client.post("/tile", **png_form(make_png(875, 3000)))).json()
-    await client.service.tile_cache.clear()
+    await client.state.tiles.cache.clear()
     params = {"doc_id": manifest["doc_id"], "tile_num": 1}
 
-    misses_before = client.service.tile_cache.misses
+    misses_before = client.state.tiles.cache.misses
     responses = await asyncio.gather(*(client.get("/get_tile", params=params) for _ in range(8)))
 
     assert all(r.status_code == 200 for r in responses)
     assert len({r.content for r in responses}) == 1
     # One miss, the rest coalesced onto the same in-flight render.
-    assert client.service.tile_cache.misses == misses_before + 1
-    assert client.service.tile_cache.coalesced >= 1
+    assert client.state.tiles.cache.misses == misses_before + 1
+    assert client.state.tiles.cache.coalesced >= 1
 
 
 async def test_reads_never_see_a_commit_half_way(client, sample_pdf):
     """A read made while a commit is between its statements sees the doc as it was
     committed last — not the transaction's own view, with the old tiles already gone."""
-    store = client.service.store
+    store = client.state.store
     doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
     before = await store.get_tiles(doc_id)
     assert len(before) == 3

@@ -44,13 +44,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-async def capture_fixture(svc, tmp_path, rows: int) -> bytes:
+async def capture_fixture(state, tmp_path, rows: int) -> bytes:
     """Snapshot a local HTML file to MHTML using the service's own browser pool."""
     from tiler.render.browser import capture_url_mhtml
 
     path = tmp_path / f"fixture_{rows}.html"
     path.write_text(_html(rows))
-    return await capture_url_mhtml(svc.render.browser, svc.settings, f"file://{path}", None)
+    return await capture_url_mhtml(state.render.browser, state.settings, f"file://{path}", None)
 
 
 @pytest.fixture
@@ -59,8 +59,8 @@ def browser_env(tmp_path):
 
 
 async def test_mhtml_round_trip_identity(browser_env, tmp_path):
-    async with running_app(browser_env) as (client, svc):
-        blob = await capture_fixture(svc, tmp_path, rows=20)
+    async with running_app(browser_env) as (client, state):
+        blob = await capture_fixture(state, tmp_path, rows=20)
         manifest = await ingest_tiles(client, mhtml_form(blob))
 
         assert manifest["doc_type"] == "MHTML"
@@ -79,8 +79,8 @@ async def test_mhtml_round_trip_identity(browser_env, tmp_path):
 
 async def test_mhtml_render_is_deterministic(browser_env, tmp_path):
     """Same archive, same pinned Chromium → identical hashes."""
-    async with running_app(browser_env) as (client, svc):
-        blob = await capture_fixture(svc, tmp_path, rows=12)
+    async with running_app(browser_env) as (client, state):
+        blob = await capture_fixture(state, tmp_path, rows=12)
         first = await ingest_tiles(client, mhtml_form(blob))
         assert (await client.delete(f"/doc/{first['doc_id']}")).status_code == 204
         second = await ingest_tiles(client, mhtml_form(blob))
@@ -93,19 +93,19 @@ async def test_mhtml_render_is_deterministic(browser_env, tmp_path):
 
 async def test_sequential_strips_reuse_one_full_page_render(browser_env, tmp_path):
     """The page cache means N strips cost one browser render."""
-    async with running_app(browser_env) as (client, svc):
-        blob = await capture_fixture(svc, tmp_path, rows=20)
+    async with running_app(browser_env) as (client, state):
+        blob = await capture_fixture(state, tmp_path, rows=20)
         manifest = await ingest_tiles(client, mhtml_form(blob))
-        await svc.tile_cache.clear()
-        await svc.render.page_cache.clear()
+        await state.tiles.cache.clear()
+        await state.render.page_cache.clear()
 
-        misses_before = svc.render.page_cache.misses
+        misses_before = state.render.page_cache.misses
         for tile in manifest["tiles"]:
             await client.get(
                 "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
             )
-        assert svc.render.page_cache.misses == misses_before + 1
-        assert svc.render.page_cache.hits >= manifest["tile_count"] - 1
+        assert state.render.page_cache.misses == misses_before + 1
+        assert state.render.page_cache.hits >= manifest["tile_count"] - 1
 
 
 async def test_tall_page_uses_the_clip_path(tmp_path):
@@ -116,8 +116,8 @@ async def test_tall_page_uses_the_clip_path(tmp_path):
         TILER_URL_FETCH_ENABLED="false",
         TILER_SAFE_FULLPAGE_PX="1024",
     )
-    async with running_app(env) as (client, svc):
-        blob = await capture_fixture(svc, tmp_path, rows=14)
+    async with running_app(env) as (client, state):
+        blob = await capture_fixture(state, tmp_path, rows=14)
         manifest = await ingest_tiles(client, mhtml_form(blob))
         assert manifest["height"] > 1024
         assert manifest["tile_count"] >= 2
@@ -167,7 +167,7 @@ async def test_url_ingest_end_to_end(tmp_path):
         TILER_URL_ALLOW_PRIVATE="true",
     )
     try:
-        async with running_app(env) as (client, svc):
+        async with running_app(env) as (client, state):
             manifest = await ingest_tiles(
                 client, {"data": {"doc_type": "URL", "url": f"http://127.0.0.1:{port}/page"}}
             )

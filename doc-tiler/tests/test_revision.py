@@ -23,12 +23,12 @@ def _age_volume(db_path: str) -> None:
         db.execute("UPDATE service_meta SET render_version = 'old'")
 
 
-async def _revised(svc) -> dict:
+async def _revised(state) -> dict:
     """Wait for the background revision to finish and return its final status."""
-    if svc.revision._task is not None:
-        await asyncio.wait_for(asyncio.shield(svc.revision._task), 60)
+    if state.revision._task is not None:
+        await asyncio.wait_for(asyncio.shield(state.revision._task), 60)
 
-    return svc.revision.status
+    return state.revision.status
 
 
 async def test_startup_revision_rerenders_stale_docs(tmp_path):
@@ -38,24 +38,24 @@ async def test_startup_revision_rerenders_stale_docs(tmp_path):
         png_id = (await client.post("/tile", **png_form(make_png()))).json()["doc_id"]
     _age_volume(env["TILER_DB_PATH"])
 
-    async with running_app(env) as (client, svc):
-        status = await _revised(svc)
+    async with running_app(env) as (client, state):
+        status = await _revised(state)
         assert status["state"] == "succeeded" and status["serving"] is True
         assert (status["total"], status["revised"], status["quarantined"]) == (2, 2, 0)
 
         assert os.path.exists(env["TILER_DB_PATH"] + ".bak-old")      # rollback point
-        assert (await svc.store.get_service_meta()).render_version == svc.settings.render_version
+        assert (await state.store.get_service_meta()).render_version == state.settings.render_version
 
         for doc_id in (pdf_id, png_id):
-            row = await svc.store.get_doc(doc_id)
-            assert row.render_version == svc.settings.render_version
+            row = await state.store.get_doc(doc_id)
+            assert row.render_version == state.settings.render_version
             got = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})
             assert got.status_code == 200, got.text                 # verified against the new hash
 
-        assert (await svc.store.get_doc(pdf_id)).metadata == {"project": "a"}  # untouched
+        assert (await state.store.get_doc(pdf_id)).metadata == {"project": "a"}  # untouched
 
-    async with running_app(env) as (client, svc):                       # nothing left to revise
-        assert svc.revision.serving and svc.revision._task is None
+    async with running_app(env) as (client, state):                       # nothing left to revise
+        assert state.revision.serving and state.revision._task is None
 
 
 async def test_data_routes_wait_for_revision(tmp_path):
@@ -65,7 +65,7 @@ async def test_data_routes_wait_for_revision(tmp_path):
         doc_id = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()["doc_id"]
     _age_volume(env["TILER_DB_PATH"])
 
-    async with running_app(env) as (client, svc):
+    async with running_app(env) as (client, state):
         status = (await client.get("/revision")).json()
         assert (status["state"], status["serving"], status["total"]) == ("required", False, 1)
 
@@ -81,7 +81,7 @@ async def test_data_routes_wait_for_revision(tmp_path):
 
         started = await client.post("/revision")
         assert started.status_code == 202 and started.json()["state"] == "running"
-        assert (await _revised(svc))["state"] == "succeeded"
+        assert (await _revised(state))["state"] == "succeeded"
 
         assert (await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})).status_code == 200
         assert (await client.get("/readyz")).status_code == 200
@@ -92,14 +92,14 @@ async def test_unrenderable_doc_is_quarantined(tmp_path):
     and re-ingesting its bytes brings it back."""
     env = base_env(tmp_path)
     good, bad = make_png(875, 1200), make_png(875, 1300)
-    async with running_app(env) as (client, svc):
+    async with running_app(env) as (client, state):
         good_id = (await client.post("/tile", **png_form(good))).json()["doc_id"]
         bad_id = (await client.post("/tile", **png_form(bad))).json()["doc_id"]
-        await svc.blobs.delete(bad_id)                                   # its original is lost
+        await state.blobs.delete(bad_id)                                   # its original is lost
     _age_volume(env["TILER_DB_PATH"])
 
-    async with running_app(env) as (client, svc):
-        status = await _revised(svc)
+    async with running_app(env) as (client, state):
+        status = await _revised(state)
         assert status["serving"] is True
         assert (status["revised"], status["quarantined"]) == (1, 1)
         assert status["quarantined_doc_ids"] == [bad_id]
@@ -119,26 +119,26 @@ async def test_unrenderable_doc_is_quarantined(tmp_path):
         again = await client.post("/tile", **png_form(bad))                # re-ingest lifts it
         assert again.status_code == 200
         assert (await client.get("/get_tile", params={"doc_id": bad_id, "tile_num": 0})).status_code == 200
-        assert await svc.store.count_quarantined() == 0
+        assert await state.store.count_quarantined() == 0
         assert (await client.get("/readyz")).json()["checks"]["quarantined"] == 0   # counted live
 
 
 async def test_quarantined_doc_is_not_retried_at_the_same_render_version(tmp_path):
     env = base_env(tmp_path)
-    async with running_app(env) as (client, svc):
+    async with running_app(env) as (client, state):
         doc_id = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()["doc_id"]
-        await svc.blobs.delete(doc_id)
+        await state.blobs.delete(doc_id)
     _age_volume(env["TILER_DB_PATH"])
 
-    async with running_app(env) as (_, svc):
-        assert (await _revised(svc))["quarantined"] == 1
+    async with running_app(env) as (_, state):
+        assert (await _revised(state))["quarantined"] == 1
 
-    async with running_app(env) as (_, svc):                            # restart: no new job
-        assert svc.revision.serving and svc.revision._task is None
+    async with running_app(env) as (_, state):                            # restart: no new job
+        assert state.revision.serving and state.revision._task is None
 
 
 async def test_force_revision_rerenders_every_doc(client, sample_pdf):
-    svc = client.service
+    state = client.state
     doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
     before = _render_count("PDF", "revise")
 
@@ -146,23 +146,23 @@ async def test_force_revision_rerenders_every_doc(client, sample_pdf):
     assert r.status_code == 202, r.text
     assert r.json()["force"] is True
 
-    status = await _revised(svc)
+    status = await _revised(state)
     assert (status["state"], status["revised"]) == ("succeeded", 1)
     assert _render_count("PDF", "revise") == before + 1
-    assert (await svc.store.get_doc(doc_id)).tile_count == 3
+    assert (await state.store.get_doc(doc_id)).tile_count == 3
 
 
 async def test_second_revision_is_refused_while_one_runs(client, sample_pdf):
     from tiler.errors import ApiError
 
     await client.post("/tile", **pdf_form(sample_pdf))
-    client.service.revision.start(force=True)
+    client.state.revision.start(force=True)
 
     with pytest.raises(ApiError) as refused:
-        client.service.revision.start()
+        client.state.revision.start()
     assert (refused.value.status_code, refused.value.code) == (409, "REVISION_RUNNING")
 
-    await _revised(client.service)
+    await _revised(client.state)
 
 
 async def test_an_abandoned_reingest_leaves_a_quarantined_doc_as_it_was(tmp_path):
@@ -171,28 +171,28 @@ async def test_an_abandoned_reingest_leaves_a_quarantined_doc_as_it_was(tmp_path
 
     env = base_env(tmp_path)
     png = make_png(875, 3000)
-    async with running_app(env) as (client, svc):
+    async with running_app(env) as (client, state):
         doc_id = (await client.post("/tile", **png_form(png))).json()["doc_id"]
-        await svc.blobs.delete(doc_id)                                  # its original is lost
+        await state.blobs.delete(doc_id)                                  # its original is lost
     _age_volume(env["TILER_DB_PATH"])
 
-    async with running_app(env) as (client, svc):
-        assert (await _revised(svc))["quarantined"] == 1
-        before = await svc.store.get_doc(doc_id)
+    async with running_app(env) as (client, state):
+        assert (await _revised(state))["quarantined"] == 1
+        before = await state.store.get_doc(doc_id)
 
-        stream = svc.ingest_stream(
-            doc_type=DocType.IMG, upload=await svc.blobs.spool(png), url=None, metadata=None
+        stream = state.ingester.ingest_stream(
+            doc_type=DocType.IMG, upload=await state.blobs.spool(png), url=None, metadata=None
         )
         assert (await anext(stream))["event"] == "begin"
         await stream.aclose()                                           # abandoned before it commits
 
-        assert await svc.store.get_doc(doc_id) == before                # still there, still quarantined
+        assert await state.store.get_doc(doc_id) == before                # still there, still quarantined
         assert before.quarantined and before.complete
-        assert len(await svc.store.get_tiles(doc_id)) == before.tile_count
+        assert len(await state.store.get_tiles(doc_id)) == before.tile_count
 
         again = await client.post("/tile", **png_form(png))             # a finished one lifts it
         assert again.status_code == 200 and again.json()["result"] == "rendered"
-        assert await svc.store.count_quarantined() == 0
+        assert await state.store.count_quarantined() == 0
         assert (await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})).status_code == 200
 
 
@@ -209,10 +209,10 @@ async def test_revision_keeps_pdf_strip_slicing(tmp_path):
         manifest = (await client.post("/tile", **pdf_form(make_pdf(pages=3)))).json()
     _age_volume(env["TILER_DB_PATH"])
 
-    async with running_app(env) as (client, svc):
-        assert (await _revised(svc))["revised"] == 1
+    async with running_app(env) as (client, state):
+        assert (await _revised(state))["revised"] == 1
 
-        row = await svc.store.get_doc(manifest["doc_id"])
+        row = await state.store.get_doc(manifest["doc_id"])
         assert row.height == manifest["height"]
         assert row.tile_count == manifest["tile_count"] > 3
 

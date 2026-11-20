@@ -18,7 +18,7 @@ async def test_pdf_sliced_round_trip_identity(tmp_path):
         TILER_PDF_TILE_HEIGHT="500",
         TILER_PDF_TILE_OVERLAP="100",
     )
-    async with running_app(env) as (client, _service):
+    async with running_app(env) as (client, _state):
         manifest = await ingest_tiles(client, pdf_form(pdf))
 
         assert manifest["doc_type"] == "PDF"
@@ -53,7 +53,7 @@ async def test_tile_returns_the_summary_without_tiles(client, sample_pdf):
         "doc_id": hashlib.sha256(sample_pdf).hexdigest(),
         "doc_type": "PDF",
         "source_url": None,
-        "render_version": client.service.settings.render_version,
+        "render_version": client.state.settings.render_version,
         "tile_count": 3,
         "result": "rendered",
     }
@@ -105,11 +105,11 @@ async def test_pdf_tile_height_is_proportional(client):
 
 async def test_idempotent_ingest_does_not_re_render(client, sample_pdf):
     first = (await client.post("/tile", **pdf_form(sample_pdf))).json()
-    before = _render_count(client.service, "PDF", "ingest")
+    before = _render_count(client.state, "PDF", "ingest")
 
     second = (await client.post("/tile", **pdf_form(sample_pdf))).json()
     assert second == {**first, "result": "idempotent"}
-    assert _render_count(client.service, "PDF", "ingest") == before  # idempotent: no re-render
+    assert _render_count(client.state, "PDF", "ingest") == before  # idempotent: no re-render
 
 
 async def test_ingest_of_stored_bytes_leaves_their_metadata(client, sample_pdf):
@@ -123,13 +123,13 @@ async def test_ingest_of_stored_bytes_leaves_their_metadata(client, sample_pdf):
 
 async def test_a_deleted_doc_renders_again(client, sample_pdf):
     doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
-    before = _render_count(client.service, "PDF", "ingest")
+    before = _render_count(client.state, "PDF", "ingest")
 
     assert (await client.delete(f"/doc/{doc_id}")).status_code == 204
     again = await client.post("/tile", **pdf_form(sample_pdf))
 
     assert again.status_code == 200 and again.json()["result"] == "rendered"
-    assert _render_count(client.service, "PDF", "ingest") == before + 1
+    assert _render_count(client.state, "PDF", "ingest") == before + 1
 
 
 async def test_tile_num_out_of_range(client, sample_pdf):
@@ -204,16 +204,16 @@ async def test_original_download_and_range(client, sample_pdf):
 
 async def test_delete_cascades(client, sample_pdf):
     doc_id = (await client.post("/tile", **pdf_form(sample_pdf))).json()["doc_id"]
-    assert client.service.blobs.exists(doc_id)
+    assert client.state.blobs.exists(doc_id)
 
     r = await client.delete(f"/doc/{doc_id}")
     assert r.status_code == 204
-    assert not client.service.blobs.exists(doc_id)
+    assert not client.state.blobs.exists(doc_id)
     assert (await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})).status_code == 404
-    assert await client.service.store.get_tiles(doc_id) == []
+    assert await client.state.store.get_tiles(doc_id) == []
 
 
-def _render_count(service, doc_type: str, path: str) -> float:
+def _render_count(state, doc_type: str, path: str) -> float:
     from tiler import metrics
 
     return metrics.RENDERS.labels(doc_type=doc_type, path=path)._value.get()

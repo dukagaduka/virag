@@ -9,7 +9,6 @@ from fastapi.responses import StreamingResponse
 
 from ..errors import bad_request
 from ..models import DocType, IngestResult
-from ..service import TilerService
 from ..store.blobs import Incoming
 from .deps import (
     ERROR_RESPONSES,
@@ -17,7 +16,6 @@ from .deps import (
     check_declared_size,
     ndjson_response,
     parse_metadata_field,
-    service,
 )
 
 router = APIRouter()
@@ -44,13 +42,15 @@ def _validate_ingest_inputs(doc_type: str, document: UploadFile | None) -> DocTy
     return doc_type
 
 
-async def _spool(svc: TilerService, doc_type: DocType, document: UploadFile | None) -> Incoming | None:
-    """Save the uploaded document to disk before any work starts on it; the service
+async def _spool(request: Request, doc_type: DocType, document: UploadFile | None) -> Incoming | None:
+    """Save the uploaded document to disk before any work starts on it; the ingest
     takes the spooled upload over. A URL ingest brings no document."""
     if document is None or doc_type == DocType.URL:
         return None
 
-    return await svc.blobs.spool(capped_chunks(document, svc.settings.max_doc_bytes))
+    state = request.app.state
+
+    return await state.blobs.spool(capped_chunks(document, state.settings.max_doc_bytes))
 
 
 @router.post(
@@ -68,15 +68,15 @@ async def ingest_document(
     metadata: Annotated[str | None, Form()] = None,
 ) -> IngestResult:
     """Ingest a document into the store and return its identity and tile count."""
-    svc = service(request)
+    state = request.app.state
     doc_type = _validate_ingest_inputs(doc_type, document)
 
-    check_declared_size(request, svc.settings.max_doc_bytes)
+    check_declared_size(request, state.settings.max_doc_bytes)
 
     meta_obj = parse_metadata_field(metadata)
-    upload = await _spool(svc, doc_type, document)
+    upload = await _spool(request, doc_type, document)
 
-    result = await svc.ingest(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj)
+    result = await state.ingester.ingest(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj)
 
     return IngestResult(**result)
 
@@ -100,14 +100,15 @@ async def ingest_document_stream(
     in-stream `error` event, and the absence of `committed` means the ingest did not
     complete.
     """
-    svc = service(request)
+    state = request.app.state
     doc_type = _validate_ingest_inputs(doc_type, document)
 
-    check_declared_size(request, svc.settings.max_doc_bytes)
+    check_declared_size(request, state.settings.max_doc_bytes)
 
     meta_obj = parse_metadata_field(metadata)
-    upload = await _spool(svc, doc_type, document)
+    upload = await _spool(request, doc_type, document)
 
     return await ndjson_response(
-        svc.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj)
+        state.ingester.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=meta_obj),
+        tile_width=state.settings.tile_width,
     )

@@ -9,15 +9,15 @@ from conftest import base_env, make_png, png_form, running_app
 
 
 async def test_fresh_volume_records_geometry(tmp_path):
-    async with running_app(base_env(tmp_path)) as (client, svc):
-        meta = await svc.store.get_service_meta()
+    async with running_app(base_env(tmp_path)) as (client, state):
+        meta = await state.store.get_service_meta()
         assert (meta.tile_width, meta.tile_height, meta.tile_overlap, meta.min_tile_height) == (
             875,
             1024,
             0,
             28,
         )
-        assert meta.render_version == svc.settings.render_version
+        assert meta.render_version == state.settings.render_version
 
 
 async def test_same_geometry_reboots_cleanly(tmp_path):
@@ -39,7 +39,7 @@ async def test_geometry_change_is_fatal(tmp_path, changed):
         pass  # initialise the volume
 
     with pytest.raises(SystemExit) as exit_info:
-        async with running_app(base_env(tmp_path, **changed)) as (_, _svc):
+        async with running_app(base_env(tmp_path, **changed)) as (_, _state):
             pass
     assert exit_info.value.code == 1  # exits non-zero, serves nothing
 
@@ -54,7 +54,7 @@ async def test_outdated_volume_is_fatal(tmp_path, caplog):
         db.execute("ALTER TABLE docs DROP COLUMN height")
 
     with pytest.raises(SystemExit) as exit_info:
-        async with running_app(env) as (_, _svc):
+        async with running_app(env) as (_, _state):
             pass
     assert exit_info.value.code == 1
     assert any("docs.height" in r.message for r in caplog.records)
@@ -66,15 +66,15 @@ async def test_pixel_tier_change_on_empty_volume_serves(tmp_path, caplog):
     async with running_app(env) as (client, _):
         pass
     with caplog.at_level("WARNING"):
-        async with running_app(base_env(tmp_path, TILER_JPEG_QUALITY="60")) as (client, svc):
+        async with running_app(base_env(tmp_path, TILER_JPEG_QUALITY="60")) as (client, state):
             assert (await client.get("/readyz")).status_code == 200
-            assert (await svc.store.get_service_meta()).render_version == svc.settings.render_version
+            assert (await state.store.get_service_meta()).render_version == state.settings.render_version
     assert any("render_version changed" in r.message for r in caplog.records)
 
 
 async def test_invalid_config_is_fatal(tmp_path):
     with pytest.raises(SystemExit):
-        async with running_app(base_env(tmp_path, TILER_TILE_OVERLAP="1024")) as (_, _svc):
+        async with running_app(base_env(tmp_path, TILER_TILE_OVERLAP="1024")) as (_, _state):
             pass
 
 
@@ -124,9 +124,9 @@ async def test_volume_id_is_stable_for_the_volume_and_unique_across_volumes(tmp_
     (tmp_path / "b").mkdir()
     env = base_env(tmp_path / "a")
 
-    async with running_app(env) as (client, svc):
+    async with running_app(env) as (client, state):
         first = (await client.get("/info")).json()["volume_id"]
-        assert first == svc.volume_id and len(first) == 32
+        assert first == state.volume_id and len(first) == 32
     async with running_app(env) as (client, _):
         assert (await client.get("/info")).json()["volume_id"] == first
     async with running_app(base_env(tmp_path / "b")) as (client, _):

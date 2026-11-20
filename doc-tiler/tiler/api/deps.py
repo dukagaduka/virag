@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
+import logging
 from contextlib import aclosing
 from typing import Any, AsyncIterator
 
@@ -11,9 +13,10 @@ from fastapi import Request, Security, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from ..errors import not_found, not_ready, too_large, unauthorized, unprocessable
+from ..errors import ApiError, not_found, not_ready, too_large, unauthorized, unprocessable
 from ..hashing import is_doc_id
-from ..service import TilerService
+
+log = logging.getLogger("tiler.api")
 
 _CHUNK = 1 << 20
 
@@ -36,18 +39,13 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
-def service(request: Request) -> TilerService:
-    """Return the TilerService held on the app state."""
-    return request.app.state.service
-
-
 def require_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(_BEARER),
 ) -> None:
     """Router dependency: a request must carry `Authorization: Bearer <TILER_API_KEY>`;
     an empty TILER_API_KEY leaves the routes open."""
-    expected = service(request).settings.api_key
+    expected = request.app.state.settings.api_key
 
     if not expected:
         return
@@ -58,7 +56,7 @@ def require_api_key(
 
 def require_serving(request: Request) -> None:
     """Router dependency: data routes answer 503 while the revision gate is closed."""
-    revision = service(request).revision
+    revision = request.app.state.revision
 
     if not revision.serving:
         raise not_ready(
@@ -104,17 +102,46 @@ async def capped_chunks(upload: UploadFile, limit: int) -> AsyncIterator[bytes]:
         yield chunk
 
 
-async def ndjson_response(events: AsyncIterator[dict[str, Any]]) -> StreamingResponse:
-    """An event stream as an NDJSON response. Its first event is awaited before the
-    response starts, so whatever fails up to it keeps its HTTP status."""
+async def ndjson_response(events: AsyncIterator[dict[str, Any]], *, tile_width: int) -> StreamingResponse:
+    """A document's events (`begin`, a `tile` per tile, `committed`) as an NDJSON
+    response, each tile with its bytes.
+
+    The first event is awaited before the response starts, so whatever fails up to it
+    keeps its HTTP status. From then on the response is already 200 and a failure goes
+    in-band, as an `error` event; the absence of `committed` is the client's signal to
+    roll back.
+    """
     first = await anext(events)
 
-    async def lines() -> AsyncIterator[bytes]:
-        async with aclosing(events):
-            yield orjson.dumps(first) + b"\n"
+    def line(event: dict[str, Any]) -> bytes:
+        if event["event"] == "tile":
+            tile = event["tile"]
+            event = {
+                "event": "tile",
+                "tile_num": tile.tile_num,
+                "width": tile_width,  # always TILE_WIDTH
+                "height": tile.height,
+                "image_hash": tile.image_hash,
+                "data": base64.b64encode(tile.jpeg).decode("ascii"),
+            }
 
-            async for event in events:
-                yield orjson.dumps(event) + b"\n"
+        return orjson.dumps(event) + b"\n"
+
+    async def lines() -> AsyncIterator[bytes]:
+        try:
+            # Closed with the response: a client that goes away ends the work at once.
+            async with aclosing(events):
+                yield line(first)
+
+                async for event in events:
+                    yield line(event)
+
+        except ApiError as exc:
+            yield line({"event": "error", "code": exc.code, "message": exc.message})
+
+        except Exception as exc:  # noqa: BLE001 - the response is already 200; report in-band
+            log.exception("tile stream crashed")
+            yield line({"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)})
 
     return StreamingResponse(lines(), media_type="application/x-ndjson")
 

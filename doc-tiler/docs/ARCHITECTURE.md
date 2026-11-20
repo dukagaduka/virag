@@ -556,8 +556,9 @@ sliced PDF stream never waits on a group that is itself waiting for a slot.
 ```
 tiler/
   __init__.py        # routes sqlite3 → pysqlite3 (STAT4) before aiosqlite loads; __version__
-  main.py            # app, lifespan (guard, pools, DB, schema+index creation, revision gate), routes
-  service.py         # core: ingest, regeneration, revision writes — stores what a document renders
+  main.py            # app, lifespan (wires the components below: guard, DB, schema+index creation, pools, revision gate), routes
+  ingest.py          # Ingester: a document's way into the store (spool, render, one commit) and out of it
+  tiles.py           # Tiles: a stored doc's tiles by its id, rendered from its blob (one tile, or its event stream); the tile cache
   capture.py         # URL capture: SSRF policy + guard proxy + MHTML snapshot
   revision.py        # serving gate + the job that brings stored docs to the current render_version
   config.py          # env + render_version + geometry/pixel tiers
@@ -565,7 +566,7 @@ tiler/
   preflight.py       # standalone startup validation (runs before uvicorn)
   media.py  metrics.py  errors.py  models.py  responses.py  # mime sniff, Prometheus, error envelope, pydantic, orjson response
   api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  revision.py  ops.py
-  render/ documents.py  # what the service renders: WorkerDocument (PDF, images), MhtmlDocument (Chromium)
+  render/ documents.py  # what gets rendered: WorkerDocument (PDF, images), MhtmlDocument (Chromium)
           readers.py    # DocumentReader: PdfReader, ImageReader — a format read as one image, inside a worker
           pool.py       # RenderPool: pebble process pool (memory cap, timeout), Chromium, bulk slots
           worker.py     # what runs in a worker: lay a document out, read and encode its tiles

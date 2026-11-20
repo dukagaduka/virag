@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from .deps import ERROR_RESPONSES, check_doc_id, ndjson_response, service
+from .deps import ERROR_RESPONSES, check_doc_id, ndjson_response
 
 router = APIRouter()
 
@@ -26,8 +26,8 @@ async def get_tile(
     verify: Annotated[bool, Query()] = True,
 ) -> Response:
     """Regenerate a single tile from the stored original and return it as JPEG."""
-    svc = service(request)
-    jpeg, tile_row, row = await svc.get_tile(doc_id, tile_num, verify)
+    state = request.app.state
+    jpeg, tile_row, row = await state.tiles.get(doc_id, tile_num, verify)
 
     return Response(
         content=jpeg,
@@ -38,7 +38,7 @@ async def get_tile(
             "X-Image-Hash": tile_row.image_hash,
             "X-Render-Version": row.render_version,
             "X-Tile-Height": str(tile_row.height),
-            "X-Tile-Width": str(svc.settings.tile_width),
+            "X-Tile-Width": str(state.settings.tile_width),
             "Cache-Control": "public, max-age=31536000, immutable",
         },
     )
@@ -58,7 +58,7 @@ async def stream_document_tiles(request: Request, doc_id: str) -> StreamingRespo
     A doc that is unknown, still being ingested or quarantined is an HTTP error; from
     `begin` on errors surface as an in-stream `error` event.
     """
-    svc = service(request)
+    state = request.app.state
     check_doc_id(doc_id)
 
-    return await ndjson_response(svc.doc_stream(doc_id))
+    return await ndjson_response(state.tiles.stream(doc_id), tile_width=state.settings.tile_width)

@@ -23,6 +23,7 @@ import orjson
 
 from ..meta.schema import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
 from ..models import DocType
+from ..render.types import RenderedTile
 
 PRAGMAS = (
     "PRAGMA journal_mode=WAL",
@@ -141,6 +142,13 @@ class DocRow:
         return self.quarantine_reason is not None
 
 
+    def servable(self, render_version: str) -> bool:
+        """Whether an ingest of the same bytes may replay this doc instead of rendering
+        it: complete and rendered by `render_version`. A quarantined doc (still at an
+        older one) is rendered again."""
+        return self.complete and self.render_version == render_version and not self.quarantined
+
+
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> "DocRow":
         """Build a DocRow from a SQLite row, decoding the metadata JSON."""
@@ -173,6 +181,18 @@ class TileRow:
     offset: int
     height: int
     image_hash: str
+
+
+    @classmethod
+    def from_rendered(cls, doc_id: str, tile: RenderedTile) -> TileRow:
+        """What the store keeps of a rendered tile: its place and its hash, not its bytes."""
+        return cls(
+            doc_id=doc_id,
+            tile_num=tile.tile_num,
+            offset=tile.offset,
+            height=tile.height,
+            image_hash=tile.image_hash,
+        )
 
 
 @dataclass(frozen=True)

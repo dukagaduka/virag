@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import time
+from contextlib import contextmanager
+from typing import Iterator
+
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 INGESTS = Counter("tiler_ingest_total", "Ingest requests", ["doc_type", "result"])
@@ -30,6 +34,23 @@ INFLIGHT = Gauge("tiler_inflight_renders", "Renders currently in flight", ["laye
 SERVING = Gauge("tiler_serving", "1 while serving; 0 while a revision holds the service not-ready")
 REVISION_DOCS = Counter("tiler_revision_docs_total", "Docs processed by a revision", ["result"])
 QUARANTINED = Gauge("tiler_quarantined_docs", "Documents quarantined by a revision")
+
+
+@contextmanager
+def measured(doc_type: str, path: str, count: list[int]) -> Iterator[None]:
+    """Record one document render on `path` (ingest, regenerate, revise): its wall time
+    whatever its outcome, and — once it succeeded — the render and its tiles
+    (`count[0]` holds their number when it is done)."""
+    started = time.perf_counter()
+
+    try:
+        yield
+
+    finally:
+        RENDER_SECONDS.labels(doc_type=doc_type, path=path).observe(time.perf_counter() - started)
+
+    RENDERS.labels(doc_type=doc_type, path=path).inc()
+    TILES.labels(doc_type=doc_type, path=path).inc(count[0])
 
 
 def render_latest() -> tuple[bytes, str]:

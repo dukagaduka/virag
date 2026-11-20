@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from ..errors import ApiError, not_found
 from ..media import extension_for
-from .deps import ERROR_RESPONSES, check_doc_id, service
+from .deps import ERROR_RESPONSES, check_doc_id
 
 router = APIRouter()
 
@@ -74,9 +74,9 @@ async def _stream(path, start: int, end: int) -> AsyncIterator[bytes]:
 )
 async def download_original(request: Request, doc_id: str) -> Response:
     """Stream the original stored blob, honouring a single Range header."""
-    svc = service(request)
+    state = request.app.state
     check_doc_id(doc_id)
-    row = await svc.store.get_doc(doc_id)
+    row = await state.store.get_doc(doc_id)
 
     if row is None:
         raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
@@ -84,12 +84,10 @@ async def download_original(request: Request, doc_id: str) -> Response:
     if not row.complete:  # its blob is not in the store before the ingest commits
         raise not_found(f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id)
 
-    path = svc.blobs.path(doc_id)
+    state.blobs.require(doc_id)
 
-    if not path.exists():
-        raise not_found(f"blob for {doc_id!r} is missing from storage", "MISSING_BLOB")
-
-    size = await svc.blobs.size(doc_id)
+    path = state.blobs.path(doc_id)
+    size = await state.blobs.size(doc_id)
     filename = f"{doc_id}{extension_for(row.mime_type)}"
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
@@ -132,16 +130,16 @@ async def download_original(request: Request, doc_id: str) -> Response:
 )
 async def delete_document(request: Request, doc_id: str) -> Response:
     """Delete a document's rows and blob when deletion is enabled."""
-    svc = service(request)
+    state = request.app.state
 
-    if not svc.settings.allow_delete:
+    if not state.settings.allow_delete:
         raise ApiError(
             405, "DELETE_DISABLED", "deletion is disabled; start with TILER_ALLOW_DELETE=true"
         )
 
     check_doc_id(doc_id)
 
-    if not await svc.delete(doc_id):
+    if not await state.ingester.delete(doc_id):
         raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
 
     return Response(status_code=204)

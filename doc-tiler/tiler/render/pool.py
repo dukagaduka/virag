@@ -19,6 +19,7 @@ import logging
 import multiprocessing
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import AbstractAsyncContextManager, nullcontext
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 import pebble
@@ -263,3 +264,10 @@ class RenderPool:
         """Run one Chromium operation (e.g. a URL capture) under the browser limits."""
         async with self.browser_slot(bulk), self.browser_errors():
             return await fn(*args)
+
+
+    async def forget(self, path: str | Path) -> None:
+        """Drop the page capture cached for the document in the file at `path`."""
+        key = str(path)
+
+        await self.page_cache.invalidate(lambda k: k == key)

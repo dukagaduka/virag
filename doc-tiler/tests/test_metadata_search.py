@@ -145,7 +145,7 @@ async def _populate(store, rows: int = 400) -> None:
 
 async def test_expression_index_is_used(client):
     """A declared-key filter is answered through idx_meta_*, not a table scan."""
-    store = client.service.store
+    store = client.state.store
     await _populate(store)
 
     for key, op, value, index in (
@@ -155,7 +155,7 @@ async def test_expression_index_is_used(client):
         ("year", "lte", 1905, "idx_meta_year"),
     ):
         sql, params = build_search_query(
-            [SearchFilter(key=key, op=op, value=value)], client.service.schema, 50, None
+            [SearchFilter(key=key, op=op, value=value)], client.state.schema, 50, None
         )
         plan = " ".join(await store.explain(sql, params))
         assert index in plan, f"{key} {op}: {plan}"
@@ -167,10 +167,10 @@ async def test_ne_is_answered_by_an_ordered_scan_not_a_table_scan(client):
     """`<>` is not a seekable B-tree constraint in any SQL engine, so `ne` walks the
     created_at index instead. It stays cheap because a `ne` predicate matches almost
     every row, so LIMIT is satisfied immediately (see README)."""
-    store = client.service.store
+    store = client.state.store
     await _populate(store, rows=200)
     sql, params = build_search_query(
-        [SearchFilter(key="project", op="ne", value="p7")], client.service.schema, 50, None
+        [SearchFilter(key="project", op="ne", value="p7")], client.state.schema, 50, None
     )
     plan = " ".join(await store.explain(sql, params))
     assert "idx_docs_created" in plan, plan
@@ -186,10 +186,10 @@ async def test_ne_is_answered_by_an_ordered_scan_not_a_table_scan(client):
 async def test_search_never_scans_the_table_itself(client):
     """Even when the planner prefers the created_at index, `docs` is never read
     row-by-row without an index — there is no fallback full scan."""
-    store = client.service.store
+    store = client.state.store
     await _populate(store, rows=200)
     for filters in ([], [SearchFilter(key="year", op="gt", value=1899)]):
-        sql, params = build_search_query(filters, client.service.schema, 50, None)
+        sql, params = build_search_query(filters, client.state.schema, 50, None)
         plan = " ".join(await store.explain(sql, params))
         assert "USING INDEX" in plan or "USING COVERING INDEX" in plan, plan
 

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterable, BinaryIO
 
+from ..errors import not_found
 from ..hashing import blob_rel_path
 
 
@@ -69,6 +70,12 @@ class BlobStore:
     def exists(self, doc_id: str) -> bool:
         """Return whether a blob for this doc_id is stored."""
         return self.path(doc_id).exists()
+
+
+    def require(self, doc_id: str) -> None:
+        """Fail with 404 when a document's blob is gone from storage."""
+        if not self.exists(doc_id):
+            raise not_found(f"blob for {doc_id!r} is missing from storage", "MISSING_BLOB")
 
 
     # ------------------------------------------------------------------ #

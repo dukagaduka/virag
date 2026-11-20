@@ -63,9 +63,9 @@ async def test_cache_serves_repeated_tiles(client):
     manifest = (await client.post("/tile", **png_form(make_png(875, 2600)))).json()
     params = {"doc_id": manifest["doc_id"], "tile_num": 1}
     await client.get("/get_tile", params=params)
-    hits_before = client.service.tile_cache.hits
+    hits_before = client.state.tiles.cache.hits
     await client.get("/get_tile", params=params)
-    assert client.service.tile_cache.hits == hits_before + 1
+    assert client.state.tiles.cache.hits == hits_before + 1
 
 
 async def test_verify_false_skips_hash_check(client):
@@ -81,14 +81,14 @@ async def test_drifted_tile_is_refused(client):
     """A poisoned image_hash simulates render non-determinism → 409, never served."""
     manifest = (await client.post("/tile", **png_form(make_png(875, 1200)))).json()
     doc_id = manifest["doc_id"]
-    store = client.service.store
+    store = client.state.store
     async with store._lock:
         await store.db.execute(
             "UPDATE tiles SET image_hash = ? WHERE doc_id = ? AND tile_num = 0",
             ("0" * 64, doc_id),
         )
         await store.db.commit()
-    await client.service.tile_cache.clear()
+    await client.state.tiles.cache.clear()
 
     r = await client.get("/get_tile", params={"doc_id": doc_id, "tile_num": 0})
     assert r.status_code == 409
