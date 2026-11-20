@@ -217,7 +217,7 @@ Uniform JSON error envelope (the `Error` schema in `openapi.yaml`).
 
 | Code | When |
 |---|---|
-| `400` | Unknown `doc_type`, `tile_num` out of range, undeclared filter key, unsupported op, numeric op on a text field, bad cursor. |
+| `400` | Unknown `doc_type`, `tile_num` out of range; in a search: an undeclared filter key (`UNDECLARED_FILTER_KEY`), an unsupported op or a numeric op on a text field (`INVALID_FILTER_OP`), a value that does not fit the field's type (`INVALID_FILTER_VALUE`), a bad cursor (`INVALID_CURSOR`). |
 | `401` | Missing or wrong `TILER_API_KEY` (`UNAUTHORIZED`). |
 | `403` | SSRF policy block. |
 | `404` | Unknown `doc_id`; a tile, the tile stream or `GET /doc/{id}` of a doc whose ingest has not committed (`DOC_INCOMPLETE`). |

@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from .deps import ERROR_RESPONSES, check_doc_id, ndjson_response
+from .deps import ERROR_RESPONSES, ndjson_response
 
 router = APIRouter()
 
@@ -27,7 +27,6 @@ async def stream_document_tiles(request: Request, doc_id: str) -> StreamingRespo
     `begin` on errors surface as an in-stream `error` event.
     """
     state = request.app.state
-    check_doc_id(doc_id)
 
     return await ndjson_response(state.tiles.stream(doc_id), tile_width=state.settings.tile_width)
 
@@ -47,8 +46,6 @@ async def get_tile(
 ) -> Response:
     """Render a single tile from the stored original and return it as JPEG."""
     state = request.app.state
-    check_doc_id(doc_id)
-
     jpeg, tile_row, row = await state.tiles.get(doc_id, tile_num, verify)
 
     return Response(

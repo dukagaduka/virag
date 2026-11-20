@@ -122,15 +122,7 @@ class Tiles:
     # ------------------------------------------------------------------ #
     async def _served(self, doc_id: str) -> DocRow:
         """The row of a doc whose tiles are served: stored, complete, not quarantined."""
-        row = await self.store.get_doc(doc_id)
-
-        if row is None:
-            raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
-
-        if not row.complete:
-            raise not_found(
-                f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id
-            )
+        row = await self.store.require_doc(doc_id, complete=True)
 
         if row.quarantined:
             raise gone(

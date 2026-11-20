@@ -85,7 +85,18 @@ async def test_numeric_op_on_text_field_is_400(client):
     r = await client.post("/docs/search", json={"filters": [
         {"key": "project", "op": "gt", "value": 5}
     ]})
-    assert r.status_code == 400
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "INVALID_FILTER_OP")
+    assert r.json()["error"]["details"] == {"key": "project"}
+
+
+async def test_a_filter_value_of_the_wrong_type_is_400(client):
+    r = await client.post("/docs/search", json={"filters": [{"key": "year", "value": "soon"}]})
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "INVALID_FILTER_VALUE")
+
+
+async def test_a_malformed_cursor_is_400(client):
+    r = await client.post("/docs/search", json={"cursor": "not-a-cursor"})
+    assert (r.status_code, r.json()["error"]["code"]) == (400, "INVALID_CURSOR")
 
 
 async def test_empty_filters_list_all_newest_first(client):

@@ -1,4 +1,5 @@
-"""Shared request helpers for the API modules."""
+"""What the route modules share: the auth and serving dependencies, the error table of
+the OpenAPI schema, the NDJSON response of a tile stream."""
 
 from __future__ import annotations
 
@@ -9,16 +10,13 @@ from contextlib import aclosing
 from typing import Any, AsyncIterator
 
 import orjson
-from fastapi import Request, Security, UploadFile
+from fastapi import Request, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from ..errors import ApiError, not_found, not_ready, too_large, unauthorized, unprocessable
-from ..hashing import is_doc_id
+from ..errors import ApiError, not_ready, unauthorized
 
 log = logging.getLogger("tiler.api")
-
-_CHUNK = 1 << 20
 
 # auto_error=False: a missing header answers our own 401 envelope, not FastAPI's 403.
 _BEARER = HTTPBearer(auto_error=False, description="TILER_API_KEY")
@@ -66,42 +64,6 @@ def require_serving(request: Request) -> None:
         )
 
 
-def check_doc_id(doc_id: str) -> str:
-    """Validate a doc_id's shape, raising 404 if it is malformed."""
-    if not is_doc_id(doc_id):
-        # A malformed id can never exist in the store; 404 keeps the contract simple.
-        raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
-
-    return doc_id
-
-
-def check_declared_size(request: Request, limit: int) -> None:
-    """Reject oversized uploads from the Content-Length header before reading them."""
-    raw = request.headers.get("content-length")
-
-    if raw and raw.isdigit() and int(raw) > limit:
-        raise too_large(
-            f"request body of {raw} bytes exceeds TILER_MAX_DOC_BYTES={limit}",
-            declared_bytes=int(raw),
-            limit=limit,
-        )
-
-
-async def capped_chunks(upload: UploadFile, limit: int) -> AsyncIterator[bytes]:
-    """An upload chunk by chunk, raising 413 once it exceeds the byte limit."""
-    total = 0
-
-    while chunk := await upload.read(_CHUNK):
-        total += len(chunk)
-
-        if total > limit:
-            raise too_large(
-                f"document exceeds TILER_MAX_DOC_BYTES={limit}", read_bytes=total, limit=limit
-            )
-
-        yield chunk
-
-
 async def ndjson_response(events: AsyncIterator[dict[str, Any]], *, tile_width: int) -> StreamingResponse:
     """A document's events (`begin`, a `tile` per tile, `committed`) as an NDJSON
     response, each tile with its bytes.
@@ -144,20 +106,3 @@ async def ndjson_response(events: AsyncIterator[dict[str, Any]], *, tile_width: 
             yield line({"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)})
 
     return StreamingResponse(lines(), media_type="application/x-ndjson")
-
-
-def parse_metadata_field(raw: str | None) -> dict[str, Any] | None:
-    """Parse the optional metadata form field into a JSON object, or None."""
-    if raw is None or raw == "":
-        return None
-
-    try:
-        value = orjson.loads(raw)
-
-    except orjson.JSONDecodeError as exc:
-        raise unprocessable(f"metadata is not valid JSON: {exc}", "INVALID_METADATA_JSON") from exc
-
-    if not isinstance(value, dict):
-        raise unprocessable("metadata must be a JSON object", "INVALID_METADATA_JSON")
-
-    return value

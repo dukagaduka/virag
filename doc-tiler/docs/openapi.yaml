@@ -305,8 +305,9 @@ paths:
               schema: { $ref: '#/components/schemas/DocList' }
         '400':
           description: >
-            Invalid filter: an undeclared key (UNDECLARED_FILTER_KEY), an unsupported op,
-            a numeric op on a text field, an uncoercible value, or a malformed cursor.
+            Invalid search: an undeclared key (UNDECLARED_FILTER_KEY), an unsupported op
+            or a numeric op on a text field (INVALID_FILTER_OP), a value that does not fit
+            the field's type (INVALID_FILTER_VALUE), a malformed cursor (INVALID_CURSOR).
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '422': { $ref: '#/components/responses/Unprocessable' }
 
@@ -568,7 +569,8 @@ components:
                 UNKNOWN_DOC_TYPE, AMBIGUOUS_INPUT, MISSING_URL, MISSING_FILE,
                 PAYLOAD_TOO_LARGE, UNSUPPORTED_MEDIA, SSRF_BLOCKED, UNKNOWN_DOC,
                 DOC_INCOMPLETE, INGEST_IN_PROGRESS, MISSING_BLOB, UNKNOWN_TILE, TILE_OUT_OF_RANGE, RANGE_NOT_SATISFIABLE,
-                DELETE_DISABLED, UNDECLARED_FILTER_KEY, INVALID_METADATA_JSON,
+                DELETE_DISABLED, UNDECLARED_FILTER_KEY, INVALID_FILTER_OP, INVALID_FILTER_VALUE,
+                INVALID_CURSOR, INVALID_METADATA_JSON,
                 METADATA_SCHEMA_VIOLATION, RENDER_MISMATCH, DECODE_FAILED,
                 EMPTY_DOCUMENT, RENDER_TOO_LARGE, RENDER_CRASHED, BROWSER_UNAVAILABLE,
                 RENDER_TIMEOUT, UPSTREAM_FAILURE, WORKER_CRASH, QUARANTINED, REVISION_RUNNING, NOT_READY, VALIDATION_ERROR,

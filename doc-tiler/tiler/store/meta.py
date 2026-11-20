@@ -21,6 +21,8 @@ from typing import Any, Iterable, Sequence
 import aiosqlite
 import orjson
 
+from ..errors import bad_request, not_found
+from ..hashing import is_doc_id
 from ..meta.schema import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
 from ..models import DocType
 from ..render.types import RenderedTile
@@ -95,15 +97,6 @@ OPS = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
 NUMERIC_OPS = {"gt", "gte", "lt", "lte"}
 
 
-class SearchError(ValueError):
-    """Bad search request (maps to 400)."""
-
-
-    def __init__(self, message: str, key: str | None = None):
-        super().__init__(message)
-        self.key = key
-
-
 @dataclass(frozen=True)
 class ServiceMeta:
     """The singleton service-config row: geometry, render version and the volume's id."""
@@ -147,6 +140,21 @@ class DocRow:
         it: complete and rendered by `render_version`. A quarantined doc (still at an
         older one) is rendered again."""
         return self.complete and self.render_version == render_version and not self.quarantined
+
+
+    def summary(self) -> dict[str, Any]:
+        """The doc as search and listing return it."""
+        return {
+            "doc_id": self.doc_id,
+            "doc_type": self.doc_type,
+            "tile_count": self.tile_count,
+            "complete": self.complete,
+            "quarantined": self.quarantined,
+            "render_version": self.render_version,
+            "created_at": self.created_at,
+            "source_url": self.source_url,
+            "metadata": self.metadata,
+        }
 
 
     @classmethod
@@ -226,7 +234,7 @@ def decode_cursor(cursor: str) -> tuple[int, str]:
         return int(created_at), doc_id
 
     except Exception as exc:
-        raise SearchError(f"invalid cursor: {exc}") from exc
+        raise bad_request(f"invalid cursor: {exc}", "INVALID_CURSOR") from exc
 
 
 def build_search_query(
@@ -244,29 +252,33 @@ def build_search_query(
         field: Field | None = schema.get(f.key)
 
         if field is None:
-            raise SearchError(
+            raise bad_request(
                 f"filter key {f.key!r} is not declared in the metadata schema; "
                 "only declared (indexed) keys are searchable",
-                f.key,
+                "UNDECLARED_FILTER_KEY",
+                key=f.key,
             )
 
         op = (f.op or "eq").lower()
 
         if op not in OPS:
-            raise SearchError(f"unsupported op {f.op!r}; expected one of {sorted(OPS)}", f.key)
+            raise bad_request(
+                f"unsupported op {f.op!r}; expected one of {sorted(OPS)}", "INVALID_FILTER_OP", key=f.key
+            )
 
         if op in NUMERIC_OPS and field.type != "number":
-            raise SearchError(
+            raise bad_request(
                 f"op {op!r} requires a 'number' field, but {f.key!r} is declared "
                 f"{field.type!r}",
-                f.key,
+                "INVALID_FILTER_OP",
+                key=f.key,
             )
 
         try:
             value = coerce_filter_value(f.value, field)
 
         except MetadataViolation as exc:
-            raise SearchError(str(exc), f.key) from exc
+            raise bad_request(str(exc), "INVALID_FILTER_VALUE", key=f.key) from exc
 
         where.append(f"{meta_expr(field.key)} {OPS[op]} ?")
         params.append(value)
@@ -496,6 +508,21 @@ class MetaStore:
         rows = await self._read(f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE doc_id = ?", (doc_id,))
 
         return DocRow.from_row(rows[0]) if rows else None
+
+
+    async def require_doc(self, doc_id: str, *, complete: bool = False) -> DocRow:
+        """A doc's row, or 404: UNKNOWN_DOC when the store has none (a malformed id can
+        never be in it), and — with `complete` — DOC_INCOMPLETE while its ingest has
+        not committed."""
+        row = await self.get_doc(doc_id) if is_doc_id(doc_id) else None
+
+        if row is None:
+            raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
+
+        if complete and not row.complete:
+            raise not_found(f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id)
+
+        return row
 
 
     async def get_tiles(self, doc_id: str) -> list[TileRow]:

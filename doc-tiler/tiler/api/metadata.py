@@ -6,22 +6,9 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Request
 
-from ..errors import not_found, unprocessable
-from ..store.meta import DocRow
-from .deps import ERROR_RESPONSES, check_doc_id
+from .deps import ERROR_RESPONSES
 
 router = APIRouter()
-
-
-async def _require_doc(request: Request, doc_id: str) -> DocRow:
-    """Return the doc's row, raising 404 if the doc is unknown."""
-    check_doc_id(doc_id)
-    row = await request.app.state.store.get_doc(doc_id)
-
-    if row is None:
-        raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
-
-    return row
 
 
 @router.get(
@@ -32,7 +19,7 @@ async def _require_doc(request: Request, doc_id: str) -> DocRow:
 )
 async def get_metadata(request: Request, doc_id: str) -> dict[str, Any]:
     """Read the metadata object for a document."""
-    row = await _require_doc(request, doc_id)
+    row = await request.app.state.store.require_doc(doc_id)
 
     return row.metadata
 
@@ -47,9 +34,10 @@ async def replace_metadata(
     request: Request, doc_id: str, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     """Replace the whole metadata object with the validated payload."""
-    await _require_doc(request, doc_id)
-
     state = request.app.state
+
+    await state.store.require_doc(doc_id)
+
     validated = state.schema.validated(body)
     await state.store.set_metadata(doc_id, validated)
 
@@ -66,11 +54,9 @@ async def merge_metadata(
     request: Request, doc_id: str, body: Annotated[dict[str, Any], Body()]
 ) -> dict[str, Any]:
     """Shallow-merge the payload into existing metadata; a null value deletes a key."""
-    row = await _require_doc(request, doc_id)
+    state = request.app.state
 
-    if not isinstance(body, dict):  # pragma: no cover - FastAPI enforces the type
-        raise unprocessable("metadata must be a JSON object", "INVALID_METADATA_JSON")
-
+    row = await state.store.require_doc(doc_id)
     merged = dict(row.metadata)
 
     for key, value in body.items():
@@ -79,7 +65,6 @@ async def merge_metadata(
         else:
             merged[key] = value
 
-    state = request.app.state
     validated = state.schema.validated(merged)
     await state.store.set_metadata(doc_id, validated)
 

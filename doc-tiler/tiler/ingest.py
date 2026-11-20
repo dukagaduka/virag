@@ -103,22 +103,18 @@ class Ingester:
         return self._ingest(doc_type=doc_type, upload=upload, url=url, metadata=metadata, replay=True)
 
 
-    async def delete(self, doc_id: str) -> bool:
-        """Delete a document's rows, blob and cached tiles; return whether it existed.
-        A doc still being ingested is its ingest's to remove: 409."""
-        row = await self.store.get_doc(doc_id)
+    async def delete(self, doc_id: str) -> None:
+        """Delete a document's rows, blob and cached tiles (404 for a doc the store
+        does not have). A doc still being ingested is its ingest's to remove: 409."""
+        row = await self.store.require_doc(doc_id)
 
-        if row is not None and not row.complete:
+        if not row.complete:
             raise self._in_progress(doc_id)
 
-        removed = await self.store.delete_doc(doc_id)
-
-        if removed:
+        if await self.store.delete_doc(doc_id):
             await self.blobs.delete(doc_id)
             await self.tiles.forget(doc_id)
             metrics.DOCS.set(await self.store.count_docs())
-
-        return removed
 
 
     # ------------------------------------------------------------------ #

@@ -18,7 +18,9 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterable, BinaryIO
+from typing import AsyncIterable, AsyncIterator, BinaryIO
+
+import anyio
 
 from ..errors import not_found
 from ..hashing import blob_rel_path
@@ -37,6 +39,7 @@ class BlobStore:
     """Stores and retrieves blob bytes under a content-addressed directory tree."""
 
     INCOMING = ".incoming"
+    CHUNK = 1 << 18  # bytes per read of a streamed blob
 
 
     def __init__(self, root: str | Path):
@@ -149,6 +152,23 @@ class BlobStore:
     async def size(self, doc_id: str) -> int:
         """Return the blob's size in bytes."""
         return (await asyncio.to_thread(self.path(doc_id).stat)).st_size
+
+
+    async def stream(self, doc_id: str, start: int, end: int) -> AsyncIterator[bytes]:
+        """The blob's bytes from `start` to `end` inclusive, in chunks."""
+        remaining = end - start + 1
+
+        async with await anyio.open_file(self.path(doc_id), "rb") as fh:
+            await fh.seek(start)
+
+            while remaining > 0:
+                chunk = await fh.read(min(self.CHUNK, remaining))
+
+                if not chunk:
+                    break
+
+                remaining -= len(chunk)
+                yield chunk
 
 
     async def delete(self, doc_id: str) -> bool:

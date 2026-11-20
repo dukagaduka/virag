@@ -3,20 +3,86 @@
 from __future__ import annotations
 
 import re
-from typing import AsyncIterator
 
-import anyio
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
-from ..errors import ApiError, not_found
+from ..errors import ApiError
 from ..media import extension_for
-from .deps import ERROR_RESPONSES, check_doc_id
+from .deps import ERROR_RESPONSES
 
 router = APIRouter()
 
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
-_CHUNK = 1 << 18
+
+
+@router.get(
+    "/doc/{doc_id}",
+    responses={200: {"content": {"application/octet-stream": {}}}, **ERROR_RESPONSES},
+    summary="Download the original stored blob.",
+    operation_id="downloadOriginal",
+)
+async def download_original(request: Request, doc_id: str) -> Response:
+    """Stream the original stored blob, honouring a single Range header."""
+    state = request.app.state
+
+    # Its blob is not in the store before the ingest commits.
+    row = await state.store.require_doc(doc_id, complete=True)
+    state.blobs.require(doc_id)
+
+    size = await state.blobs.size(doc_id)
+    filename = f"{doc_id}{extension_for(row.mime_type)}"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Accept-Ranges": "bytes",
+        "X-Doc-Id": doc_id,
+    }
+
+    rng = request.headers.get("range")
+
+    if rng:
+        window = _parse_range(rng, size)
+
+        if window is not None:
+            start, end = window
+            headers |= {
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Content-Length": str(end - start + 1),
+            }
+
+            return StreamingResponse(
+                state.blobs.stream(doc_id, start, end),
+                status_code=206,
+                media_type=row.mime_type,
+                headers=headers,
+            )
+
+    headers["Content-Length"] = str(size)
+
+    return StreamingResponse(
+        state.blobs.stream(doc_id, 0, size - 1), media_type=row.mime_type, headers=headers
+    )
+
+
+@router.delete(
+    "/doc/{doc_id}",
+    status_code=204,
+    responses=ERROR_RESPONSES,
+    summary="Delete a document, its tile rows and its blob (flag-guarded).",
+    operation_id="deleteDocument",
+)
+async def delete_document(request: Request, doc_id: str) -> Response:
+    """Delete a document's rows and blob when deletion is enabled."""
+    state = request.app.state
+
+    if not state.settings.allow_delete:
+        raise ApiError(
+            405, "DELETE_DISABLED", "deletion is disabled; start with TILER_ALLOW_DELETE=true"
+        )
+
+    await state.ingester.delete(doc_id)
+
+    return Response(status_code=204)
 
 
 def _parse_range(header: str, size: int) -> tuple[int, int] | None:
@@ -47,99 +113,3 @@ def _parse_range(header: str, size: int) -> tuple[int, int] | None:
         raise ApiError(416, "RANGE_NOT_SATISFIABLE", f"range not satisfiable for size {size}")
 
     return start, end
-
-
-async def _stream(path, start: int, end: int) -> AsyncIterator[bytes]:
-    """Yield bytes of `path` from `start` to `end` inclusive, in chunks."""
-    remaining = end - start + 1
-
-    async with await anyio.open_file(path, "rb") as fh:
-        await fh.seek(start)
-
-        while remaining > 0:
-            chunk = await fh.read(min(_CHUNK, remaining))
-
-            if not chunk:
-                break
-
-            remaining -= len(chunk)
-            yield chunk
-
-
-@router.get(
-    "/doc/{doc_id}",
-    responses={200: {"content": {"application/octet-stream": {}}}, **ERROR_RESPONSES},
-    summary="Download the original stored blob.",
-    operation_id="downloadOriginal",
-)
-async def download_original(request: Request, doc_id: str) -> Response:
-    """Stream the original stored blob, honouring a single Range header."""
-    state = request.app.state
-    check_doc_id(doc_id)
-    row = await state.store.get_doc(doc_id)
-
-    if row is None:
-        raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
-
-    if not row.complete:  # its blob is not in the store before the ingest commits
-        raise not_found(f"doc_id {doc_id!r} is still being ingested", "DOC_INCOMPLETE", doc_id=doc_id)
-
-    state.blobs.require(doc_id)
-
-    path = state.blobs.path(doc_id)
-    size = await state.blobs.size(doc_id)
-    filename = f"{doc_id}{extension_for(row.mime_type)}"
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Accept-Ranges": "bytes",
-        "X-Doc-Id": doc_id,
-    }
-
-    rng = request.headers.get("range")
-
-    if rng:
-        window = _parse_range(rng, size)
-
-        if window is not None:
-            start, end = window
-            headers |= {
-                "Content-Range": f"bytes {start}-{end}/{size}",
-                "Content-Length": str(end - start + 1),
-            }
-
-            return StreamingResponse(
-                _stream(path, start, end),
-                status_code=206,
-                media_type=row.mime_type,
-                headers=headers,
-            )
-
-    headers["Content-Length"] = str(size)
-
-    return StreamingResponse(
-        _stream(path, 0, size - 1), media_type=row.mime_type, headers=headers
-    )
-
-
-@router.delete(
-    "/doc/{doc_id}",
-    status_code=204,
-    responses=ERROR_RESPONSES,
-    summary="Delete a document, its tile rows and its blob (flag-guarded).",
-    operation_id="deleteDocument",
-)
-async def delete_document(request: Request, doc_id: str) -> Response:
-    """Delete a document's rows and blob when deletion is enabled."""
-    state = request.app.state
-
-    if not state.settings.allow_delete:
-        raise ApiError(
-            405, "DELETE_DISABLED", "deletion is disabled; start with TILER_ALLOW_DELETE=true"
-        )
-
-    check_doc_id(doc_id)
-
-    if not await state.ingester.delete(doc_id):
-        raise not_found(f"unknown doc_id {doc_id!r}", "UNKNOWN_DOC", doc_id=doc_id)
-
-    return Response(status_code=204)
