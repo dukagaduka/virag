@@ -17,9 +17,8 @@ from . import metrics
 from .config import Settings
 from .errors import bad_request, conflict, gone, not_found
 from .hashing import sha256_hex
-from .render.documents import Document
 from .render.geometry import Tile
-from .render.pool import RenderPool
+from .render.renderer import Renderer
 from .render.types import RenderedTile
 from .store.blobs import BlobStore
 from .store.cache import AsyncLRU
@@ -33,10 +32,10 @@ class Tiles:
     owns the tile cache."""
 
 
-    def __init__(self, store: MetaStore, blobs: BlobStore, render: RenderPool, settings: Settings):
-        self.store  = store
-        self.blobs  = blobs
-        self.render = render
+    def __init__(self, store: MetaStore, blobs: BlobStore, renderer: Renderer, settings: Settings):
+        self.store    = store
+        self.blobs    = blobs
+        self.renderer = renderer
 
         # Final JPEG bytes by (doc_id, tile_num).
         self.cache = AsyncLRU(settings.render_cache_size, "tile")
@@ -90,8 +89,13 @@ class Tiles:
         }
 
         if render:
-            async with aclosing(self._render_all(row)) as rendered:
+            stored = {tile_row.tile_num: tile_row for tile_row in await self.store.get_tiles(row.doc_id)}
+
+            # One background render of the whole doc, each tile checked against its stored hash.
+            async with aclosing(self._rendered(row, list(stored.values()), bulk=True)) as rendered:
                 async for tile in rendered:
+                    self._verify(row, stored[tile.tile_num], tile.image_hash)
+
                     yield {"event": "tile", "tile": tile}
 
         yield {
@@ -110,7 +114,7 @@ class Tiles:
         """Drop what is cached of a document — its tiles and its page capture: the
         document was rendered anew, or is gone."""
         await self.cache.invalidate(lambda k: isinstance(k, tuple) and k[0] == doc_id)
-        await self.render.forget(self.blobs.path(doc_id))
+        await self.renderer.forget(self.blobs.path(doc_id))
 
 
     # ------------------------------------------------------------------ #
@@ -140,38 +144,26 @@ class Tiles:
 
     async def _render(self, row: DocRow, tile_row: TileRow) -> bytes:
         """Render one tile from the stored blob: the rows it was cut from at ingest."""
+        async with aclosing(self._rendered(row, [tile_row], bulk=False)) as rendered:
+            [tile] = [tile async for tile in rendered]
+
+        return tile.jpeg
+
+
+    async def _rendered(
+        self, row: DocRow, tile_rows: list[TileRow], *, bulk: bool
+    ) -> AsyncIterator[RenderedTile]:
+        """Tiles of a stored doc rendered in one render, in tile order, as they were cut
+        at ingest."""
         self.blobs.require(row.doc_id)
-        tile = Tile(tile_row.tile_num, tile_row.offset, tile_row.height)
+        cut = [Tile(tile_row.tile_num, tile_row.offset, tile_row.height) for tile_row in tile_rows]
 
-        with metrics.measured(row.doc_type, "regenerate", [1]):
-            async with Document.open(
-                self.render, row.doc_type, self.blobs.path(row.doc_id), height=row.height
-            ) as doc:
-                [image] = await doc.render([tile])
-
-        return image.jpeg
-
-
-    async def _render_all(self, row: DocRow) -> AsyncIterator[RenderedTile]:
-        """Render every tile of a stored doc in one background render, in tile order,
-        each verified against its stored hash."""
-        self.blobs.require(row.doc_id)
-
-        stored = {tile_row.tile_num: tile_row for tile_row in await self.store.get_tiles(row.doc_id)}
-        tiles = [Tile(tile_row.tile_num, tile_row.offset, tile_row.height) for tile_row in stored.values()]
-        count = [0]
-
-        with metrics.measured(row.doc_type, "regenerate", count):
-            async with Document.open(
-                self.render, row.doc_type, self.blobs.path(row.doc_id), bulk=True, height=row.height
-            ) as doc:
-                async with aclosing(doc.render_all(tiles)) as batches:
-                    async for batch in batches:
-                        for tile in batch:
-                            self._verify(row, stored[tile.tile_num], tile.image_hash)
-                            count[0] += 1
-
-                            yield tile
+        async with self.renderer.open(
+            row.doc_type, self.blobs.path(row.doc_id), purpose="regenerate", bulk=bulk, height=row.height
+        ) as doc:
+            async with aclosing(doc.tiles(cut)) as tiles:
+                async for tile in tiles:
+                    yield tile
 
 
     @staticmethod

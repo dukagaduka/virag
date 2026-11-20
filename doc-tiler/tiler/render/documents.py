@@ -1,9 +1,9 @@
-"""Documents: a stored document opened for rendering, as the rest of the tiler sees it.
+"""Documents: a document opened for rendering (through `Renderer.open`).
 
 Whatever its format, a document is one image `TILE_WIDTH` wide and `height` tall:
-`plan()` measures it and cuts it into tiles, `render()` returns the JPEGs of some of
-them, `render_all()` renders a whole plan batch by batch. Where that happens is the
-document's own business:
+`tiles()` yields its tiles rendered — `plan()` measures it and cuts it into tiles
+first, unless the cut is given — and `render()` returns the JPEGs of one batch of them.
+Where that happens is the document's own business:
 
 - `WorkerDocument` (PDF, images) — entirely inside the render workers, by the format's
   reader (`readers.py`);
@@ -20,7 +20,6 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from itertools import islice
-from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
 from ..models import DocType
@@ -56,21 +55,8 @@ class Document(ABC):
         self.doc_type = doc_type
         self.path = path
         self.bulk = bulk
+        self.rendered = 0  # tiles yielded so far
         self._height = height
-
-
-    @staticmethod
-    def open(
-        pool: RenderPool,
-        doc_type: DocType,
-        path: str | Path,
-        *,
-        bulk: bool = False,
-        height: int | None = None,
-    ) -> Document:
-        """The document in the file at `path` (a stored blob or a spooled upload), as
-        the class of its type."""
-        return DOCUMENTS[doc_type](pool, doc_type, str(path), bulk=bulk, height=height)
 
 
     async def __aenter__(self) -> Document:
@@ -100,10 +86,14 @@ class Document(ABC):
         """Render and encode the given tiles, in order."""
 
 
-    async def render_all(self, tiles: list[Tile]) -> AsyncIterator[list[RenderedTile]]:
-        """Render `tiles` batch by batch, up to `_parallel` batches at once, yielding
-        each batch's tiles in tile order."""
-        batches = iter(self._batches(tiles))
+    async def tiles(self, cut: list[Tile] | None = None) -> AsyncIterator[RenderedTile]:
+        """The document's tiles, rendered, in tile order: those of `cut` (made before,
+        for a stored doc), or all of them — the document is then measured and cut first.
+        They render batch by batch, up to `_parallel` batches at once."""
+        if cut is None:
+            cut = await self.plan()
+
+        batches = iter(self._batches(cut))
         running: deque[tuple[list[Tile], asyncio.Task]] = deque()
 
         try:
@@ -114,7 +104,10 @@ class Document(ABC):
                 encoded = await task
                 self._top_up(running, batches)
 
-                yield [RenderedTile.build(tile, image) for tile, image in zip(batch, encoded)]
+                for tile, image in zip(batch, encoded):
+                    self.rendered += 1
+
+                    yield RenderedTile.build(tile, image)
 
         finally:
             for _, task in running:

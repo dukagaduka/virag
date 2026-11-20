@@ -23,9 +23,9 @@ class UrlCapture:
     """Owns the SSRF guard proxy the browser fetches through."""
 
 
-    def __init__(self, settings: Settings, render: RenderPool):
+    def __init__(self, settings: Settings, pool: RenderPool):
         self.settings = settings
-        self.render = render
+        self.pool = pool
         self.guard_proxy: GuardProxy | None = None
 
 
@@ -61,8 +61,8 @@ class UrlCapture:
 
         log.info("fetching %s (resolved to %s)", url, ",".join(target.ips))
         proxy = self.guard_proxy.url if self.guard_proxy is not None else None
-        blob = await self.render.browser_call(
-            web.capture_url_mhtml, self.render.browser, s, url, proxy, bulk=True
+        blob = await self.pool.browser_call(
+            web.capture_url_mhtml, self.pool.browser, s, url, proxy, bulk=True
         )
 
         if self.guard_proxy is not None and self.guard_proxy.blocked:

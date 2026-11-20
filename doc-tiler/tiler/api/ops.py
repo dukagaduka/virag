@@ -63,13 +63,13 @@ async def readyz(request: Request) -> Response:
         checks["blobs"] = f"error: {exc}"
         ok = False
 
-    pool_ok = await state.render.healthy()
+    pool_ok = await state.pool.healthy()
     checks["render_pool"] = "ok" if pool_ok else "down"
 
     if not pool_ok:
         ok = False
 
-    browser = state.render.browser
+    browser = state.pool.browser
 
     if state.settings.browser_enabled:
         checks["browser"] = "ok" if browser.available else f"unavailable: {browser.start_error}"
@@ -130,11 +130,11 @@ async def info(request: Request) -> dict[str, Any]:
             "render_workers": settings.render_workers,
             "bulk_browsers": settings.bulk_browsers,
             "bulk_render_workers": settings.bulk_render_workers,
-            "browser_available": state.render.browser.available,
+            "browser_available": state.pool.browser.available,
             "render_worker_memory": settings.render_worker_memory,
             "render_timeout_sec": settings.render_timeout_sec,
-            "render_worker_restarts": state.render.worker_restarts,
+            "render_worker_restarts": state.pool.worker_restarts,
         },
-        "cache": {"tile": state.tiles.cache.stats(), "page": state.render.page_cache.stats()},
+        "cache": {"tile": state.tiles.cache.stats(), "page": state.pool.page_cache.stats()},
         "docs": await state.store.count_docs(),
     }

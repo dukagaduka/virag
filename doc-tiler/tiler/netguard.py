@@ -5,11 +5,16 @@ DNS rebinding, redirects to internal hosts, or a subresource pointing at
 169.254.169.254. Routing the browser context through this in-process proxy moves
 resolution to us: every connection Chromium makes — top-level, redirect, or
 subresource — is resolved here, checked against the policy, and dialled by IP.
+
+A connection lives as long as both of its ends do: the proxy holds its task (asyncio
+keeps a task only weakly, so one waiting on a silent peer would otherwise be garbage),
+and a tunnel is over the moment either end closes.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Iterable
 
@@ -40,6 +45,7 @@ class GuardProxy:
         self._allow_private = allow_private
         self._connect_timeout = connect_timeout
         self._server: asyncio.AbstractServer | None = None
+        self._connections: set[asyncio.Task] = set()
         self.port: int = 0
         self.blocked: list[str] = []
 
@@ -58,7 +64,7 @@ class GuardProxy:
 
 
     async def stop(self) -> None:
-        """Close the listening socket and wait for it to shut down."""
+        """Close the listening socket, end the connections still open and wait for both."""
         if self._server is not None:
             self._server.close()
 
@@ -70,9 +76,32 @@ class GuardProxy:
 
             self._server = None
 
+        connections = list(self._connections)
+
+        for task in connections:
+            task.cancel()
+
+        await asyncio.gather(*connections, return_exceptions=True)
+
 
     # ------------------------------------------------------------------ #
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """One connection of the browser, held by the proxy from its request line to
+        the end of its tunnel."""
+        task = asyncio.current_task()
+        self._connections.add(task)
+
+        try:
+            await self._serve(reader, writer)
+
+        finally:
+            self._connections.discard(task)
+
+            with contextlib.suppress(Exception):
+                writer.close()
+
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Parse one request line and dispatch to CONNECT or plain forwarding."""
         try:
             head = await asyncio.wait_for(
@@ -209,22 +238,35 @@ class GuardProxy:
         u_reader: asyncio.StreamReader,
         u_writer: asyncio.StreamWriter,
     ) -> None:
-        """Splice client and upstream in both directions until either closes."""
-        await asyncio.gather(
-            GuardProxy._pump(c_reader, u_writer),
-            GuardProxy._pump(u_reader, c_writer),
-            return_exceptions=True,
-        )
-        await asyncio.gather(
-            GuardProxy._close(c_writer),
-            GuardProxy._close(u_writer),
-            return_exceptions=True,
-        )
+        """Splice client and upstream in both directions until either of them closes.
+
+        A browser never half-closes, so once one direction has ended the tunnel is
+        over: the other end is closed too, not waited for — an upstream that keeps its
+        connection would otherwise keep the tunnel for good.
+        """
+        pumps = [
+            asyncio.create_task(GuardProxy._pump(c_reader, u_writer)),
+            asyncio.create_task(GuardProxy._pump(u_reader, c_writer)),
+        ]
+
+        try:
+            await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+
+        finally:
+            for pump in pumps:
+                pump.cancel()
+
+            await asyncio.gather(*pumps, return_exceptions=True)
+            await asyncio.gather(
+                GuardProxy._close(c_writer),
+                GuardProxy._close(u_writer),
+                return_exceptions=True,
+            )
 
 
     @staticmethod
     async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Copy bytes from `reader` to `writer` until EOF."""
+        """Copy bytes from `reader` to `writer` until EOF, or until either of them fails."""
         try:
             while chunk := await reader.read(65536):
                 writer.write(chunk)
@@ -232,13 +274,6 @@ class GuardProxy:
 
         except Exception:
             pass
-
-        finally:
-            try:
-                writer.write_eof()
-
-            except Exception:
-                pass
 
 
     @staticmethod

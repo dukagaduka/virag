@@ -50,7 +50,7 @@ async def capture_fixture(state, tmp_path, rows: int) -> bytes:
 
     path = tmp_path / f"fixture_{rows}.html"
     path.write_text(_html(rows))
-    return await capture_url_mhtml(state.render.browser, state.settings, f"file://{path}", None)
+    return await capture_url_mhtml(state.pool.browser, state.settings, f"file://{path}", None)
 
 
 @pytest.fixture
@@ -97,15 +97,15 @@ async def test_sequential_strips_reuse_one_full_page_render(browser_env, tmp_pat
         blob = await capture_fixture(state, tmp_path, rows=20)
         manifest = await ingest_tiles(client, mhtml_form(blob))
         await state.tiles.cache.clear()
-        await state.render.page_cache.clear()
+        await state.pool.page_cache.clear()
 
-        misses_before = state.render.page_cache.misses
+        misses_before = state.pool.page_cache.misses
         for tile in manifest["tiles"]:
             await client.get(
                 "/get_tile", params={"doc_id": manifest["doc_id"], "tile_num": tile["tile_num"]}
             )
-        assert state.render.page_cache.misses == misses_before + 1
-        assert state.render.page_cache.hits >= manifest["tile_count"] - 1
+        assert state.pool.page_cache.misses == misses_before + 1
+        assert state.pool.page_cache.hits >= manifest["tile_count"] - 1
 
 
 async def test_tall_page_uses_the_clip_path(tmp_path):

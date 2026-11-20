@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 
 import pytest
 from conftest import base_env, running_app
@@ -146,6 +147,91 @@ async def test_guard_proxy_forwards_allowed_http():
         body = await asyncio.wait_for(reader.read(1024), timeout=5)
         assert b"200 OK" in body and body.endswith(b"hi")
         writer.close()
+    finally:
+        await proxy.stop()
+        origin.close()
+
+
+async def _tunnel(proxy: GuardProxy, port: int):
+    """A CONNECT tunnel through the proxy to 127.0.0.1:port."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
+    writer.write(f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n".encode())
+    await writer.drain()
+
+    assert b"200" in await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+
+    return reader, writer
+
+
+async def test_guard_proxy_ends_a_tunnel_when_the_client_leaves():
+    """An upstream that keeps its connection does not keep the tunnel: once the browser
+    is gone the proxy closes the upstream too, and no connection task is left behind —
+    neither running nor for the garbage collector to destroy while it is pending."""
+    upstream_closed = asyncio.Event()
+
+    async def handler(reader, writer):                 # echoes, and never closes first
+        while chunk := await reader.read(1024):
+            writer.write(chunk)
+            await writer.drain()
+
+        upstream_closed.set()
+
+    lost: list[dict] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _, context: lost.append(context))
+
+    origin = await asyncio.start_server(handler, "127.0.0.1", 0)
+    proxy = GuardProxy(allow_private=True)
+    await proxy.start()
+
+    try:
+        reader, writer = await _tunnel(proxy, origin.sockets[0].getsockname()[1])
+
+        writer.write(b"ping")
+        await writer.drain()
+        assert await asyncio.wait_for(reader.readexactly(4), timeout=5) == b"ping"
+        assert len(proxy._connections) == 1
+
+        writer.close()                                 # the browser context closes
+        await writer.wait_closed()
+
+        await asyncio.wait_for(upstream_closed.wait(), timeout=5)
+
+        for _ in range(50):
+            if not proxy._connections:
+                break
+
+            await asyncio.sleep(0.05)
+
+        assert not proxy._connections
+
+        gc.collect()
+        await asyncio.sleep(0)
+        assert lost == []
+
+    finally:
+        loop.set_exception_handler(None)
+        await proxy.stop()
+        origin.close()
+
+
+async def test_guard_proxy_stop_ends_open_tunnels():
+    async def handler(reader, writer):
+        await reader.read()
+
+    origin = await asyncio.start_server(handler, "127.0.0.1", 0)
+    proxy = GuardProxy(allow_private=True)
+    await proxy.start()
+
+    try:
+        reader, writer = await _tunnel(proxy, origin.sockets[0].getsockname()[1])
+
+        await proxy.stop()
+
+        assert not proxy._connections
+        assert await asyncio.wait_for(reader.read(), timeout=5) == b""    # closed under the client
+        writer.close()
+
     finally:
         await proxy.stop()
         origin.close()

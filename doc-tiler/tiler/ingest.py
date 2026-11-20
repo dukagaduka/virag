@@ -30,8 +30,7 @@ from .config import Settings
 from .errors import ApiError, bad_request, conflict
 from .meta.schema import MetadataSchema
 from .models import DocType
-from .render.documents import Document
-from .render.pool import RenderPool
+from .render.renderer import Renderer
 from .store.blobs import BlobStore, Incoming
 from .store.meta import DocRow, MetaStore, TileRow
 from .tiles import Tiles
@@ -47,19 +46,19 @@ class Ingester:
         self,
         store: MetaStore,
         blobs: BlobStore,
-        render: RenderPool,
+        renderer: Renderer,
         capture: UrlCapture,
         tiles: Tiles,
         schema: MetadataSchema,
         settings: Settings,
     ):
 
-        self.store   = store
-        self.blobs   = blobs
-        self.render  = render
-        self.capture = capture
-        self.tiles   = tiles
-        self.schema  = schema
+        self.store    = store
+        self.blobs    = blobs
+        self.renderer = renderer
+        self.capture  = capture
+        self.tiles    = tiles
+        self.schema   = schema
 
         self.render_version = settings.render_version
 
@@ -238,18 +237,14 @@ class Ingester:
             }
 
             staged: list[TileRow] = []
-            count = [0]
 
-            with metrics.measured(effective_type, "ingest", count):
-                async with Document.open(self.render, effective_type, upload.path, bulk=True) as doc:
-                    async with aclosing(doc.render_all(await doc.plan())) as batches:
-                        async for batch in batches:
-                            for tile in batch:
-                                staged.append(TileRow.from_rendered(doc_id, tile))
-                                count[0] += 1
-                                yield {"event": "tile", "tile": tile}
+            async with self.renderer.open(effective_type, upload.path, purpose="ingest", bulk=True) as doc:
+                async with aclosing(doc.tiles()) as tiles:
+                    async for tile in tiles:
+                        staged.append(TileRow.from_rendered(doc_id, tile))
+                        yield {"event": "tile", "tile": tile}
 
-                    height = doc.height
+                height = doc.height
 
             # The blob first: one without tiles is inert, tiles without their blob are not.
             await self.blobs.commit(upload)
@@ -289,7 +284,7 @@ class Ingester:
         under its path — even when the ingest is being cancelled."""
         with anyio.CancelScope(shield=True):
             await self.blobs.discard(upload)
-            await self.render.forget(upload.path)
+            await self.renderer.forget(upload.path)
 
 
     @staticmethod

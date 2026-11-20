@@ -24,6 +24,7 @@ from .errors import install_error_handlers
 from .ingest import Ingester
 from .meta.schema import SchemaError, index_statements, load_schema
 from .render.pool import RenderPool
+from .render.renderer import Renderer
 from .responses import OrjsonResponse
 from .revision import Revision
 from .store.blobs import BlobStore
@@ -65,12 +66,13 @@ async def lifespan(app: FastAPI):
 
     store = MetaStore(settings.db_path)
     blobs = BlobStore(settings.blob_dir)
-    render = RenderPool(settings)
-    capture = UrlCapture(settings, render)
+    pool = RenderPool(settings)
+    renderer = Renderer(pool)
+    capture = UrlCapture(settings, pool)
 
-    tiles = Tiles(store, blobs, render, settings)
-    ingester = Ingester(store, blobs, render, capture, tiles, schema, settings)
-    revision = Revision(store, blobs, render, tiles, settings)
+    tiles = Tiles(store, blobs, renderer, settings)
+    ingester = Ingester(store, blobs, renderer, capture, tiles, schema, settings)
+    revision = Revision(store, blobs, renderer, tiles, settings)
 
     # Everything below must succeed before the first request is served. Whatever is
     # started registers its own shutdown at once, so a failed step still closes what
@@ -122,8 +124,8 @@ async def lifespan(app: FastAPI):
         await capture.start()
         stack.push_async_callback(capture.stop)
 
-        await render.start(browser=settings.browser_enabled, per_context_proxy=capture.proxied)
-        stack.push_async_callback(render.stop)
+        await pool.start(browser=settings.browser_enabled, per_context_proxy=capture.proxied)
+        stack.push_async_callback(pool.stop)
 
         metrics.DOCS.set(await store.count_docs())
 
@@ -136,7 +138,7 @@ async def lifespan(app: FastAPI):
         app.state.volume_id = volume_id
         app.state.store = store
         app.state.blobs = blobs
-        app.state.render = render
+        app.state.pool = pool
         app.state.capture = capture
         app.state.tiles = tiles
         app.state.ingester = ingester

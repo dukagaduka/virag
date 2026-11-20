@@ -84,10 +84,14 @@ Playwright threads, and forking those into workers deadlocks.
 
 Every document, whatever its format, is **one image of width `W` and height `H`**, and
 a tile is a run of its rows `[offset, offset + height)`. The service works on that
-alone (`render/documents.py`): `plan()` measures the document and cuts it into tiles,
-`render()` returns the JPEGs of some of them, `render_all()` renders a whole plan batch
-by batch. Each tile's `offset` and `height` are stored with it, so `get_tile` reads the
-tile's rows back and never cuts the document again.
+alone, and there is one way from a file to its tiles — the `Renderer`
+(`render/renderer.py`): an ingest, a revision and a request for a stored doc's tiles all
+open the document through it (`renderer.open(...)`) and read `doc.tiles()`. The document
+(`render/documents.py`) measures itself and cuts itself into tiles (`plan()`), unless
+the cut is given, and renders them batch by batch (`render()`). Each tile's `offset` and
+`height` are stored with it, so `get_tile` and a stored doc's stream pass that cut back
+and never cut the document again. The Renderer also records every render in the metrics
+(`path` = ingest / regenerate / revise).
 
 How the rows are produced is the document's own business:
 
@@ -566,7 +570,8 @@ tiler/
   preflight.py       # standalone startup validation (runs before uvicorn)
   media.py  metrics.py  errors.py  models.py  responses.py  # mime sniff, Prometheus, error envelope, pydantic, orjson response
   api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  revision.py  ops.py
-  render/ documents.py  # what gets rendered: WorkerDocument (PDF, images), MhtmlDocument (Chromium)
+  render/ renderer.py   # Renderer: the one way from a document's file to its tiles; records the renders
+          documents.py  # what gets rendered: WorkerDocument (PDF, images), MhtmlDocument (Chromium)
           readers.py    # DocumentReader: PdfReader, ImageReader — a format read as one image, inside a worker
           pool.py       # RenderPool: pebble process pool (memory cap, timeout), Chromium, bulk slots
           worker.py     # what runs in a worker: lay a document out, read and encode its tiles

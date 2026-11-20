@@ -41,8 +41,7 @@ from typing import Any, AsyncIterator
 from . import metrics
 from .config import Settings
 from .errors import ApiError, conflict
-from .render.documents import Document
-from .render.pool import RenderPool
+from .render.renderer import Renderer
 from .store.blobs import BlobStore
 from .store.meta import DocRow, MetaStore, TileRow
 from .tiles import Tiles
@@ -64,15 +63,15 @@ class Revision:
         self,
         store: MetaStore,
         blobs: BlobStore,
-        render: RenderPool,
+        renderer: Renderer,
         tiles: Tiles,
         settings: Settings,
     ):
 
-        self.store  = store
-        self.blobs  = blobs
-        self.render = render
-        self.tiles  = tiles
+        self.store    = store
+        self.blobs    = blobs
+        self.renderer = renderer
+        self.tiles    = tiles
 
         self.render_version = settings.render_version
         self.on_mismatch    = settings.revision_on_render_mismatch
@@ -287,17 +286,10 @@ class Revision:
         """Re-render one stored doc from its blob and swap its tiles and height in place
         at the current render_version (doc_id and metadata are untouched)."""
         self.blobs.require(row.doc_id)
-        staged: list[TileRow] = []
-        count = [0]
 
-        with metrics.measured(row.doc_type, "revise", count):
-            async with Document.open(self.render, row.doc_type, self.blobs.path(row.doc_id)) as doc:
-                async for batch in doc.render_all(await doc.plan()):
-                    staged.extend(TileRow.from_rendered(row.doc_id, tile) for tile in batch)
-
-                height = doc.height
-
-            count[0] = len(staged)
+        async with self.renderer.open(row.doc_type, self.blobs.path(row.doc_id), purpose="revise") as doc:
+            staged = [TileRow.from_rendered(row.doc_id, tile) async for tile in doc.tiles()]
+            height = doc.height
 
         await self.store.replace_render(
             row.doc_id,
