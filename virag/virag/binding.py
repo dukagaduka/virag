@@ -8,12 +8,11 @@ from virag.clients.tiler_client import TilerService
 
 log = logging.getLogger("virag.binding")
 
-# The indexed metadata fields virag relies on: `name` for search, and the two enroll
-# markers reconcile queries by. All must be declared in the tiler's metadata schema
+# The indexed metadata fields virag relies on: `name` for search, and the enroll
+# marker reconcile queries by. Both must be declared in the tiler's metadata schema
 # (deploy/tiler_metadata_schema.yaml) or reconcile's search would 400.
 REQUIRED_METADATA_FIELDS = {
     "name": "text",
-    "virag_started_at": "number",
     "virag_enrolled_at": "number",
 }
 

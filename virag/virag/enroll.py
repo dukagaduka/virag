@@ -16,8 +16,13 @@ The Enroller consumes a tile stream of the tiler — `begin`, a `tile` per tile,
 A stream that fails or ends without `committed` rolls the document back out of Qdrant —
 only while the document is still this process's: a process that stalled past its lease
 may find another enroll writing it already. A doc the tiler held before stays there
-pending, so reconcile heals it later; a new one the tiler drops itself when its ingest
-ends without a commit.
+pending, and reconcile enrolls it again from its stored tiles; a new one the tiler
+drops itself when its ingest ends without a commit.
+
+The Enroller is the one writer of a document's points in the serving collection:
+`/enroll` feeds it the tiler's ingest stream, reconcile's self-heal and a revision's
+sync the stream of a stored doc (`enroll_stored`), and both drop a document's points
+through it (`drop`).
 """
 
 from __future__ import annotations
@@ -83,8 +88,7 @@ class Enroller:
             doc_id = begin["doc_id"]
 
             async with self.coordinator.enrolling(doc_id) as collection:
-                pending = {"virag_started_at": int(time.time()), "virag_enrolled_at": 0}
-                await self.tiler.patch_metadata(doc_id, {**(metadata or {}), **pending})
+                await self.tiler.patch_metadata(doc_id, {**(metadata or {}), "virag_enrolled_at": 0})
 
                 try:
                     await self.store.delete_by_doc(doc_id, collection=collection)
@@ -107,6 +111,18 @@ class Enroller:
             "tile_count": committed.get("tile_count", enrolled),
             "enrolled": enrolled,
         }
+
+
+    async def enroll_stored(self, doc_id: str) -> dict:
+        """Enroll a document the tiler holds again, from its stored tiles."""
+        return await self.enroll(self.tiler.doc_stream(doc_id))
+
+
+    async def drop(self, doc_id: str) -> None:
+        """Drop a document's points — held like an enroll, so never under one
+        (EnrollInProgress)."""
+        async with self.coordinator.enrolling(doc_id) as collection:
+            await self.store.delete_by_doc(doc_id, collection=collection)
 
 
     async def _begin(self, events: AsyncIterator[dict]) -> dict:

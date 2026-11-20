@@ -1,44 +1,56 @@
-"""reconcile: Qdrant ⊆ Tiler enforcement, self-heal of stale pending enrolls, flat re-embed."""
+"""reconcile: Qdrant ⊆ Tiler enforcement, and abandoned enrolls finished through the Enroller."""
 
 from __future__ import annotations
 
 import asyncio
 
-from virag.enroll import point_id
-from virag.reconcile import reconcile, reembed_docs, sync_docs
+from virag.enroll import Enroller, point_id
+from virag.errors import ApiError
+from virag.reconcile import reconcile
 from virag.settings import EnrollSettings, ReconcileSettings
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, make_coordinator
-
-
-_ENROLL = EnrollSettings(batch_size=16)
-
-
-def _settings(self_heal=True):
-    return ReconcileSettings(self_heal=self_heal, interval_sec=0, pending_ttl_sec=3600)
+from conftest import FakeRetriever, FakeStore, FakeTiler, lease_key, make_coordinator
 
 
 def _doc(doc_id, tile_count, *, complete=True, enrolled_at=1):
     return {
         "doc_id": doc_id, "doc_type": "PDF", "tile_count": tile_count, "complete": complete,
         "render_version": "rv", "source_url": None,
-        "metadata": {"name": doc_id, "virag_started_at": 1, "virag_enrolled_at": enrolled_at},
+        "metadata": {"name": doc_id, "virag_enrolled_at": enrolled_at},
     }
 
 
+def _reconcile(store, tiler, coordinator=None, *, self_heal=True, retriever=None):
+    """One reconcile pass, as the coroutine to run."""
+    coordinator = coordinator if coordinator is not None else make_coordinator(store)
+    enroller = Enroller(store, coordinator, tiler, retriever or FakeRetriever(), EnrollSettings(batch_size=16))
+
+    return reconcile(
+        store, coordinator, tiler, enroller, ReconcileSettings(self_heal=self_heal, interval_sec=0),
+    )
+
+
+def _enrolled_docs(store) -> list[str]:
+    return sorted({p["doc_id"] for u in store.upserts for p in u["payloads"]})
+
+
+# ---------------------------------------------------------------------------
+# Qdrant ⊆ Tiler
+# ---------------------------------------------------------------------------
+
 def test_reconcile_deletes_dangling_points():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    store, tiler = FakeStore(), FakeTiler()
     store._doc_ids = {"kept", "dangling"}                       # dangling has no tiler doc
     tiler.docs = [{"doc_id": "kept"}]
 
-    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
+    asyncio.run(_reconcile(store, tiler))
 
     assert "dangling" in store.deletes
     assert "kept" not in store.deletes
 
 
 def test_reconcile_deletes_points_of_quarantined_docs():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    store, tiler = FakeStore(), FakeTiler()
     store._doc_ids = {"kept", "quarantined", "reenrolling"}
     tiler.docs = [
         {"doc_id": "kept"},
@@ -49,17 +61,66 @@ def test_reconcile_deletes_points_of_quarantined_docs():
 
     async def go():
         async with coordinator.enrolling("reenrolling"):       # a re-enroll is lifting it
-            await reconcile(store, coordinator, tiler, retriever, _settings(), _ENROLL)
+            await _reconcile(store, tiler, coordinator)
 
     asyncio.run(go())
 
     assert store.deletes == ["quarantined"]
 
 
+def test_reconcile_runs_only_in_the_leading_process():
+    store, tiler = FakeStore(), FakeTiler()
+    store._doc_ids = {"dangling"}
+    leader = make_coordinator(store)
+    follower = make_coordinator(store, valkey=leader.valkey)
+
+    asyncio.run(_reconcile(store, tiler, leader))
+    store.deletes.clear()
+    store._doc_ids = {"dangling"}
+
+    asyncio.run(_reconcile(store, tiler, follower))
+
+    assert store.deletes == []                                          # the leader's to do
+
+
+# ---------------------------------------------------------------------------
+# abandoned enrolls
+# ---------------------------------------------------------------------------
+
+def test_an_abandoned_enroll_is_finished_from_the_stored_tiles():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [_doc("doc-a", 2, enrolled_at=0)]
+
+    asyncio.run(_reconcile(store, tiler))
+
+    assert tiler.doc_stream_calls == ["doc-a"]                          # the tiler's stream of the stored doc
+    assert tiler.get_tile_calls == []                                   # not tile by tile
+
+    assert len(store.upserts) == 1
+    up = store.upserts[0]
+    assert up["ids"] == [point_id("doc-a", 0), point_id("doc-a", 1)]    # an enroll: the same ids
+    assert set(up["payloads"][0]) == {"doc_id", "tile_num", "image_hash", "render_version"}
+    assert up["collection"] == "c__v1"                                  # pinned to the serving one
+
+    marks = [patch["virag_enrolled_at"] for doc_id, patch in tiler.metadata_patches if doc_id == "doc-a"]
+    assert marks[0] == 0 and marks[-1] > 0                              # pending, then promoted
+    assert store.deletes == ["doc-a"]                                   # its partial points cleared first
+
+
+def test_a_pending_doc_is_abandoned_whatever_its_age():
+    """No age to wait out: pending and held by nobody means its enroll is over."""
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [_doc("just-failed", 1, enrolled_at=0)]
+
+    asyncio.run(_reconcile(store, tiler))
+
+    assert _enrolled_docs(store) == ["just-failed"]
+
+
 def test_reconcile_leaves_a_document_being_enrolled_to_its_enroll():
-    """Neither its points (dangling as the listing saw them) nor its stale pending mark
-    are reconcile's to touch while an enroll holds the document."""
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    """Neither its points (dangling as the listing saw them) nor its pending mark are
+    reconcile's to touch while an enroll holds the document."""
+    store, tiler = FakeStore(), FakeTiler()
     store._doc_ids = {"dangling", "enrolling"}                  # neither is in the tiler's listing
     tiler.pending_docs = [_doc("enrolling", 1, enrolled_at=0), _doc("abandoned", 1, enrolled_at=0)]
     coordinator = make_coordinator(store)
@@ -67,157 +128,120 @@ def test_reconcile_leaves_a_document_being_enrolled_to_its_enroll():
 
     async def go():
         async with other.enrolling("enrolling"):
-            await reconcile(store, coordinator, tiler, retriever, _settings(), _ENROLL)
+            await _reconcile(store, tiler, coordinator)
 
     asyncio.run(go())
 
     assert sorted(store.deletes) == ["abandoned", "dangling"]
-    assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["abandoned"]   # healed
-    assert [doc_id for doc_id, _ in tiler.metadata_patches] == ["abandoned"]
+    assert _enrolled_docs(store) == ["abandoned"]
+    assert tiler.doc_stream_calls == ["abandoned"]
 
 
-def test_reconcile_self_heals_complete_pending():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    tiler.pending_docs = [{
-        "doc_id": "doc-a", "doc_type": "PDF", "tile_count": 2, "complete": True,
-        "render_version": "rv-test", "source_url": None,
-        "metadata": {"name": "A", "virag_started_at": 1, "virag_enrolled_at": 0},
-    }]
+def test_a_document_taken_after_reconcile_looked_is_left_alone(monkeypatch):
+    """An enroll that takes the document between reconcile's look at the keys and its own
+    attempt: taking it is refused, and nothing of the document is touched."""
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [_doc("raced", 1, enrolled_at=0)]
+    coordinator = make_coordinator(store)
+    other = make_coordinator(store, valkey=coordinator.valkey)
+    listing = tiler.iter_docs
 
-    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
+    async def iter_docs(*, filters=None):
+        if filters:
+            coordinator.valkey.values["enroll:raced"] = (other.token, None)   # taken meanwhile
+        return await listing(filters=filters)
 
-    assert len(store.upserts) == 1
-    up = store.upserts[0]
-    assert up["ids"] == [point_id("doc-a", 0), point_id("doc-a", 1)]     # matches enroll's ids
-    assert set(up["payloads"][0]) == {"doc_id", "tile_num", "image_hash", "render_version"}   # as enroll writes them
-    assert tiler.metadata_patches[-1][0] == "doc-a"                     # pending promoted
-    assert tiler.metadata_patches[-1][1]["virag_enrolled_at"] > 0
-    assert up["collection"] == "c__v1"                                  # pinned to the serving one
+    tiler.iter_docs = iter_docs
+
+    asyncio.run(_reconcile(store, tiler, coordinator))
+
+    assert store.deletes == [] and store.upserts == [] and tiler.metadata_patches == []
+
+
+def test_a_document_of_a_dead_process_is_abandoned():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [_doc("orphan", 1, enrolled_at=0)]
+    coordinator = make_coordinator(store)
+    dead = make_coordinator(store, valkey=coordinator.valkey)
+    coordinator.valkey.values["enroll:orphan"] = (dead.token, None)
+    coordinator.valkey.expire(lease_key(dead))                          # it died mid-enroll
+
+    asyncio.run(_reconcile(store, tiler, coordinator))
+
+    assert _enrolled_docs(store) == ["orphan"]
 
 
 def test_self_heal_is_journaled_by_a_running_revision():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
+    store, tiler = FakeStore(), FakeTiler()
     tiler.pending_docs = [_doc("doc-a", 1, enrolled_at=0)]
     coordinator = make_coordinator(store)
 
     async def go():
         await coordinator.acquire_revision()
         await coordinator.start_journal()
-        await reconcile(store, coordinator, tiler, retriever, _settings(), _ENROLL)
+        await _reconcile(store, tiler, coordinator)
 
         return await coordinator.journal()
 
     assert asyncio.run(go()) == {"doc-a"}
 
 
-def test_reconcile_runs_only_in_the_leading_process():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    store._doc_ids = {"dangling"}
-    leader = make_coordinator(store)
-    follower = make_coordinator(store, valkey=leader.valkey)
-
-    asyncio.run(reconcile(store, leader, tiler, retriever, _settings(), _ENROLL))
-    store.deletes.clear()
-    store._doc_ids = {"dangling"}
-
-    asyncio.run(reconcile(store, follower, tiler, retriever, _settings(), _ENROLL))
-
-    assert store.deletes == []                                          # the leader's to do
-
-
-def test_reconcile_leaves_incomplete_for_reenroll():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    tiler.pending_docs = [{
-        "doc_id": "doc-b", "doc_type": "PDF", "tile_count": 0, "complete": False,
-        "render_version": "rv-test", "source_url": None, "metadata": {"name": "B"},
-    }]
-
-    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
-
-    assert store.deletes == ["doc-b"]      # partial cleared
-    assert store.upserts == []             # not re-embedded (tiler incomplete)
-
-
-def test_failed_self_heal_clears_partial_and_stays_pending():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    tiler.pending_docs = [_doc("doc-a", 2, enrolled_at=0)]
-    tiler.fail_tiles = {("doc-a", 1)}
-
-    asyncio.run(reconcile(store, make_coordinator(store), tiler, retriever, _settings(), _ENROLL))
-
-    assert store.deletes == ["doc-a", "doc-a"]                          # before, and after the failure
-    assert tiler.metadata_patches == []                                 # never promoted
-
-
-# ---------------------------------------------------------------------------
-# flat tile stream
-# ---------------------------------------------------------------------------
-
-def test_batches_cross_document_boundaries():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    docs = [_doc("a", 1), _doc("b", 2), _doc("c", 1)]
-
-    failed = asyncio.run(reembed_docs(store, tiler, retriever, docs, batch_size=2, collection="c__v2"))
-
-    assert failed == set()
-    batches = sorted([p["doc_id"], p["tile_num"]] for u in store.upserts for p in u["payloads"])
-    assert batches == [["a", 0], ["b", 0], ["b", 1], ["c", 0]]
-    assert len(store.upserts) == 2                                      # two full batches, not three
-    assert all(u["collection"] == "c__v2" for u in store.upserts)
-
-
-def test_failed_batch_is_retried_and_only_the_bad_doc_fails():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    docs = [_doc("a", 1), _doc("b", 2), _doc("c", 1)]
-    tiler.fail_tiles = {("b", 1)}                                       # shares a batch with c
-
-    failed = asyncio.run(reembed_docs(store, tiler, retriever, docs, batch_size=2))
-
-    assert failed == {"b"}
-    stored = {p["doc_id"] for u in store.upserts for p in u["payloads"]}
-    assert {"a", "c"} <= stored                                         # c recovered on retry
-
-
-def test_mark_enrolled_promotes_only_finished_docs():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    docs = [_doc("a", 2), _doc("b", 1), _doc("empty", 0)]
-    tiler.fail_tiles = {("b", 0)}
-
-    asyncio.run(reembed_docs(store, tiler, retriever, docs, batch_size=1, mark_enrolled=True))
-
-    assert sorted(doc_id for doc_id, _ in tiler.metadata_patches) == ["a", "empty"]
-
-
-def test_sync_mirrors_tiler_state_for_given_docs():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    tiler.docs = [
-        _doc("live", 1),
-        _doc("pending", 1, enrolled_at=0),                              # rolled-back enroll
-        _doc("partial", 1, complete=False),
+def test_a_doc_the_tiler_does_not_serve_only_loses_its_partial_points():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [
+        _doc("incomplete", 0, complete=False, enrolled_at=0),
+        _doc("quarantined", 1, enrolled_at=0) | {"quarantined": True},
     ]
 
-    failed = asyncio.run(sync_docs(
-        store, make_coordinator(store), tiler, retriever, {"live", "pending", "partial", "gone"},
-        batch_size=4, collection="c__v2",
-    ))
+    asyncio.run(_reconcile(store, tiler))
 
-    assert failed == set()
-    assert sorted(store.deletes) == ["gone", "live", "partial", "pending"]  # all dropped first
-    assert set(store.delete_collections) == {"c__v2"}
-    assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["live"]
+    assert sorted(store.deletes) == ["incomplete", "quarantined"]       # partial cleared
+    assert store.upserts == [] and tiler.doc_stream_calls == []         # left for a re-enroll
+    assert tiler.metadata_patches == []
 
 
-def test_sync_leaves_a_document_being_enrolled_to_its_enroll():
-    store, tiler, retriever = FakeStore(), FakeTiler(), FakeRetriever()
-    tiler.docs = [_doc("live", 1), _doc("enrolling", 1)]
+def test_self_heal_off_only_clears_partial_points():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [_doc("doc-a", 2, enrolled_at=0)]
+
+    asyncio.run(_reconcile(store, tiler, self_heal=False))
+
+    assert store.deletes == ["doc-a"]
+    assert store.upserts == [] and tiler.metadata_patches == []
+
+
+def test_a_failed_self_heal_leaves_the_doc_pending_and_goes_on():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [_doc("bad", 2, enrolled_at=0), _doc("good", 1, enrolled_at=0)]
+    tiler.fail_tiles = {("bad", 1)}                                     # its stream breaks mid-way
     coordinator = make_coordinator(store)
 
-    async def go():
-        async with coordinator.enrolling("enrolling"):
-            return await sync_docs(
-                store, coordinator, tiler, retriever, {"live", "enrolling"}, batch_size=4, collection="c__v2",
-            )
+    asyncio.run(_reconcile(store, tiler, coordinator))
 
-    assert asyncio.run(go()) == set()
-    assert store.deletes == ["live"]
-    assert [p["doc_id"] for u in store.upserts for p in u["payloads"]] == ["live"]
+    assert store.deletes == ["bad", "bad", "good"]                      # bad: cleared, then rolled back
+    assert all(patch["virag_enrolled_at"] == 0 for doc_id, patch in tiler.metadata_patches if doc_id == "bad")
+    assert _enrolled_docs(store) == ["good"]                            # the pass went on
+    assert not any(name.startswith("enroll:") for name in coordinator.valkey.values)   # both released
+
+
+def test_a_refused_stream_fails_only_its_doc():
+    store, tiler = FakeStore(), FakeTiler()
+    tiler.pending_docs = [_doc("gone", 1, enrolled_at=0), _doc("good", 1, enrolled_at=0)]
+    stream = tiler.doc_stream
+
+    def doc_stream(doc_id):
+        if doc_id == "gone":
+            return _refused()
+
+        return stream(doc_id)
+
+    async def _refused():
+        raise ApiError(status_code=503, message="Upstream failed", details={"upstream_status": 404})
+        yield  # pragma: no cover - makes this an async generator
+
+    tiler.doc_stream = doc_stream
+
+    asyncio.run(_reconcile(store, tiler))
+
+    assert _enrolled_docs(store) == ["good"]
+    assert store.deletes == ["good"]                                    # nothing of `gone` was begun

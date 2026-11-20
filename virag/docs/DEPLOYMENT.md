@@ -131,11 +131,11 @@ proxy) in front of virag wherever its port is reachable beyond a trusted network
 ## Tiler metadata schema
 
 virag stamps enroll-lifecycle markers on the tiler's indexed metadata and reconcile
-searches them, so the tiler must declare **three** indexed fields:
-`name` (text), `virag_started_at` (number), and `virag_enrolled_at` (number). The Compose
+searches them, so the tiler must declare **two** indexed fields:
+`name` (text) and `virag_enrolled_at` (number). The Compose
 file mounts `deploy/service/tiler_metadata_schema.yaml` into the tiler at
 `/config/metadata_schema.yaml` for exactly this. At startup virag reads the tiler's
-`GET /schema/metadata` and **refuses to boot** (fatal) if any of the three is missing or
+`GET /schema/metadata` and **refuses to boot** (fatal) if either is missing or
 wrong-typed — so keep this schema in sync with the tiler.
 
 ## Image
@@ -190,7 +190,7 @@ caps (`*_MAX_CONCURRENCY`) multiply with the process count — size them accordi
   (a warning for an outage, an error for a refusal) when a chat fell back to the
   retriever's order, `integrity:` warnings when a tile's
   hash doesn't match its Qdrant payload, and `reconcile:` lines when a pass deletes
-  dangling or quarantined docs' Qdrant points, clears stale-pending enrolls, or self-heals
+  dangling or quarantined docs' Qdrant points, finds abandoned enrolls, or self-heals
   a doc.
 
 ## Startup ordering & the retriever model

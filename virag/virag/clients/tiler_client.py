@@ -70,6 +70,10 @@ class TilerService(HttpService):
         return f"{self.base_url}/doc/{doc_id}"
 
 
+    def doc_tiles_route(self, doc_id: str) -> str:
+        return f"{self.base_url}/doc/{doc_id}/tiles"
+
+
     def metadata_route(self, doc_id: str) -> str:
         return f"{self.base_url}/doc/{doc_id}/metadata"
 
@@ -121,7 +125,7 @@ class TilerService(HttpService):
         url: str | None = None,
         metadata: dict | None = None,
     ):
-        """Stream a stored ingest as NDJSON events (begin, tile*, committed | error).
+        """Ingest a document and stream it as NDJSON events (begin, tile*, committed | error).
 
         Because tiles arrive as they render, the per-read timeout — not a single
         whole-request deadline — bounds each hop, so an arbitrarily long render never
@@ -142,17 +146,22 @@ class TilerService(HttpService):
             if not response.is_success:
                 raise await self._refusal(response)
 
-            try:
-                async for line in response.aiter_lines():
-                    if line.strip():
-                        yield orjson.loads(line)
+            async for event in self._events(response, action="the ingest"):
+                yield event
 
-            except httpx2.RequestError as e:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Lost {self.tile_stream_route} mid-stream during the ingest",
-                    details={"error": repr(e)},
-                ) from e
+
+    async def doc_stream(self, doc_id: str):
+        """Stream a document the tiler holds, as the ingest of its bytes would: the same
+        events, its tiles regenerated. A doc that is unknown, still being ingested or
+        quarantined fails before the stream begins."""
+        async with self._stream(
+            "GET",
+            self.doc_tiles_route(doc_id),
+            action="the tile stream",
+            retry=False,
+        ) as response:
+            async for event in self._events(response, action="the tile stream"):
+                yield event
 
 
     async def get_tile(
@@ -300,6 +309,22 @@ class TilerService(HttpService):
                 break
 
         return items
+
+
+    @staticmethod
+    async def _events(response: httpx2.Response, *, action: str):
+        """The events of an NDJSON tile stream, one per line."""
+        try:
+            async for line in response.aiter_lines():
+                if line.strip():
+                    yield orjson.loads(line)
+
+        except httpx2.RequestError as e:
+            raise ApiError(
+                status_code=503,
+                message=f"Lost {response.url} mid-stream during {action}",
+                details={"error": repr(e)},
+            ) from e
 
 
     @staticmethod

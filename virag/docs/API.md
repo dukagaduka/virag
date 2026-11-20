@@ -138,8 +138,9 @@ and upserts tiles in batches as they arrive — it never buffers the whole docum
 memory, so arbitrarily large documents (e.g. a 920-page PDF) enroll fully without hitting
 a render timeout. The request/response contract above is unchanged. On any failure
 mid-enroll the document's partial points are rolled back out of Qdrant. A document the
-tiler already held stays there, marked pending, so [reconcile](ARCHITECTURE.md) heals it
-later; a new one the tiler drops itself, since its ingest never committed. Enrolling
+tiler already held stays there, marked pending, and the next
+[reconcile](ARCHITECTURE.md) pass enrolls it again from the tiler's stored tiles; a new
+one the tiler drops itself, since its ingest never committed. Enrolling
 bytes the tiler already holds does not render them again; the `metadata` sent with the
 enroll is merged into the document's metadata in the tiler.
 
@@ -218,7 +219,7 @@ process (it is kept in Valkey):
 
 `state` is `idle` (no job yet), `running` (`phase`: `building`, then `syncing` after the
 swap), `succeeded`, `degraded` (swapped, but some journaled docs failed to sync — listed
-in `sync_failed_doc_ids`; re-enroll them), or `failed` (`error`, and `failed_doc_ids`
+in `sync_failed_doc_ids`; they stay pending, and reconcile enrolls them again), or `failed` (`error`, and `failed_doc_ids`
 when the alias was not swapped). A job whose process died reads as `failed` with
 `error: "owner lost (<host>/<pid>)"`; `POST /revision` again.
 

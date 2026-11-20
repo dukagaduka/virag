@@ -58,11 +58,10 @@ interval — repairing partial/orphaned enrolls and propagating tiler deletes. S
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `VIRAG_SELF_HEAL` | no | `true` | On reconcile, re-embed a stale-pending doc from the tiler when the tiler doc is complete (else just drop its partial points and leave it for re-enroll). |
+| `VIRAG_SELF_HEAL` | no | `true` | On reconcile, enroll an abandoned pending doc again from the tiler's stored tiles when the tiler doc is complete and not quarantined (else just drop its partial points and leave it for re-enroll). |
 | `VIRAG_RECONCILE_INTERVAL_SEC` | no | `300` | Seconds between periodic reconcile passes (≥ 0). `0` disables the loop — the one-shot startup pass still runs. |
-| `VIRAG_PENDING_TTL_SEC` | no | `3600` | A pending enroll older than this is treated as crashed/partial (≥ 1). Must exceed the longest enroll, or an in-flight enroll could be swept. Also the longest a revision/rollback waits after its swap for enrolls still writing into the old collection. |
 
-## Render version
+## Render version & revision
 
 Chat answers `409 RENDER_VERSION_MISMATCH` for a tile the tiler renders by another
 `render_version` than it was embedded from. See [ARCHITECTURE.md](ARCHITECTURE.md) §9.
@@ -70,6 +69,7 @@ Chat answers `409 RENDER_VERSION_MISMATCH` for a tile the tiler renders by anoth
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `VIRAG_REVISION_ON_RENDER_MISMATCH` | no | `false` | At startup, when the collection was embedded from another `render_version` than the tiler's, start `/revision` right away. `false` → log a warning and wait for `POST /revision`. |
+| `VIRAG_REVISION_DRAIN_TIMEOUT_SEC` | no | `3600` | The longest a revision / rollback waits, after its alias swap, for the enrolls still writing into the replaced collection (≥ 1). An enroll outliving it finishes in the replaced collection and needs a re-enroll. |
 
 ## Coordination (Valkey)
 
@@ -175,7 +175,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 | `TILER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `TILER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the tiler (≥ 1). |
 | `TILER_MAX_RETRIES` | no | `3` | Retries for a transient failure on idempotent calls (≥ 0); an ingest is never replayed. |
-| `TILER_MAX_CONCURRENCY` | no | `32` | Max concurrent **bulk** tile regenerations — self-heal, revision, rollback sync (≥ 0; `0` = unlimited; must be ≤ `TILER_MAX_CONNECTIONS`). Chat RAG tile fetches bypass it. Size it to the tiler's parallel render capacity; it also sizes how many re-embed batches are kept in flight. |
+| `TILER_MAX_CONCURRENCY` | no | `32` | Max concurrent **bulk** tile regenerations — a revision's build (≥ 0; `0` = unlimited; must be ≤ `TILER_MAX_CONNECTIONS`). Chat RAG tile fetches bypass it. Size it to the tiler's parallel render capacity; it also sizes how many re-embed batches are kept in flight. |
 
 ## Upstream VLM (OpenAI-compatible; external)
 

@@ -8,6 +8,7 @@ the real one, over an in-memory Valkey."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import time
 from contextlib import asynccontextmanager
@@ -328,6 +329,7 @@ class FakeTiler:
         self._result = result
         self._info = info or {"volume_id": "vol-test", "render_version": "rv-test"}
         self.get_tile_calls: list[tuple] = []
+        self.doc_stream_calls: list[str] = []
         self.existing: set[str] = set()
         self.metadata_patches: list[tuple] = []
         self.doc_metadata: dict[str, dict] = {}
@@ -336,7 +338,6 @@ class FakeTiler:
             "version": 1,
             "fields": [
                 {"key": "name", "type": "text"},
-                {"key": "virag_started_at", "type": "number"},
                 {"key": "virag_enrolled_at", "type": "number"},
             ],
         }
@@ -355,6 +356,24 @@ class FakeTiler:
         yield {"event": "committed", "doc_id": res.doc_id, "doc_type": res.doc_type,
                "source_url": res.source_url, "render_version": res.render_version,
                "height": res.height, "tile_count": res.tile_count, "result": "rendered"}
+
+    async def doc_stream(self, doc_id):
+        """A stored doc (one of `docs` / `pending_docs`) as its ingest's events; a tile in
+        `fail_tiles` breaks the stream there."""
+        self.doc_stream_calls.append(doc_id)
+        doc = {d["doc_id"]: d for d in [*self.docs, *self.pending_docs]}[doc_id]
+        identity = {"doc_id": doc_id, "doc_type": doc["doc_type"], "source_url": None,
+                    "render_version": self._info["render_version"]}
+
+        yield {"event": "begin", **identity}
+        for n in range(doc["tile_count"]):
+            if (doc_id, n) in self.fail_tiles:
+                raise RuntimeError(f"tile {doc_id}:{n} unavailable")
+            yield {"event": "tile", "tile_num": n, "width": 875, "height": 1024,
+                   "image_hash": tile_hash(doc_id, n),
+                   "data": base64.b64encode(tile_bytes(doc_id, n)).decode("ascii")}
+        yield {"event": "committed", **identity, "height": doc["tile_count"] * 1024,
+               "tile_count": doc["tile_count"], "result": "idempotent"}
 
     async def get_tile(self, doc_id, tile_num, *, render_version=None, bulk=False) -> bytes:
         self.get_tile_calls.append((doc_id, tile_num))
@@ -471,7 +490,7 @@ def make_settings(**overrides) -> Settings:
             connect_timeout_sec=10, max_connections=100, max_concurrency=0, max_retries=0,
         ),
         enroll_settings=overrides.pop("enroll_settings", EnrollSettings(batch_size=16)),
-        reconcile_settings=ReconcileSettings(self_heal=True, interval_sec=0, pending_ttl_sec=3600),
+        reconcile_settings=ReconcileSettings(self_heal=True, interval_sec=0),
     )
 
 

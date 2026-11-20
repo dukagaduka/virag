@@ -170,8 +170,8 @@ the rules that span virag processes live in the Coordinator (§10).
   startup fails. A fresh collection is bound on first run (`tiler_volume_id` + the
   tiler's `render_version`).
 - **Metadata-schema guard** (`enforce_metadata_schema`) — reconcile searches the tiler's
-  indexed metadata, so the tiler must declare the three fields virag depends on:
-  `name` (text), `virag_started_at` (number), `virag_enrolled_at` (number). A missing or
+  indexed metadata, so the tiler must declare the two fields virag depends on:
+  `name` (text), `virag_enrolled_at` (number). A missing or
   wrong-typed field is **fatal** (`BindingError`) — the tiler is misconfigured. See
   §9.
 - **Lease** — the process takes its lease in Valkey and starts the heartbeat that
@@ -224,12 +224,12 @@ documents enroll fully.
   second enroll of the same document answers `409 ENROLL_IN_PROGRESS` and touches
   nothing; reconcile and a revision's sync leave a held document to its enroll. So the
   points of a document are written, and rolled back, by one request only.
-- **Pending markers.** Having taken the document, the enroll stamps the tiler's indexed
-  metadata with `virag_started_at` (epoch at start) and `virag_enrolled_at` (`0` while
-  pending) and drops the document's earlier points; on success it sets
-  `virag_enrolled_at` to the epoch. On any failure after the pending mark the partial
-  points are rolled back out of Qdrant; a doc the tiler held before stays in place and
-  pending for reconcile to heal, a new one the tiler drops with its ingest. An enroll
+- **The pending marker.** Having taken the document, the enroll stamps the tiler's indexed
+  metadata with `virag_enrolled_at = 0` (pending) and drops the document's earlier
+  points; on success it sets `virag_enrolled_at` to the epoch. On any failure after the
+  pending mark the partial points are rolled back out of Qdrant; a doc the tiler held
+  before stays in place and pending — and, no enroll holding it any more, is enrolled
+  again by the next reconcile pass; a new one the tiler drops with its ingest. An enroll
   that could not even mark the document pending leaves its points as they were. Before
   the rollback delete the enroll checks the document is still its own (fencing): a
   process that stalled past its lease may find another enroll writing it already.
@@ -259,15 +259,24 @@ the one process leading it (§10). Two passes:
    quarantined go too: its tiles answer `410`, so they would only crowd live hits out
    of `top_k`; a re-enroll brings the points back. A doc being enrolled anywhere in the
    cluster is left to its enroll: the keys are read last, right before the delete.
-2. *Clear stale pending.* Find docs with `virag_enrolled_at == 0` **and**
-   `virag_started_at < now − VIRAG_PENDING_TTL_SEC` (the TTL gate skips in-flight
-   enrolls), and for each — held like an enroll (`enroll:<doc_id>`; one that is held
-   already is skipped) — delete its partial points, and — if `VIRAG_SELF_HEAL` is on and
-   the tiler doc is complete and not quarantined — re-embed the doc from the tiler to
-   restore it. Otherwise it is left for a re-enroll.
+2. *Finish abandoned enrolls.* A doc that is pending (`virag_enrolled_at == 0`) while
+   nobody is enrolling it (no `enroll:<doc_id>` of a live process) was left by an
+   enroll that failed or died — no age to wait out. If `VIRAG_SELF_HEAL` is on and the
+   tiler doc is complete and not quarantined, it is **enrolled again** from the tiler's
+   stored tiles: the same `Enroller`, fed the tiler's `GET /doc/{id}/tiles` stream
+   instead of an ingest (`enroll_stored`). Otherwise its partial points are dropped
+   (`Enroller.drop`) and it is left for a re-enroll. Docs are taken one at a time, each
+   under its key; one that fails stays pending for the next pass.
 
-**Re-embed stream.** Self-heal, revision and rollback sync share one re-embed
-(`reembed_docs`): every `(doc_id, tile_num)` of the docs is cut into batches of
+**One writer.** A document's points in the serving collection are written and dropped
+only through the `Enroller`, under the document's key: by `/enroll`, by reconcile's
+second pass, and by a revision's sync after its swap. The exceptions hold no key and
+only look at the keys: reconcile's first pass, which deletes points of documents the
+tiler no longer serves, and a revision's build, which writes a collection nobody reads
+yet.
+
+**The flat re-embed** (`RevisionManager.reembed`) is how a revision builds its
+collection: every `(doc_id, tile_num)` of the docs is cut into batches of
 `VIRAG_ENROLL_BATCH_SIZE` *across document boundaries*, each batch fetches its tiles
 concurrently (bulk, capped by `TILER_MAX_CONCURRENCY`), embeds them in one bulk retriever
 call and upserts once; a window of batches derived from the tiler cap stays in flight. A
@@ -282,11 +291,12 @@ if docs still fail; enforce `Qdrant ⊆ Tiler` on it; abort likewise if the tile
 `render_version` changed meanwhile, else stamp it on the build; check the job is still
 this process's (fencing: a process whose lease expired may have been replaced); swap the
 alias, keeping the replaced collection (stamped `retired_at`) as the rollback target;
-read the journal; wait up to `VIRAG_PENDING_TTL_SEC` for the enrolls in flight at that
-moment (one of them may still be writing into the old collection); sync the journaled
-docs into the new collection (drop, then re-embed if the tiler holds them complete and
-enrolled; a doc being enrolled is left to its enroll, which writes it there whole);
-enforce the invariant again. New writes are never mirrored into the build — the journal
+read the journal; wait up to `VIRAG_REVISION_DRAIN_TIMEOUT_SEC` for the enrolls in
+flight at that moment (one of them may still be writing into the old collection); sync
+the journaled docs into the new collection — each through the `Enroller`: enrolled
+again from its stored tiles if the tiler holds it complete and enrolled, its points
+dropped otherwise; a doc being enrolled is left to its enroll, which writes it there
+whole; enforce the invariant again. New writes are never mirrored into the build — the journal
 of documents enrolled meanwhile (by `/enroll` or self-heal, in any process; including
 those already in flight at the start) plus the post-swap sync closes the gap. Use it after a retriever-model change and after a tiler render change. The
 request may land on any process: that process runs the job, and every process answers
@@ -391,9 +401,9 @@ virag/
   settings.py        # pydantic-settings sections: every env var, its default and bounds
   binding.py         # the collection ↔ tiler volume binding + tiler metadata-schema guard
   coordination.py    # Coordinator: leases, documents being enrolled + journal, drain, the revision job, the reconcile lead
-  enroll.py          # Enroller: a tile stream of the tiler → a document's points (take, pending, embed + upsert, promote / roll back)
-  reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic) and the shared re-embed stream
-  revision.py        # RevisionManager: background revision / rollback job, journal sync
+  enroll.py          # Enroller: a tile stream of the tiler (an ingest, or a stored doc) → a document's points; the one writer
+  reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic): the invariant, abandoned enrolls
+  revision.py        # RevisionManager: background revision / rollback job, the flat re-embed of its build, journal sync
   errors.py          # ApiError + the uniform {"error": {...}} envelope
   responses.py       # OrjsonResponse, the app-wide default response class
   utils.py           # non-domain helpers (error_body, gather, cancel, chunked, unavailable_as_503)

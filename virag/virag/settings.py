@@ -185,16 +185,16 @@ class ReconcileSettings(_Section):
 
     self_heal: bool = True
     interval_sec: int = Field(300, ge=0, validation_alias="VIRAG_RECONCILE_INTERVAL_SEC")  # 0 = startup only
-    pending_ttl_sec: int = Field(3600, ge=1)    # must exceed the longest enroll
 
 
 class RevisionSettings(_Section):
     """What virag does when it starts against a collection embedded from another
-    render_version than the tiler's."""
+    render_version than the tiler's, and how long a job waits after its alias swap."""
 
     model_config = SettingsConfigDict(env_prefix="VIRAG_")
 
     revision_on_render_mismatch: bool = False   # on → revise at startup; off → log, wait for POST /revision
+    revision_drain_timeout_sec: int = Field(3600, ge=1)  # the wait for enrolls still writing the replaced collection
 
 
 class CoordinationSettings(_Section):

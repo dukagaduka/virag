@@ -163,14 +163,15 @@ async def lifespan(app: FastAPI):
             coordinator,
             tiler,
             retriever,
+            enroller,
             settings.enroll_settings,
-            settings.reconcile_settings,
+            settings.revision_settings,
         )
         stack.push_async_callback(revision.close)
 
         # Repair any partial/orphaned enrolls left by an earlier crash before serving
         # (in the process leading reconcile).
-        await reconcile(store, coordinator, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
+        await reconcile(store, coordinator, tiler, enroller, settings.reconcile_settings)
 
         # A collection embedded from another render_version answers chat with
         # RENDER_VERSION_MISMATCH until rebuilt; with the flag on it is rebuilt right away.
@@ -178,7 +179,7 @@ async def lifespan(app: FastAPI):
 
         # Registered last, so it is cancelled first — before the clients it uses close.
         reconcile_task = asyncio.create_task(
-            run_periodic(store, coordinator, tiler, retriever, settings.reconcile_settings, settings.enroll_settings)
+            run_periodic(store, coordinator, tiler, enroller, settings.reconcile_settings)
         )
         stack.push_async_callback(cancel, reconcile_task)
 

@@ -352,6 +352,31 @@ def test_tiler_stream_yields_events():
     assert _run(consume()) == [{"event": "begin"}, {"event": "committed"}]
 
 
+def test_tiler_doc_stream_yields_the_events_of_a_stored_doc():
+    tiler = TilerService("http://tiler", max_retries=3, **_HTTP)
+    seen = _mock(tiler, lambda req, n: httpx2.Response(200, content=b'{"event":"begin"}\n{"event":"committed"}\n'))
+
+    async def consume():
+        return [event async for event in tiler.doc_stream("abc")]
+
+    assert _run(consume()) == [{"event": "begin"}, {"event": "committed"}]
+    assert [(req.method, str(req.url)) for req in seen] == [("GET", "http://tiler/doc/abc/tiles")]
+
+
+def test_tiler_doc_stream_fails_before_it_begins_for_a_doc_the_tiler_does_not_serve():
+    tiler = TilerService("http://tiler", max_retries=3, **_HTTP)
+    seen = _mock(tiler, lambda req, n: httpx2.Response(410, json={"error": {"code": "QUARANTINED", "message": "no"}}))
+
+    async def consume():
+        return [event async for event in tiler.doc_stream("abc")]
+
+    with pytest.raises(ApiError) as exc:
+        _run(consume())
+
+    assert exc.value.details["upstream_status"] == 410
+    assert len(seen) == 1                                               # never replayed
+
+
 def test_tiler_bulk_get_tile_is_capped_interactive_is_not():
     tiler = TilerService("http://tiler", max_retries=0, **{**_HTTP, "max_concurrency": 2})
     in_flight = {"now": 0, "peak": 0}
