@@ -71,6 +71,7 @@ model.
 tiler/            the service package
   main.py         app + lifespan (guard → indexes → pools → revision gate), routes
   ingest.py       Ingester: a document's way into the store, and out of it
+  events.py       the events of a tile stream (Begin, Tile, Committed) and their NDJSON lines
   tiles.py        Tiles: a stored doc's tiles by its id, rendered from its blob; the tile cache
   revision.py     serving gate + re-render of docs from another render_version
   config.py       env, geometry/pixel tiers, render_version

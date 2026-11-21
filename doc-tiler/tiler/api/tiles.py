@@ -28,7 +28,7 @@ async def stream_document_tiles(request: Request, doc_id: str) -> StreamingRespo
     """
     state = request.app.state
 
-    return await ndjson_response(state.tiles.stream(doc_id), tile_width=state.settings.tile_width)
+    return await ndjson_response(state.tiles.stream(doc_id))
 
 
 @router.get(

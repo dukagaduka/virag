@@ -22,21 +22,24 @@ class EncodedImage:
 
 @dataclass(frozen=True)
 class RenderedTile:
-    """One finished tile: its place in the document image, its bytes and content hash."""
+    """One finished tile: its place in the document image, its size, its bytes and
+    content hash."""
 
     tile_num: int
     offset: int
+    width: int  # always TILE_WIDTH
     height: int
     jpeg: bytes
     image_hash: str
 
 
     @classmethod
-    def build(cls, tile: Tile, image: EncodedImage) -> RenderedTile:
+    def build(cls, tile: Tile, image: EncodedImage, width: int) -> RenderedTile:
         """Hash the encoded image of `tile` and wrap the two as a finished tile."""
         return cls(
             tile_num=tile.num,
             offset=tile.offset,
+            width=width,
             height=image.height,
             jpeg=image.jpeg,
             image_hash=sha256_hex(image.jpeg),

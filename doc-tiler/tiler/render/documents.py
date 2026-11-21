@@ -107,7 +107,7 @@ class Document(ABC):
                 for tile, image in zip(batch, encoded):
                     self.rendered += 1
 
-                    yield RenderedTile.build(tile, image)
+                    yield RenderedTile.build(tile, image, self.params.tile_width)
 
         finally:
             for _, task in running:

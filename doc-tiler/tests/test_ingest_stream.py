@@ -11,6 +11,7 @@ import anyio
 import pytest
 from conftest import base_env, pdf_form, running_app, make_pdf
 
+from tiler.events import Begin, Committed, Tile
 from tiler.models import DocType
 
 
@@ -159,7 +160,7 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
     doc_id = hashlib.sha256(sample_pdf).hexdigest()
     stream = await _stream(state, sample_pdf)
 
-    assert (await anext(stream))["event"] == "begin"
+    assert isinstance(await anext(stream), Begin)
 
     # The row is there, so a consumer can refer to the doc; nothing of it is served yet.
     assert (await state.store.get_doc(doc_id)).complete is False
@@ -182,8 +183,8 @@ async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):
     assert (gone.status_code, gone.json()["error"]["code"]) == (409, "INGEST_IN_PROGRESS")
     assert len(_spooled(state)) == 1                                     # the latecomer's upload is gone
 
-    events = [event async for event in stream]
-    assert events[-1]["event"] == "committed"
+    rest = [event async for event in stream]
+    assert isinstance(rest[-1], Committed)
 
     assert (await state.store.get_doc(doc_id)).complete is True
     assert state.blobs.exists(doc_id) and _spooled(state) == []            # moved into the store
@@ -212,7 +213,7 @@ async def test_an_abandoned_ingest_leaves_nothing(client):
     stream = await _stream(state, pdf)
 
     async for event in stream:
-        if event["event"] == "tile":
+        if isinstance(event, Tile):
             break
 
     await stream.aclose()                                              # the client went away
@@ -234,7 +235,7 @@ async def test_a_cancelled_ingest_leaves_nothing(client):
 
     with anyio.CancelScope() as scope:
         async for event in stream:
-            if event["event"] == "tile":
+            if isinstance(event, Tile):
                 scope.cancel()
 
     assert scope.cancelled_caught

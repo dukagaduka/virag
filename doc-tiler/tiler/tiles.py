@@ -3,7 +3,7 @@
 Tiles are never persisted. The store keeps a tile's place in the document image
 (`tiles.offset`, `tiles.height`) and the hash of its bytes; the blob and a deterministic
 render give the bytes back — one tile at a time, or the whole document as the event
-stream its ingest produced. A tile that does not hash to what was stored is refused
+stream its ingest produced (`events.py`). A tile that does not hash to what was stored is refused
 (RENDER_MISMATCH).
 """
 
@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import logging
 from contextlib import aclosing
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
-from . import metrics
+from . import events, metrics
 from .config import Settings
 from .errors import bad_request, conflict, gone, not_found
 from .hashing import sha256_hex
@@ -67,26 +67,22 @@ class Tiles:
         return jpeg, tile_row, row
 
 
-    async def stream(self, doc_id: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream(self, doc_id: str) -> AsyncIterator[events.Event]:
         """The events of a doc the store serves, by its id: what the ingest of its bytes
         would emit, its tiles rendered again. Nothing of the doc changes."""
         row = await self._served(doc_id)
 
-        async with aclosing(self.replay(row)) as events:
-            async for event in events:
+        async with aclosing(self.replay(row)) as replayed:
+            async for event in replayed:
                 yield event
 
 
-    async def replay(self, row: DocRow, *, render: bool = True) -> AsyncIterator[dict[str, Any]]:
-        """A stored doc as an ingest's events: `begin`, its tiles rendered again (unless
-        `render` is off), then `committed`."""
-        yield {
-            "event": "begin",
-            "doc_id": row.doc_id,
-            "doc_type": row.doc_type,
-            "source_url": row.source_url,
-            "render_version": row.render_version,
-        }
+    async def replay(self, row: DocRow, *, render: bool = True) -> AsyncIterator[events.Event]:
+        """A stored doc as an ingest's events: `Begin`, its tiles rendered again (unless
+        `render` is off), then `Committed`."""
+        begin = events.Begin(row.doc_id, row.doc_type, row.source_url, row.render_version)
+
+        yield begin
 
         if render:
             stored = {tile_row.tile_num: tile_row for tile_row in await self.store.get_tiles(row.doc_id)}
@@ -96,18 +92,9 @@ class Tiles:
                 async for tile in rendered:
                     self._verify(row, stored[tile.tile_num], tile.image_hash)
 
-                    yield {"event": "tile", "tile": tile}
+                    yield events.Tile(tile)
 
-        yield {
-            "event": "committed",
-            "doc_id": row.doc_id,
-            "doc_type": row.doc_type,
-            "source_url": row.source_url,
-            "render_version": row.render_version,
-            "height": row.height,
-            "tile_count": row.tile_count,
-            "result": "idempotent",
-        }
+        yield begin.committed(height=row.height, tile_count=row.tile_count, result="idempotent")
 
 
     async def forget(self, doc_id: str) -> None:

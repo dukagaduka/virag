@@ -3,17 +3,16 @@ the OpenAPI schema, the NDJSON response of a tile stream."""
 
 from __future__ import annotations
 
-import base64
 import hmac
 import logging
 from contextlib import aclosing
 from typing import Any, AsyncIterator
 
-import orjson
 from fastapi import Request, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .. import events
 from ..errors import ApiError, not_ready, unauthorized
 
 log = logging.getLogger("tiler.api")
@@ -64,45 +63,31 @@ def require_serving(request: Request) -> None:
         )
 
 
-async def ndjson_response(events: AsyncIterator[dict[str, Any]], *, tile_width: int) -> StreamingResponse:
-    """A document's events (`begin`, a `tile` per tile, `committed`) as an NDJSON
-    response, each tile with its bytes.
+async def ndjson_response(stream: AsyncIterator[events.Event]) -> StreamingResponse:
+    """A document's tile stream (`Begin`, a `Tile` per tile, `Committed`) as an NDJSON
+    response.
 
     The first event is awaited before the response starts, so whatever fails up to it
     keeps its HTTP status. From then on the response is already 200 and a failure goes
-    in-band, as an `error` event; the absence of `committed` is the client's signal to
+    in-band, as an `Error` event; the absence of `committed` is the client's signal to
     roll back.
     """
-    first = await anext(events)
-
-    def line(event: dict[str, Any]) -> bytes:
-        if event["event"] == "tile":
-            tile = event["tile"]
-            event = {
-                "event": "tile",
-                "tile_num": tile.tile_num,
-                "width": tile_width,  # always TILE_WIDTH
-                "height": tile.height,
-                "image_hash": tile.image_hash,
-                "data": base64.b64encode(tile.jpeg).decode("ascii"),
-            }
-
-        return orjson.dumps(event) + b"\n"
+    first = await anext(stream)
 
     async def lines() -> AsyncIterator[bytes]:
         try:
             # Closed with the response: a client that goes away ends the work at once.
-            async with aclosing(events):
-                yield line(first)
+            async with aclosing(stream):
+                yield first.line()
 
-                async for event in events:
-                    yield line(event)
+                async for event in stream:
+                    yield event.line()
 
         except ApiError as exc:
-            yield line({"event": "error", "code": exc.code, "message": exc.message})
+            yield events.Error(exc.code, exc.message).line()
 
         except Exception as exc:  # noqa: BLE001 - the response is already 200; report in-band
             log.exception("tile stream crashed")
-            yield line({"event": "error", "code": "INTERNAL_ERROR", "message": repr(exc)})
+            yield events.Error("INTERNAL_ERROR", repr(exc)).line()
 
     return StreamingResponse(lines(), media_type="application/x-ndjson")

@@ -167,6 +167,7 @@ async def test_second_revision_is_refused_while_one_runs(client, sample_pdf):
 
 async def test_an_abandoned_reingest_leaves_a_quarantined_doc_as_it_was(tmp_path):
     """Nothing of a stored doc changes before an ingest of its bytes commits."""
+    from tiler.events import Begin
     from tiler.models import DocType
 
     env = base_env(tmp_path)
@@ -183,7 +184,7 @@ async def test_an_abandoned_reingest_leaves_a_quarantined_doc_as_it_was(tmp_path
         stream = state.ingester.ingest_stream(
             doc_type=DocType.IMG, upload=await state.blobs.spool(png), url=None, metadata=None
         )
-        assert (await anext(stream))["event"] == "begin"
+        assert isinstance(await anext(stream), Begin)
         await stream.aclose()                                           # abandoned before it commits
 
         assert await state.store.get_doc(doc_id) == before                # still there, still quarantined

@@ -563,6 +563,7 @@ tiler/
   __init__.py        # routes sqlite3 → pysqlite3 (STAT4) before aiosqlite loads; __version__
   main.py            # app, lifespan (wires the components below: guard, DB, schema+index creation, pools, revision gate), routes
   ingest.py          # Ingester: a document's way into the store (spool, render, one commit) and out of it
+  events.py          # what a tile stream consists of: Begin, Tile, Committed (Error on the wire); an event's NDJSON line
   tiles.py           # Tiles: a stored doc's tiles by its id, rendered from its blob (one tile, or its event stream); the tile cache
   capture.py         # URL capture: SSRF policy + guard proxy + MHTML snapshot
   revision.py        # serving gate + the job that brings stored docs to the current render_version

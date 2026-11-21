@@ -1,6 +1,7 @@
 """Ingest: a document's way into the store, and out of it.
 
-An ingest is a stream of events — `begin`, a `tile` per tile, then `committed`:
+An ingest is a stream of events (`events.py`) — `Begin`, a `Tile` per tile, then
+`Committed`:
 
   1. The upload waits in `.incoming` while it renders (a URL is captured into one
      first); its sha256 is the doc_id.
@@ -24,7 +25,7 @@ from typing import Any, AsyncIterator
 
 import anyio
 
-from . import media, metrics
+from . import events, media, metrics
 from .capture import UrlCapture
 from .config import Settings
 from .errors import ApiError, bad_request, conflict
@@ -70,24 +71,25 @@ class Ingester:
         upload: Incoming | None,
         url: str | None,
         metadata: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        """Ingest a document into the store and return its summary (no tile bytes).
+    ) -> events.Committed:
+        """Ingest a document into the store and return its summary — the event its
+        stream ends with.
 
         Runs the same pipeline as `ingest_stream`, only without emitting the tiles: bytes
         the store already serves return at once instead of being replayed.
         """
-        summary = None
+        committed = None
 
         async for event in self._ingest(
             doc_type=doc_type, upload=upload, url=url, metadata=metadata, replay=False
         ):
-            if event["event"] == "committed":
-                summary = {key: value for key, value in event.items() if key != "event"}
+            if isinstance(event, events.Committed):
+                committed = event
 
-        if summary is None:  # pragma: no cover
+        if committed is None:  # pragma: no cover
             raise RuntimeError("ingest finished without a committed event")
 
-        return summary
+        return committed
 
 
     def ingest_stream(
@@ -97,9 +99,9 @@ class Ingester:
         upload: Incoming | None,
         url: str | None,
         metadata: dict[str, Any] | None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """Ingest a document as a stream of events: `begin`, a `tile` per tile (carrying
-        its `RenderedTile`), then `committed`. Failures raise."""
+    ) -> AsyncIterator[events.Event]:
+        """Ingest a document as a stream of events: `Begin`, a `Tile` per tile, then
+        `Committed`. Failures raise."""
         return self._ingest(doc_type=doc_type, upload=upload, url=url, metadata=metadata, replay=True)
 
 
@@ -128,12 +130,12 @@ class Ingester:
         url: str | None,
         metadata: dict[str, Any] | None,
         replay: bool,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """The ingest pipeline: `begin`, `tile` events carrying a `RenderedTile`, `committed`.
+    ) -> AsyncIterator[events.Event]:
+        """The ingest pipeline: `Begin`, a `Tile` per tile, `Committed`.
 
         The upload (taken over here) waits in `.incoming` while it renders. Bytes the
         store already holds and serves are not rendered again: their tiles are replayed
-        when `replay` is set, and `committed` follows at once otherwise. Whatever ends
+        when `replay` is set, and `Committed` follows at once otherwise. Whatever ends
         the ingest, the spooled upload is gone with it. Failures raise.
         """
         source_url: str | None = None
@@ -160,14 +162,14 @@ class Ingester:
             # Same hash, same bytes: a doc that is stored and servable is not rendered again.
             if existing is not None and existing.servable(self.render_version):
                 metrics.INGESTS.labels(doc_type=effective_type, result="idempotent").inc()
-                events = self.tiles.replay(existing, render=replay)
+                stream = self.tiles.replay(existing, render=replay)
 
             else:
-                events = self._render_into_store(upload, effective_type, source_url, mime, metadata, existing)
+                stream = self._render_into_store(upload, effective_type, source_url, mime, metadata, existing)
 
             try:
-                async with aclosing(events):
-                    async for event in events:
+                async with aclosing(stream):
+                    async for event in stream:
                         yield event
 
             except ApiError as exc:
@@ -187,8 +189,8 @@ class Ingester:
         mime: str,
         metadata: dict[str, Any] | None,
         existing: DocRow | None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """Render an upload and commit it, ending with `committed`.
+    ) -> AsyncIterator[events.Event]:
+        """Render an upload and commit it, ending with `Committed`.
 
         A new doc gets its row first, incomplete, so the consumer can refer to it while
         its tiles stream; the row's primary key also settles who ingests the doc when
@@ -219,18 +221,13 @@ class Ingester:
         elif not existing.complete:
             raise self._in_progress(doc_id)
 
+        begin = events.Begin(doc_id, effective_type, source_url, self.render_version)
         committed = False
 
         try:
             # Identity up front, so the consumer can build point ids / mark pending before
             # any tile arrives.
-            yield {
-                "event": "begin",
-                "doc_id": doc_id,
-                "doc_type": effective_type,
-                "source_url": source_url,
-                "render_version": self.render_version,
-            }
+            yield begin
 
             staged: list[TileRow] = []
 
@@ -238,7 +235,7 @@ class Ingester:
                 async with aclosing(doc.tiles()) as tiles:
                     async for tile in tiles:
                         staged.append(TileRow.from_rendered(doc_id, tile))
-                        yield {"event": "tile", "tile": tile}
+                        yield events.Tile(tile)
 
                 height = doc.height
 
@@ -263,16 +260,7 @@ class Ingester:
         metrics.DOCS.set(await self.store.count_docs())
         metrics.INGESTS.labels(doc_type=effective_type, result="rendered").inc()
 
-        yield {
-            "event": "committed",
-            "doc_id": doc_id,
-            "doc_type": effective_type,
-            "source_url": source_url,
-            "render_version": self.render_version,
-            "height": height,
-            "tile_count": len(staged),
-            "result": "rendered",
-        }
+        yield begin.committed(height=height, tile_count=len(staged), result="rendered")
 
 
     async def _drop_upload(self, upload: Incoming) -> None:
