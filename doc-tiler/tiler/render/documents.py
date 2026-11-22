@@ -20,11 +20,11 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from itertools import islice
-from typing import Any, AsyncIterator, Iterator
+from typing import AsyncIterator, Iterator
 
 from ..models import DocType
-from . import browser as web
 from . import render, worker
+from .browser import Tab
 from .geometry import Tile
 from .pool import RenderPool
 from .readers import READERS
@@ -195,7 +195,7 @@ class MhtmlDocument(Document):
 
         super().__init__(pool, doc_type, path, bulk=bulk, height=height)
         self._stack = contextlib.AsyncExitStack()
-        self._tab: Any = None
+        self._tab: Tab | None = None
 
 
     async def __aenter__(self) -> MhtmlDocument:
@@ -206,7 +206,7 @@ class MhtmlDocument(Document):
 
     async def plan(self) -> list[Tile]:
         async with self.pool.browser_errors():
-            height = await web.page_height(await self._page())
+            height = await (await self._opened()).height()
 
         # A page captured whole is as tall as its capture, not as its CSS height.
         if height <= self.pool.settings.safe_fullpage_px:
@@ -231,7 +231,7 @@ class MhtmlDocument(Document):
 
         for tile in tiles:
             async with self.pool.browser_errors():
-                png = await web.clip(await self._page(), self.pool.settings, self.params.tile_width, tile.offset, tile.height)
+                png = await (await self._opened()).clip(tile.offset, tile.height)
 
             encoded.append(await self.pool.run(render.encode_strip, png, p.tile_width, p.jpeg_quality, bulk=self.bulk))
 
@@ -256,12 +256,10 @@ class MhtmlDocument(Document):
         return super()._batches(tiles) if self._whole else [[tile] for tile in tiles]
 
 
-    async def _page(self) -> Any:
-        """The loaded archive in a Chromium tab, opened on first use."""
+    async def _opened(self) -> Tab:
+        """The archive loaded in a Chromium tab, opened on first use."""
         if self._tab is None:
-            self._tab = await self._stack.enter_async_context(
-                web.mhtml_page(self.pool.browser, self.pool.settings, self.pool.temp_dir, self.path)
-            )
+            self._tab = await self._stack.enter_async_context(self.pool.browser.open_mhtml(self.path))
 
         return self._tab
 
@@ -273,7 +271,7 @@ class MhtmlDocument(Document):
 
 
     async def _capture_full_page(self) -> bytes:
-        return await web.full_page_png(await self._page())
+        return await (await self._opened()).full_png()
 
 
 # The document class of each stored document type.

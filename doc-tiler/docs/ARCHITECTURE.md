@@ -577,7 +577,7 @@ tiler/
           readers.py    # DocumentReader: PdfReader, ImageReader — a format read as one image, inside a worker
           pool.py       # RenderPool: pebble process pool (memory cap, timeout), Chromium, bulk slots
           worker.py     # what runs in a worker: lay a document out, read and encode its tiles
-          browser.py  render.py  geometry.py  types.py  # Chromium tabs; pixel primitives; Tile/Tiling; result dataclasses
+          browser.py  render.py  geometry.py  types.py  # Chromium (BrowserPool loads a document, Tab captures it); pixel primitives; Tile/Tiling; result dataclasses
   store/  blobs.py  meta.py  cache.py
   meta/   schema.py                                # load schema, meta_expr(), CREATE INDEX loop
   ssrf.py  netguard.py  hashing.py                 # URL policy + pinning proxy + sha256

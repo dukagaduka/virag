@@ -41,9 +41,9 @@ class RenderPool:
     def __init__(self, settings: RenderSettings, params: RenderParams, *, temp_dir: str):
         self.settings = settings
         self.params   = params
-        self.temp_dir = temp_dir  # scratch files of a render (MHTML archives opened by Chromium)
-
-        self.browser = BrowserPool(settings, viewport=(params.tile_width, params.tiling.height))
+        self.browser  = BrowserPool(
+            settings, viewport=(params.tile_width, params.tiling.height), temp_dir=temp_dir
+        )
         # Full-page MHTML captures, per document: one render serves all of a doc's tiles.
         self.page_cache = AsyncLRU(max(2, settings.render_cache_size // 8), "page")
         self.worker_restarts = 0

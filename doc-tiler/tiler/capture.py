@@ -12,7 +12,6 @@ from . import metrics
 from .config import CaptureSettings
 from .errors import forbidden
 from .netguard import GuardProxy
-from .render import browser as web
 from .render.pool import RenderPool
 from .ssrf import BlockedTarget, validate_url
 
@@ -61,9 +60,7 @@ class UrlCapture:
 
         log.info("fetching %s (resolved to %s)", url, ",".join(target.ips))
         proxy = self.guard_proxy.url if self.guard_proxy is not None else None
-        blob = await self.pool.browser_call(
-            web.capture_url_mhtml, self.pool.browser, self.pool.settings, url, proxy, bulk=True
-        )
+        blob = await self.pool.browser_call(self.pool.browser.capture_url, url, proxy, bulk=True)
 
         if self.guard_proxy is not None and self.guard_proxy.blocked:
             # Subresources may have been blocked; surface it without failing the capture.

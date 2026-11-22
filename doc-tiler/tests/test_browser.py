@@ -46,11 +46,9 @@ pytestmark = pytest.mark.skipif(
 
 async def capture_fixture(state, tmp_path, rows: int) -> bytes:
     """Snapshot a local HTML file to MHTML using the service's own browser pool."""
-    from tiler.render.browser import capture_url_mhtml
-
     path = tmp_path / f"fixture_{rows}.html"
     path.write_text(_html(rows))
-    return await capture_url_mhtml(state.pool.browser, state.settings.render_settings, f"file://{path}", None)
+    return await state.pool.browser.capture_url(f"file://{path}", None)
 
 
 @pytest.fixture
