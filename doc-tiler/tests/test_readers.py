@@ -17,7 +17,7 @@ from tiler.models import DocType
 from tiler.render import worker
 from tiler.render.geometry import Tile, Tiling
 from tiler.render.readers import ImageReader, PdfReader, RenderParams
-from tiler.render.render import DecodeError
+from tiler.render.pixels import DecodeError
 
 PARAMS = RenderParams(
     tile_width=875,

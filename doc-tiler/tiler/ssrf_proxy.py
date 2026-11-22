@@ -20,7 +20,7 @@ from typing import Iterable
 
 from .ssrf import BlockedTarget, resolve_and_check
 
-log = logging.getLogger("tiler.netguard")
+log = logging.getLogger("tiler.ssrf_proxy")
 
 
 class GuardProxy:

@@ -23,7 +23,7 @@ import orjson
 
 from ..errors import bad_request, not_found
 from ..hashing import is_doc_id
-from ..meta.schema import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
+from ..metadata import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
 from ..models import DocType
 from ..render.types import RenderedTile
 

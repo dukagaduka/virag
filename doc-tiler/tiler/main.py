@@ -20,7 +20,7 @@ from .capture import UrlCapture
 from .config import ConfigError, Settings, configure_logging
 from .errors import install_error_handlers
 from .ingest import Ingester
-from .meta.schema import SchemaError, load_schema
+from .metadata import SchemaError, load_schema
 from .render.pool import RenderPool
 from .render.readers import RenderParams
 from .render.renderer import Renderer

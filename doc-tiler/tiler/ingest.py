@@ -28,7 +28,7 @@ import anyio
 from . import events, media, metrics
 from .capture import UrlCapture
 from .errors import ApiError, bad_request, conflict
-from .meta.schema import MetadataSchema
+from .metadata import MetadataSchema
 from .models import DocType
 from .render.renderer import Renderer
 from .store.blobs import BlobStore, Incoming

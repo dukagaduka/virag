@@ -11,9 +11,9 @@ import logging
 from . import metrics
 from .config import CaptureSettings
 from .errors import forbidden
-from .netguard import GuardProxy
 from .render.pool import RenderPool
 from .ssrf import BlockedTarget, validate_url
+from .ssrf_proxy import GuardProxy
 
 log = logging.getLogger("tiler.capture")
 

@@ -13,7 +13,7 @@ import logging
 import sys
 
 from .config import ConfigError, Settings, configure_logging
-from .meta.schema import SchemaError, load_schema
+from .metadata import SchemaError, load_schema
 from .volume import GeometryMismatch, Volume
 
 log = logging.getLogger("tiler.preflight")

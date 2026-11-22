@@ -23,7 +23,7 @@ from itertools import islice
 from typing import AsyncIterator, Iterator
 
 from ..models import DocType
-from . import render, worker
+from . import pixels, worker
 from .browser import Tab
 from .geometry import Tile
 from .pool import RenderPool
@@ -211,7 +211,7 @@ class MhtmlDocument(Document):
         # A page captured whole is as tall as its capture, not as its CSS height.
         if height <= self.pool.settings.safe_fullpage_px:
             png = await self._full_page()
-            height = await self.pool.run(render.png_page_height, png, self.params.tile_width, bulk=self.bulk)
+            height = await self.pool.run(pixels.png_page_height, png, self.params.tile_width, bulk=self.bulk)
 
         self._height = height
 
@@ -225,7 +225,7 @@ class MhtmlDocument(Document):
             png = await self._full_page()
             rows = [(tile.offset, tile.offset + tile.height) for tile in tiles]
 
-            return await self.pool.run(render.crop_page_png, png, rows, p.tile_width, p.jpeg_quality, bulk=self.bulk)
+            return await self.pool.run(pixels.crop_page_png, png, rows, p.tile_width, p.jpeg_quality, bulk=self.bulk)
 
         encoded = []
 
@@ -233,7 +233,7 @@ class MhtmlDocument(Document):
             async with self.pool.browser_errors():
                 png = await (await self._opened()).clip(tile.offset, tile.height)
 
-            encoded.append(await self.pool.run(render.encode_strip, png, p.tile_width, p.jpeg_quality, bulk=self.bulk))
+            encoded.append(await self.pool.run(pixels.encode_strip, png, p.tile_width, p.jpeg_quality, bulk=self.bulk))
 
         return encoded
 

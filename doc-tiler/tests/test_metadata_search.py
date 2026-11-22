@@ -7,7 +7,7 @@ import json
 import pytest
 from conftest import base_env, make_pdf, pdf_form, running_app
 
-from tiler.meta.schema import meta_expr
+from tiler.metadata import meta_expr
 from tiler.store.meta import SearchFilter, build_search_query
 
 
@@ -214,7 +214,7 @@ def test_query_builder_uses_the_shared_expression():
 
 
 def _schema():
-    from tiler.meta.schema import parse_schema
+    from tiler.metadata import parse_schema
 
     return parse_schema({"version": 1, "fields": [{"key": "source.host", "type": "text"}]})
 
@@ -298,7 +298,7 @@ async def _search_count(client, key: str, value) -> int:
 
 @pytest.mark.parametrize("bad_key", ["a b", "1abc", "a.b.", "a-b", "a')--"])
 def test_schema_rejects_injectable_keys(bad_key):
-    from tiler.meta.schema import SchemaError, parse_schema
+    from tiler.metadata import SchemaError, parse_schema
 
     with pytest.raises(SchemaError):
         parse_schema({"version": 1, "fields": [{"key": bad_key, "type": "text"}]})

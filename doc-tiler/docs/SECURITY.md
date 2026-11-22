@@ -36,7 +36,7 @@ Active only when `TILER_URL_FETCH_ENABLED=true` and `TILER_URL_ALLOW_PRIVATE=fal
 Validating the URL *before* navigation is not enough: it cannot stop DNS rebinding, a
 redirect to an internal host, or a subresource pointing at `169.254.169.254` — Chromium
 does its own DNS resolution. So the browser context is routed through an **in-process
-loopback proxy** (`netguard.py`) that resolves every connection itself, applies the
+loopback proxy** (`ssrf_proxy.py`) that resolves every connection itself, applies the
 policy, and dials **by validated IP** (defeating rebinding). Top-level, redirect and
 subresource requests all pass through it.
 

@@ -8,8 +8,8 @@ import gc
 import pytest
 from conftest import base_env, running_app
 
-from tiler.netguard import GuardProxy
 from tiler.ssrf import BlockedTarget, ip_is_blocked, validate_url
+from tiler.ssrf_proxy import GuardProxy
 
 BLOCKED_IPS = [
     "127.0.0.1",

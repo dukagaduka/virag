@@ -15,7 +15,7 @@ import resource
 from ..models import DocType
 from .geometry import Tile
 from .readers import READERS, DocumentReader, RenderParams
-from .render import DecodeError, RenderTooLarge, to_jpeg
+from .pixels import DecodeError, RenderTooLarge, to_jpeg
 from .types import EncodedImage
 
 # JPEG cannot hold an image taller than this.

@@ -459,7 +459,7 @@ the live page — is what gets tiled, so ingest and a tile request render the sa
 Tall pages (> `TILER_SAFE_FULLPAGE_PX`) are captured per-strip via
 `page.screenshot(clip=...)` with a viewport-relative clip, scrolling into view so lazy
 content rasterizes. Ingest and regeneration call the *same* functions in
-`render/render.py`.
+`render/pixels.py`.
 
 ---
 
@@ -567,6 +567,7 @@ tiler/
   events.py          # what a tile stream consists of: Begin, Tile, Committed (Error on the wire); an event's NDJSON line
   tiles.py           # Tiles: a stored doc's tiles by its id, rendered from its blob (one tile, or its event stream); the tile cache
   capture.py         # URL capture: SSRF policy + guard proxy + MHTML snapshot
+  metadata.py        # the declared metadata schema: load, meta_expr(), validation, CREATE INDEX statements
   revision.py        # serving gate + the job that brings stored docs to the current render_version
   config.py          # the TILER_* variables in sections (geometry, pixel, render, store, capture, revision, api) + render_version
   volume.py          # Volume.open: the DB and the blob dir opened, bound to their geometry (service_meta), indexed by the schema
@@ -578,10 +579,9 @@ tiler/
           readers.py    # DocumentReader: PdfReader, ImageReader — a format read as one image, inside a worker
           pool.py       # RenderPool: pebble process pool (memory cap, timeout), Chromium, bulk slots
           worker.py     # what runs in a worker: lay a document out, read and encode its tiles
-          browser.py  render.py  geometry.py  types.py  # Chromium (BrowserPool loads a document, Tab captures it); pixel primitives; Tile/Tiling; result dataclasses
+          browser.py  pixels.py  geometry.py  types.py  # Chromium (BrowserPool loads a document, Tab captures it); pixel primitives; Tile/Tiling; result dataclasses
   store/  blobs.py  meta.py  cache.py
-  meta/   schema.py                                # load schema, meta_expr(), CREATE INDEX loop
-  ssrf.py  netguard.py  hashing.py                 # URL policy + pinning proxy + sha256
+  ssrf.py  ssrf_proxy.py  hashing.py               # URL policy + the proxy that pins Chromium to it + sha256
 ```
 
 `meta_expr()` is the single source of the JSON extraction expression used by both index

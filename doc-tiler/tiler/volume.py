@@ -16,7 +16,7 @@ import logging
 import os
 
 from .config import Settings
-from .meta.schema import MetadataSchema, index_statements
+from .metadata import MetadataSchema, index_statements
 from .store.blobs import BlobStore
 from .store.meta import MetaStore, ServiceMeta
 

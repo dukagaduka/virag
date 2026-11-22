@@ -17,9 +17,9 @@ from typing import Any, Iterable
 import orjson
 import yaml
 
-from ..errors import unprocessable
+from .errors import unprocessable
 
-log = logging.getLogger("tiler.schema")
+log = logging.getLogger("tiler.metadata")
 
 # Keys are interpolated into SQL/JSON-path text, so the grammar is deliberately tight.
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")

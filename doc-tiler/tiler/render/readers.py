@@ -27,7 +27,7 @@ from PIL import Image
 from ..config import MAX_SUPERSAMPLE, GeometrySettings, PixelSettings
 from ..models import DocType
 from .geometry import Tile, Tiling, resized_height
-from .render import DecodeError, EmptyDocument, RenderTooLarge, crop_rows, fit_width, open_image
+from .pixels import DecodeError, EmptyDocument, RenderTooLarge, crop_rows, fit_width, open_image
 
 
 @dataclass(frozen=True)

@@ -27,7 +27,7 @@ from .. import metrics
 from ..config import RenderSettings
 from ..errors import ApiError, bad_gateway, gateway_timeout, unprocessable
 from ..store.cache import AsyncLRU
-from . import render, worker
+from . import pixels, worker
 from .browser import BrowserPool, BrowserUnavailable, RenderFailure, RenderTimeout
 from .readers import RenderParams
 
@@ -160,10 +160,10 @@ class RenderPool:
             try:
                 return await self._attempt(fn, args)
 
-            except render.EmptyDocument as exc:
+            except pixels.EmptyDocument as exc:
                 raise unprocessable(str(exc), "EMPTY_DOCUMENT") from exc
 
-            except render.DecodeError as exc:
+            except pixels.DecodeError as exc:
                 raise unprocessable(str(exc), "DECODE_FAILED") from exc
 
             except MemoryError as exc:
