@@ -54,7 +54,7 @@ class DocList(BaseModel):
     next_cursor: str | None = None
 
 
-class SearchFilterModel(BaseModel):
+class SearchFilter(BaseModel):
     """A single metadata filter predicate."""
 
     key: str
@@ -65,7 +65,7 @@ class SearchFilterModel(BaseModel):
 class SearchRequest(BaseModel):
     """A search/list request: AND-combined filters plus pagination."""
 
-    filters: list[SearchFilterModel] = Field(default_factory=list)
+    filters: list[SearchFilter] = Field(default_factory=list)
     limit: int = Field(default=50, ge=1, le=500)
     cursor: str | None = None
 

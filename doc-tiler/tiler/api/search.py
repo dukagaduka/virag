@@ -5,7 +5,6 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from ..models import DocList, DocSummary, SearchRequest
-from ..store.meta import SearchFilter
 
 router = APIRouter()
 
@@ -20,8 +19,6 @@ router = APIRouter()
 async def search_docs(request: Request, body: SearchRequest) -> DocList:
     """List documents or filter them by declared metadata keys."""
     state = request.app.state
-    filters = [SearchFilter(key=f.key, op=f.op, value=f.value) for f in body.filters]
-
-    rows, next_cursor = await state.store.search(filters, state.schema, body.limit, body.cursor)
+    rows, next_cursor = await state.store.search(body.filters, state.schema, body.limit, body.cursor)
 
     return DocList(items=[DocSummary(**row.summary()) for row in rows], next_cursor=next_cursor)

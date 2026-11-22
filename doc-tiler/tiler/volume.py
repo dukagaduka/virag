@@ -16,7 +16,7 @@ import logging
 import os
 
 from .config import Settings
-from .metadata import MetadataSchema, index_statements
+from .metadata import MetadataSchema
 from .store.blobs import BlobStore
 from .store.meta import MetaStore, ServiceMeta
 
@@ -82,7 +82,7 @@ class Volume:
             await store.create_tables()
             meta = await cls._bind(store, settings)
 
-            created = await store.create_metadata_indexes(index_statements(schema))
+            created = await store.create_metadata_indexes(schema.index_statements())
             dropped = await store.drop_stale_metadata_indexes({f.index_name for f in schema.fields})
 
         except BaseException:

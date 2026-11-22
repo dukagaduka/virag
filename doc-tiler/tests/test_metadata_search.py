@@ -7,8 +7,9 @@ import json
 import pytest
 from conftest import base_env, make_pdf, pdf_form, running_app
 
-from tiler.metadata import meta_expr
-from tiler.store.meta import SearchFilter, build_search_query
+from tiler.metadata import Field, MetadataSchema, SchemaError
+from tiler.models import SearchFilter
+from tiler.store.meta import MetaStore
 
 
 async def ingest(client, pages: int, metadata: dict | None = None):
@@ -165,7 +166,7 @@ async def test_expression_index_is_used(client):
         ("year", "gt", 2050, "idx_meta_year"),  # selective numeric range
         ("year", "lte", 1905, "idx_meta_year"),
     ):
-        sql, params = build_search_query(
+        sql, params = MetaStore.search_query(
             [SearchFilter(key=key, op=op, value=value)], client.state.schema, 50, None
         )
         plan = " ".join(await store.explain(sql, params))
@@ -180,7 +181,7 @@ async def test_ne_is_answered_by_an_ordered_scan_not_a_table_scan(client):
     every row, so LIMIT is satisfied immediately (see README)."""
     store = client.state.store
     await _populate(store, rows=200)
-    sql, params = build_search_query(
+    sql, params = MetaStore.search_query(
         [SearchFilter(key="project", op="ne", value="p7")], client.state.schema, 50, None
     )
     plan = " ".join(await store.explain(sql, params))
@@ -200,23 +201,21 @@ async def test_search_never_scans_the_table_itself(client):
     store = client.state.store
     await _populate(store, rows=200)
     for filters in ([], [SearchFilter(key="year", op="gt", value=1899)]):
-        sql, params = build_search_query(filters, client.state.schema, 50, None)
+        sql, params = MetaStore.search_query(filters, client.state.schema, 50, None)
         plan = " ".join(await store.explain(sql, params))
         assert "USING INDEX" in plan or "USING COVERING INDEX" in plan, plan
 
 
 def test_query_builder_uses_the_shared_expression():
-    sql, _ = build_search_query(
+    sql, _ = MetaStore.search_query(
         [SearchFilter(key="source.host", op="eq", value="x")],
         _schema(), 10, None,
     )
-    assert meta_expr("source.host") in sql
+    assert Field("source.host", "text").expr in sql
 
 
 def _schema():
-    from tiler.metadata import parse_schema
-
-    return parse_schema({"version": 1, "fields": [{"key": "source.host", "type": "text"}]})
+    return MetadataSchema.parse({"version": 1, "fields": [{"key": "source.host", "type": "text"}]})
 
 
 async def test_validation_rejects_bad_types_and_missing_required(client):
@@ -298,7 +297,5 @@ async def _search_count(client, key: str, value) -> int:
 
 @pytest.mark.parametrize("bad_key", ["a b", "1abc", "a.b.", "a-b", "a')--"])
 def test_schema_rejects_injectable_keys(bad_key):
-    from tiler.metadata import SchemaError, parse_schema
-
     with pytest.raises(SchemaError):
-        parse_schema({"version": 1, "fields": [{"key": bad_key, "type": "text"}]})
+        MetadataSchema.parse({"version": 1, "fields": [{"key": bad_key, "type": "text"}]})

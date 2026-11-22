@@ -23,79 +23,9 @@ import orjson
 
 from ..errors import bad_request, not_found
 from ..hashing import is_doc_id
-from ..metadata import Field, MetadataSchema, MetadataViolation, coerce_filter_value, meta_expr
-from ..models import DocType
+from ..metadata import MetadataSchema, MetadataViolation
+from ..models import DocType, SearchFilter
 from ..render.types import RenderedTile
-
-PRAGMAS = (
-    "PRAGMA journal_mode=WAL",
-    "PRAGMA busy_timeout=5000",
-    "PRAGMA synchronous=NORMAL",
-    "PRAGMA foreign_keys=ON",
-)
-
-DDL = (
-    """
-    CREATE TABLE IF NOT EXISTS service_meta (
-        id              INTEGER PRIMARY KEY CHECK (id = 1),
-        tile_width      INTEGER NOT NULL,
-        tile_height     INTEGER NOT NULL,
-        tile_overlap    INTEGER NOT NULL,
-        min_tile_height INTEGER NOT NULL,
-        render_version  TEXT    NOT NULL,
-        volume_id       TEXT    NOT NULL,
-        initialized_at  INTEGER NOT NULL
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS docs (
-        doc_id         TEXT PRIMARY KEY,
-        doc_type       TEXT NOT NULL,
-        blob_rel_path  TEXT NOT NULL,
-        source_url     TEXT,
-        height         INTEGER NOT NULL,
-        tile_count     INTEGER NOT NULL,
-        mime_type      TEXT NOT NULL,
-        metadata       TEXT,
-        render_version TEXT NOT NULL,
-        complete       INTEGER NOT NULL DEFAULT 1,
-        created_at     INTEGER NOT NULL,
-        updated_at     INTEGER NOT NULL
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS tiles (
-        doc_id      TEXT NOT NULL,
-        tile_num    INTEGER NOT NULL,
-        offset      INTEGER NOT NULL,
-        height      INTEGER NOT NULL,
-        image_hash  TEXT NOT NULL,
-        PRIMARY KEY (doc_id, tile_num),
-        FOREIGN KEY (doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE
-    )
-    """,
-    # Docs a revision could not re-render at `render_version`; their tiles answer 410.
-    # A table of its own (not a docs column), so existing volumes need no migration.
-    """
-    CREATE TABLE IF NOT EXISTS quarantine (
-        doc_id          TEXT PRIMARY KEY,
-        render_version  TEXT NOT NULL,
-        reason          TEXT NOT NULL,
-        quarantined_at  INTEGER NOT NULL,
-        FOREIGN KEY (doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_docs_created ON docs(created_at, doc_id)",
-)
-
-# Selected next to the docs columns, so every DocRow knows whether it is quarantined.
-QUARANTINE_REASON = (
-    "(SELECT reason FROM quarantine WHERE quarantine.doc_id = docs.doc_id) AS quarantine_reason"
-)
-
-OPS = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
-NUMERIC_OPS = {"gt", "gte", "lt", "lte"}
-
 
 @dataclass(frozen=True)
 class ServiceMeta:
@@ -203,108 +133,77 @@ class TileRow:
         )
 
 
-@dataclass(frozen=True)
-class SearchFilter:
-    """One search predicate: a metadata key, comparison op, and value."""
-
-    key: str
-    op: str
-    value: Any
-
-
-def dumps(value: Any, *, sort_keys: bool = False) -> str | None:
-    """Serialize a JSON column as TEXT (SQLite reads a BLOB as JSONB); empty → NULL."""
-    if not value:
-        return None
-
-    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS if sort_keys else None).decode()
-
-
-def encode_cursor(created_at: int, doc_id: str) -> str:
-    """Encode a `(created_at, doc_id)` pagination cursor to a token."""
-    return base64.urlsafe_b64encode(f"{created_at}:{doc_id}".encode()).decode().rstrip("=")
-
-
-def decode_cursor(cursor: str) -> tuple[int, str]:
-    """Decode a pagination cursor back to `(created_at, doc_id)`."""
-    try:
-        pad = "=" * (-len(cursor) % 4)
-        created_at, _, doc_id = base64.urlsafe_b64decode(cursor + pad).decode().partition(":")
-
-        return int(created_at), doc_id
-
-    except Exception as exc:
-        raise bad_request(f"invalid cursor: {exc}", "INVALID_CURSOR") from exc
-
-
-def build_search_query(
-    filters: Sequence[SearchFilter],
-    schema: MetadataSchema,
-    limit: int,
-    cursor: str | None,
-) -> tuple[str, list[Any]]:
-    """Build the search SQL. Every predicate goes through `meta_expr()` so the
-    expression is textually identical to the index's, letting SQLite use it."""
-    where: list[str] = []
-    params: list[Any] = []
-
-    for f in filters:
-        field: Field | None = schema.get(f.key)
-
-        if field is None:
-            raise bad_request(
-                f"filter key {f.key!r} is not declared in the metadata schema; "
-                "only declared (indexed) keys are searchable",
-                "UNDECLARED_FILTER_KEY",
-                key=f.key,
-            )
-
-        op = (f.op or "eq").lower()
-
-        if op not in OPS:
-            raise bad_request(
-                f"unsupported op {f.op!r}; expected one of {sorted(OPS)}", "INVALID_FILTER_OP", key=f.key
-            )
-
-        if op in NUMERIC_OPS and field.type != "number":
-            raise bad_request(
-                f"op {op!r} requires a 'number' field, but {f.key!r} is declared "
-                f"{field.type!r}",
-                "INVALID_FILTER_OP",
-                key=f.key,
-            )
-
-        try:
-            value = coerce_filter_value(f.value, field)
-
-        except MetadataViolation as exc:
-            raise bad_request(str(exc), "INVALID_FILTER_VALUE", key=f.key) from exc
-
-        where.append(f"{meta_expr(field.key)} {OPS[op]} ?")
-        params.append(value)
-
-    if cursor:
-        created_at, doc_id = decode_cursor(cursor)
-        where.append("(created_at < ? OR (created_at = ? AND doc_id < ?))")
-        params.extend([created_at, created_at, doc_id])
-
-    sql = (
-        "SELECT doc_id, doc_type, blob_rel_path, source_url, height, tile_count, mime_type, "
-        "metadata, render_version, complete, created_at, updated_at, "
-        f"{QUARANTINE_REASON} FROM docs"
-    )
-
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-
-    sql += " ORDER BY created_at DESC, doc_id DESC LIMIT ?"
-    params.append(limit + 1)  # one extra row tells us whether a next page exists
-
-    return sql, params
-
-
 class MetaStore:
     """Async wrapper over the SQLite database backing docs, tiles, and search."""
+
+    PRAGMAS = (
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA busy_timeout=5000",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA foreign_keys=ON",
+    )
+
+    DDL = (
+        """
+        CREATE TABLE IF NOT EXISTS service_meta (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            tile_width      INTEGER NOT NULL,
+            tile_height     INTEGER NOT NULL,
+            tile_overlap    INTEGER NOT NULL,
+            min_tile_height INTEGER NOT NULL,
+            render_version  TEXT    NOT NULL,
+            volume_id       TEXT    NOT NULL,
+            initialized_at  INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS docs (
+            doc_id         TEXT PRIMARY KEY,
+            doc_type       TEXT NOT NULL,
+            blob_rel_path  TEXT NOT NULL,
+            source_url     TEXT,
+            height         INTEGER NOT NULL,
+            tile_count     INTEGER NOT NULL,
+            mime_type      TEXT NOT NULL,
+            metadata       TEXT,
+            render_version TEXT NOT NULL,
+            complete       INTEGER NOT NULL DEFAULT 1,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS tiles (
+            doc_id      TEXT NOT NULL,
+            tile_num    INTEGER NOT NULL,
+            offset      INTEGER NOT NULL,
+            height      INTEGER NOT NULL,
+            image_hash  TEXT NOT NULL,
+            PRIMARY KEY (doc_id, tile_num),
+            FOREIGN KEY (doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE
+        )
+        """,
+        # Docs a revision could not re-render at `render_version`; their tiles answer 410.
+        # A table of its own (not a docs column), so existing volumes need no migration.
+        """
+        CREATE TABLE IF NOT EXISTS quarantine (
+            doc_id          TEXT PRIMARY KEY,
+            render_version  TEXT NOT NULL,
+            reason          TEXT NOT NULL,
+            quarantined_at  INTEGER NOT NULL,
+            FOREIGN KEY (doc_id) REFERENCES docs(doc_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_docs_created ON docs(created_at, doc_id)",
+    )
+
+    # Selected next to the docs columns, so every DocRow knows whether it is quarantined.
+    QUARANTINE_REASON = (
+        "(SELECT reason FROM quarantine WHERE quarantine.doc_id = docs.doc_id) AS quarantine_reason"
+    )
+
+    OPS = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+    NUMERIC_OPS = {"gt", "gte", "lt", "lte"}
 
     # Columns that older volumes lacked (volume id, streaming ingest, the document
     # height and the tile offsets). They are in DDL for fresh volumes; an old volume
@@ -338,7 +237,7 @@ class MetaStore:
         self._lock = asyncio.Lock()
         self._db = await self._open(self.db_path)
 
-        for pragma in PRAGMAS:
+        for pragma in self.PRAGMAS:
             await self._db.execute(pragma)
 
         await self._db.commit()
@@ -381,7 +280,7 @@ class MetaStore:
     async def create_tables(self) -> None:
         """Create the base tables and indexes if they do not exist."""
         async with self._lock:
-            for stmt in DDL:
+            for stmt in self.DDL:
                 await self.db.execute(stmt)
 
             await self.db.commit()
@@ -505,7 +404,7 @@ class MetaStore:
     # ------------------------------------------------------------------ #
     async def get_doc(self, doc_id: str) -> DocRow | None:
         """Return the doc row for `doc_id`, or None if absent."""
-        rows = await self._read(f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE doc_id = ?", (doc_id,))
+        rows = await self._read(f"SELECT *, {self.QUARANTINE_REASON} FROM docs WHERE doc_id = ?", (doc_id,))
 
         return DocRow.from_row(rows[0]) if rows else None
 
@@ -582,7 +481,7 @@ class MetaStore:
                     blob_rel_path,
                     source_url,
                     mime_type,
-                    dumps(metadata, sort_keys=True),
+                    self._dumps(metadata, sort_keys=True),
                     render_version,
                     now,
                     now,
@@ -683,7 +582,7 @@ class MetaStore:
         docs drop out of the stale set."""
         where, params = self._revisable(render_version, force)
         rows = await self._read(
-            f"SELECT *, {QUARANTINE_REASON} FROM docs WHERE {where} AND doc_id > ? "
+            f"SELECT *, {self.QUARANTINE_REASON} FROM docs WHERE {where} AND doc_id > ? "
             "ORDER BY doc_id LIMIT ?",
             [*params, after, limit],
         )
@@ -720,7 +619,7 @@ class MetaStore:
         async with self._lock:
             await self.db.execute(
                 "UPDATE docs SET metadata = ?, updated_at = ? WHERE doc_id = ?",
-                (dumps(metadata, sort_keys=True), int(time.time()), doc_id),
+                (self._dumps(metadata, sort_keys=True), int(time.time()), doc_id),
             )
             await self.db.commit()
 
@@ -761,14 +660,14 @@ class MetaStore:
         cursor: str | None,
     ) -> tuple[list[DocRow], str | None]:
         """Run a filtered, paginated search and return the page plus next cursor."""
-        sql, params = build_search_query(filters, schema, limit, cursor)
+        sql, params = self.search_query(filters, schema, limit, cursor)
         rows = [DocRow.from_row(row) for row in await self._read(sql, params)]
         next_cursor = None
 
         if len(rows) > limit:
             rows = rows[:limit]
             last = rows[-1]
-            next_cursor = encode_cursor(last.created_at, last.doc_id)
+            next_cursor = self._encode_cursor(last.created_at, last.doc_id)
 
         return rows, next_cursor
 
@@ -778,6 +677,94 @@ class MetaStore:
         rows = await self._read(f"EXPLAIN QUERY PLAN {sql}", list(params))
 
         return [row["detail"] for row in rows]
+
+
+    @staticmethod
+    def search_query(
+        filters: Sequence[SearchFilter],
+        schema: MetadataSchema,
+        limit: int,
+        cursor: str | None,
+    ) -> tuple[str, list[Any]]:
+        """Build the search SQL. Every predicate goes through `Field.expr`, so the
+        expression is textually identical to the index's, letting SQLite use it."""
+        where: list[str] = []
+        params: list[Any] = []
+
+        for f in filters:
+            field = schema.get(f.key)
+
+            if field is None:
+                raise bad_request(
+                    f"filter key {f.key!r} is not declared in the metadata schema; "
+                    "only declared (indexed) keys are searchable",
+                    "UNDECLARED_FILTER_KEY",
+                    key=f.key,
+                )
+
+            if f.op in MetaStore.NUMERIC_OPS and field.type != "number":
+                raise bad_request(
+                    f"op {f.op!r} requires a 'number' field, but {f.key!r} is declared "
+                    f"{field.type!r}",
+                    "INVALID_FILTER_OP",
+                    key=f.key,
+                )
+
+            try:
+                value = field.coerce(f.value)
+
+            except MetadataViolation as exc:
+                raise bad_request(str(exc), "INVALID_FILTER_VALUE", key=f.key) from exc
+
+            where.append(f"{field.expr} {MetaStore.OPS[f.op]} ?")
+            params.append(value)
+
+        if cursor:
+            created_at, doc_id = MetaStore._decode_cursor(cursor)
+            where.append("(created_at < ? OR (created_at = ? AND doc_id < ?))")
+            params.extend([created_at, created_at, doc_id])
+
+        sql = (
+            "SELECT doc_id, doc_type, blob_rel_path, source_url, height, tile_count, mime_type, "
+            "metadata, render_version, complete, created_at, updated_at, "
+            f"{MetaStore.QUARANTINE_REASON} FROM docs"
+        )
+
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+
+        sql += " ORDER BY created_at DESC, doc_id DESC LIMIT ?"
+        params.append(limit + 1)  # one extra row tells us whether a next page exists
+
+        return sql, params
+
+
+    @staticmethod
+    def _encode_cursor(created_at: int, doc_id: str) -> str:
+        """Encode a `(created_at, doc_id)` pagination cursor to a token."""
+        return base64.urlsafe_b64encode(f"{created_at}:{doc_id}".encode()).decode().rstrip("=")
+
+
+    @staticmethod
+    def _decode_cursor(cursor: str) -> tuple[int, str]:
+        """Decode a pagination cursor back to `(created_at, doc_id)`."""
+        try:
+            pad = "=" * (-len(cursor) % 4)
+            created_at, _, doc_id = base64.urlsafe_b64decode(cursor + pad).decode().partition(":")
+
+            return int(created_at), doc_id
+
+        except Exception as exc:
+            raise bad_request(f"invalid cursor: {exc}", "INVALID_CURSOR") from exc
+
+
+    @staticmethod
+    def _dumps(value: Any, *, sort_keys: bool = False) -> str | None:
+        """Serialize a JSON column as TEXT (SQLite reads a BLOB as JSONB); empty → NULL."""
+        if not value:
+            return None
+
+        return orjson.dumps(value, option=orjson.OPT_SORT_KEYS if sort_keys else None).decode()
 
 
     @staticmethod

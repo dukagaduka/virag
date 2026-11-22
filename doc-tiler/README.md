@@ -79,7 +79,7 @@ tiler/            the service package
   api/            ingest, tiles, docs, metadata, search, revision, ops
   render/         renderer (file → tiles), documents, readers (PDF, images), pool (render workers + Chromium), browser, geometry, types
   store/          blobs (content-addressed FS), meta (SQLite), cache (async LRU)
-  metadata.py     the declared metadata schema, meta_expr(), validation
+  metadata.py     the declared metadata schema: MetadataSchema and its Fields (expr, validation)
   ssrf.py ssrf_proxy.py   URL policy + the proxy that pins Chromium to it
 docs/             documentation (see the table above)
 deploy/           docker-compose.yaml + .env.example

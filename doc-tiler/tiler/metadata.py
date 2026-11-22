@@ -1,18 +1,19 @@
-"""Declared metadata schema, `meta_expr()` and write-time validation.
+"""The declared metadata schema: which keys of a document's metadata are searchable,
+their types, and what a metadata object must pass to be stored.
 
-`meta_expr()` is the SINGLE source of the JSON extraction expression. Index
-creation and query building must both go through it: SQLite only uses an
-expression index when the query's expression is textually identical to the
-index's.
+`Field.expr` is the SINGLE source of the JSON extraction expression. Index creation
+and query building must both go through it: SQLite only uses an expression index
+when the query's expression is textually identical to the index's.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, ClassVar, Iterable
 
 import orjson
 import yaml
@@ -21,17 +22,13 @@ from .errors import unprocessable
 
 log = logging.getLogger("tiler.metadata")
 
-# Keys are interpolated into SQL/JSON-path text, so the grammar is deliberately tight.
-_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-FIELD_TYPES = ("text", "number")
-
 
 class SchemaError(RuntimeError):
     """Invalid metadata schema file; fatal at startup."""
 
 
 class MetadataViolation(ValueError):
-    """Metadata rejected at write time (maps to 422)."""
+    """A value that does not fit its declared field."""
 
 
     def __init__(self, message: str, key: str | None = None):
@@ -43,15 +40,119 @@ class MetadataViolation(ValueError):
 class Field:
     """A single declared, indexed metadata field."""
 
+    # Keys are interpolated into SQL/JSON-path text, so the grammar is deliberately tight.
+    KEY_RE: ClassVar[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+    TYPES: ClassVar[tuple[str, ...]] = ("text", "number")
+    MISSING: ClassVar[object] = object()  # what `read` returns for a key that is not there
+
     key: str
     type: str
     required: bool = False
+
+
+    @classmethod
+    def parse(cls, entry: Any, source: str) -> Field:
+        """Validate one entry of a schema's `fields` into a Field, raising SchemaError."""
+        if not isinstance(entry, dict):
+            raise SchemaError(f"{source}: each field must be a mapping, got {entry!r}")
+
+        key = entry.get("key")
+
+        if not isinstance(key, str) or not cls.KEY_RE.match(key):
+            raise SchemaError(
+                f"{source}: field key {key!r} must match {cls.KEY_RE.pattern} "
+                "(dotted identifiers only)"
+            )
+
+        ftype = entry.get("type")
+
+        if ftype not in cls.TYPES:
+            raise SchemaError(
+                f"{source}: field {key!r} has type {ftype!r}; expected one of {cls.TYPES}"
+            )
+
+        return cls(key=key, type=ftype, required=bool(entry.get("required", False)))
+
+
+    @property
+    def expr(self) -> str:
+        """The one and only JSON extraction expression for this field."""
+        if not self.KEY_RE.match(self.key):
+            raise SchemaError(f"invalid metadata key {self.key!r}")
+
+        return f"json_extract(metadata, '$.{self.key}')"
 
 
     @property
     def index_name(self) -> str:
         """The SQLite index name derived from this field's key."""
         return "idx_meta_" + self.key.replace(".", "_")
+
+
+    @property
+    def index_statement(self) -> str:
+        """`CREATE INDEX IF NOT EXISTS` over this field's expression."""
+        return f"CREATE INDEX IF NOT EXISTS {self.index_name} ON docs ({self.expr})"
+
+
+    def coerce(self, value: Any) -> Any:
+        """The value as this field's type holds it, or MetadataViolation."""
+        return self._text(value) if self.type == "text" else self._number(value)
+
+
+    def read(self, metadata: Any) -> Any:
+        """The value at this field's dotted key in a metadata object; MISSING if absent."""
+        cur: Any = metadata
+
+        for part in self.key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return self.MISSING
+
+            cur = cur[part]
+
+        return cur
+
+
+    def write(self, metadata: dict[str, Any], value: Any) -> None:
+        """Set the value at this field's dotted key (its parents must already exist)."""
+        parts = self.key.split(".")
+        cur = metadata
+
+        for part in parts[:-1]:
+            cur = cur[part]
+
+        cur[parts[-1]] = value
+
+
+    def _text(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise MetadataViolation(
+                f"field {self.key!r} is declared 'text' but got {type(value).__name__}", self.key
+            )
+
+        return str(value)
+
+
+    def _number(self, value: Any) -> float | int:
+        if isinstance(value, bool):
+            raise MetadataViolation(f"field {self.key!r} is declared 'number' but got a boolean", self.key)
+
+        if isinstance(value, (int, float)):
+            return value
+
+        if isinstance(value, str):
+            try:
+                return float(value)
+
+            except ValueError:
+                pass
+
+        raise MetadataViolation(
+            f"field {self.key!r} is declared 'number' but got {type(value).__name__}", self.key
+        )
 
 
 @dataclass(frozen=True)
@@ -62,16 +163,66 @@ class MetadataSchema:
     fields: tuple[Field, ...]
 
 
+    @classmethod
+    def load(cls, path: str | Path) -> MetadataSchema:
+        """Load and parse the schema file; an absent one is a schema without fields."""
+        p = Path(path)
+
+        if not p.exists():
+            log.warning(
+                "metadata schema %s not found — no metadata keys are searchable", p
+            )
+            return cls(version=0, fields=())
+
+        try:
+            raw = yaml.safe_load(p.read_text()) or {}
+
+        except yaml.YAMLError as exc:
+            raise SchemaError(f"cannot parse {p}: {exc}") from exc
+
+        return cls.parse(raw, source=str(p))
+
+
+    @classmethod
+    def parse(cls, raw: Any, source: str = "<inline>") -> MetadataSchema:
+        """Validate a raw mapping into a MetadataSchema, raising SchemaError."""
+        if not isinstance(raw, dict):
+            raise SchemaError(f"{source}: top level must be a mapping")
+
+        version = raw.get("version", 1)
+
+        if not isinstance(version, int):
+            raise SchemaError(f"{source}: 'version' must be an integer")
+
+        entries = raw.get("fields") or []
+
+        if not isinstance(entries, list):
+            raise SchemaError(f"{source}: 'fields' must be a list")
+
+        fields: dict[str, Field] = {}
+
+        for entry in entries:
+            field = Field.parse(entry, source)
+
+            if field.key in fields:
+                raise SchemaError(f"{source}: duplicate field key {field.key!r}")
+
+            fields[field.key] = field
+
+        return cls(version=version, fields=tuple(fields.values()))
+
+
     def get(self, key: str) -> Field | None:
         """Return the declared field for `key`, or None if undeclared."""
         return self._by_key.get(key)
 
 
-    def validated(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        """The metadata as it is stored: declared fields validated and coerced. Raises
-        422 on a violation, or when the object cannot be stored as JSON."""
+    def validated(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
+        """The metadata as it is stored: a copy with the declared fields validated and
+        coerced; undeclared keys pass through untouched. Raises 422 on a violation, or
+        when the object cannot be stored as JSON."""
         try:
-            validated = validate_metadata(metadata, self)
+            validated = self._coerced(metadata)
 
         except MetadataViolation as exc:
             raise unprocessable(str(exc), "METADATA_SCHEMA_VIOLATION", key=exc.key) from exc
@@ -85,10 +236,9 @@ class MetadataSchema:
         return validated
 
 
-    @property
-    def _by_key(self) -> dict[str, Field]:
-        """Fields indexed by key."""
-        return {f.key: f for f in self.fields}
+    def index_statements(self) -> Iterable[str]:
+        """`CREATE INDEX IF NOT EXISTS` per declared field — the whole reindex story."""
+        return [field.index_statement for field in self.fields]
 
 
     def as_dict(self) -> dict[str, Any]:
@@ -101,199 +251,39 @@ class MetadataSchema:
         }
 
 
-def meta_expr(key: str) -> str:
-    """The one and only JSON extraction expression for a metadata key."""
-    if not _KEY_RE.match(key):
-        raise SchemaError(f"invalid metadata key {key!r}")
+    # ------------------------------------------------------------------ #
+    # internals
+    # ------------------------------------------------------------------ #
+    @property
+    def _by_key(self) -> dict[str, Field]:
+        """Fields indexed by key."""
+        return {f.key: f for f in self.fields}
 
-    return f"json_extract(metadata, '$.{key}')"
 
+    def _coerced(self, metadata: Any) -> dict[str, Any]:
+        """A copy of the metadata with every declared field coerced to its type."""
+        if metadata is None:
+            metadata = {}
 
-EMPTY_SCHEMA = MetadataSchema(version=0, fields=())
+        if not isinstance(metadata, dict):
+            raise MetadataViolation("metadata must be a JSON object")
 
+        out = copy.deepcopy(metadata)
 
-def load_schema(path: str | Path) -> MetadataSchema:
-    """Load and parse the schema file, returning EMPTY_SCHEMA if absent."""
-    p = Path(path)
+        for field in self.fields:
+            value = field.read(out)
 
-    if not p.exists():
-        log.warning(
-            "metadata schema %s not found — no metadata keys are searchable", p
-        )
-        return EMPTY_SCHEMA
+            if value is Field.MISSING or value is None:
+                if field.required:
+                    raise MetadataViolation(
+                        f"required metadata field {field.key!r} is missing", field.key
+                    )
 
-    try:
-        raw = yaml.safe_load(p.read_text()) or {}
+                continue
 
-    except yaml.YAMLError as exc:
-        raise SchemaError(f"cannot parse {p}: {exc}") from exc
+            coerced = field.coerce(value)
 
-    return parse_schema(raw, source=str(p))
+            if coerced is not value:
+                field.write(out, coerced)
 
-
-def parse_schema(raw: Any, source: str = "<inline>") -> MetadataSchema:
-    """Validate a raw mapping into a MetadataSchema, raising SchemaError."""
-    if not isinstance(raw, dict):
-        raise SchemaError(f"{source}: top level must be a mapping")
-
-    version = raw.get("version", 1)
-
-    if not isinstance(version, int):
-        raise SchemaError(f"{source}: 'version' must be an integer")
-
-    entries = raw.get("fields") or []
-
-    if not isinstance(entries, list):
-        raise SchemaError(f"{source}: 'fields' must be a list")
-
-    fields: list[Field] = []
-    seen: set[str] = set()
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise SchemaError(f"{source}: each field must be a mapping, got {entry!r}")
-
-        key = entry.get("key")
-
-        if not isinstance(key, str) or not _KEY_RE.match(key):
-            raise SchemaError(
-                f"{source}: field key {key!r} must match {_KEY_RE.pattern} "
-                "(dotted identifiers only)"
-            )
-
-        if key in seen:
-            raise SchemaError(f"{source}: duplicate field key {key!r}")
-
-        ftype = entry.get("type")
-
-        if ftype not in FIELD_TYPES:
-            raise SchemaError(
-                f"{source}: field {key!r} has type {ftype!r}; expected one of {FIELD_TYPES}"
-            )
-
-        required = bool(entry.get("required", False))
-        seen.add(key)
-        fields.append(Field(key=key, type=ftype, required=required))
-
-    return MetadataSchema(version=version, fields=tuple(fields))
-
-
-# --------------------------------------------------------------------------- #
-# Write-time validation
-# --------------------------------------------------------------------------- #
-_MISSING = object()
-
-
-def _dig(obj: Any, key: str) -> Any:
-    """Follow a dotted key into nested dicts; return _MISSING if absent."""
-    cur: Any = obj
-
-    for part in key.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return _MISSING
-
-        cur = cur[part]
-
-    return cur
-
-
-def _set_path(obj: dict[str, Any], key: str, value: Any) -> None:
-    """Set the value at a dotted key path (parents must already exist)."""
-    parts = key.split(".")
-    cur = obj
-
-    for part in parts[:-1]:
-        cur = cur[part]
-
-    cur[parts[-1]] = value
-
-
-def coerce_text(value: Any, key: str) -> str:
-    """Coerce a value to a 'text' field's string, or raise MetadataViolation."""
-    if isinstance(value, str):
-        return value
-
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise MetadataViolation(
-            f"field {key!r} is declared 'text' but got {type(value).__name__}", key
-        )
-
-    return str(value)
-
-
-def coerce_number(value: Any, key: str) -> float | int:
-    """Coerce a value to a 'number' field, or raise MetadataViolation."""
-    if isinstance(value, bool):
-        raise MetadataViolation(f"field {key!r} is declared 'number' but got a boolean", key)
-
-    if isinstance(value, (int, float)):
-        return value
-
-    if isinstance(value, str):
-        try:
-            return float(value)
-
-        except ValueError:
-            pass
-
-    raise MetadataViolation(
-        f"field {key!r} is declared 'number' but got {type(value).__name__}", key
-    )
-
-
-def validate_metadata(metadata: Any, schema: MetadataSchema) -> dict[str, Any]:
-    """Validate + coerce declared fields. Undeclared keys pass through untouched."""
-    if metadata is None:
-        metadata = {}
-
-    if not isinstance(metadata, dict):
-        raise MetadataViolation("metadata must be a JSON object")
-
-    out = _deep_copy(metadata)
-
-    for field in schema.fields:
-        value = _dig(out, field.key)
-
-        if value is _MISSING or value is None:
-            if field.required:
-                raise MetadataViolation(
-                    f"required metadata field {field.key!r} is missing", field.key
-                )
-
-            continue
-
-        coerced = (
-            coerce_text(value, field.key)
-            if field.type == "text"
-            else coerce_number(value, field.key)
-        )
-
-        if coerced is not value:
-            _set_path(out, field.key, coerced)
-
-    return out
-
-
-def coerce_filter_value(value: Any, field: Field) -> Any:
-    """Coerce a search filter value to its declared field type."""
-    if field.type == "text":
-        return coerce_text(value, field.key)
-
-    return coerce_number(value, field.key)
-
-
-def _deep_copy(value: Any) -> Any:
-    """Recursively copy nested dicts/lists so callers cannot mutate the input."""
-    if isinstance(value, dict):
-        return {k: _deep_copy(v) for k, v in value.items()}
-
-    if isinstance(value, list):
-        return [_deep_copy(v) for v in value]
-
-    return value
-
-
-def index_statements(schema: MetadataSchema) -> Iterable[str]:
-    """`CREATE INDEX IF NOT EXISTS` per declared field — the whole reindex story."""
-    for field in schema.fields:
-        yield f"CREATE INDEX IF NOT EXISTS {field.index_name} ON docs ({meta_expr(field.key)})"
+        return out

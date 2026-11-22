@@ -305,9 +305,10 @@ paths:
               schema: { $ref: '#/components/schemas/DocList' }
         '400':
           description: >
-            Invalid search: an undeclared key (UNDECLARED_FILTER_KEY), an unsupported op
-            or a numeric op on a text field (INVALID_FILTER_OP), a value that does not fit
-            the field's type (INVALID_FILTER_VALUE), a malformed cursor (INVALID_CURSOR).
+            Invalid search: an undeclared key (UNDECLARED_FILTER_KEY), a numeric op on a
+            text field (INVALID_FILTER_OP), a value that does not fit the field's type
+            (INVALID_FILTER_VALUE), a malformed cursor (INVALID_CURSOR). An op outside the
+            enum is a 422 like any malformed body.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '422': { $ref: '#/components/responses/Unprocessable' }
 

@@ -13,7 +13,7 @@ import logging
 import sys
 
 from .config import ConfigError, Settings, configure_logging
-from .metadata import SchemaError, load_schema
+from .metadata import MetadataSchema, SchemaError
 from .volume import GeometryMismatch, Volume
 
 log = logging.getLogger("tiler.preflight")
@@ -41,7 +41,7 @@ def main() -> int:
 async def _run() -> int:
     """Load the config and the schema, open the volume, report what is in it."""
     settings = Settings.from_env()
-    schema = load_schema(settings.store_settings.metadata_schema_path)
+    schema = MetadataSchema.load(settings.store_settings.metadata_schema_path)
 
     volume = await Volume.open(settings, schema)
 

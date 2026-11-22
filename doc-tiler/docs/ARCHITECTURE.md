@@ -327,8 +327,10 @@ format and [API.md](API.md) for the search/CRUD endpoints.
 At startup, for each declared field, create an expression index on the JSON path:
 
 ```python
-def meta_expr(key: str) -> str:                    # SINGLE source of the extraction expression
-    return f"json_extract(metadata, '$.{key}')"    # dotted keys work: '$.source.host'
+class Field:
+    @property
+    def expr(self) -> str:                              # SINGLE source of the extraction expression
+        return f"json_extract(metadata, '$.{self.key}')"  # dotted keys work: '$.source.host'
 ```
 
 SQLite computes the extraction once per row, stores it in a B-tree, and auto-maintains
@@ -339,7 +341,7 @@ later is the same `CREATE INDEX IF NOT EXISTS`; SQLite backfills it. Stale
 
 - **Textual match:** SQLite uses the expression index only when the query's `WHERE`
   expression is *textually identical* to the index's. The query builder MUST build
-  predicates through the same `meta_expr(key)` helper. Verified with `EXPLAIN QUERY
+  predicates through the same `Field.expr`. Verified with `EXPLAIN QUERY
   PLAN` in tests: expect `SEARCH ... USING INDEX idx_meta_*`, not `SCAN`.
 - **STAT4 is required for selective range filters.** A numeric range (`year > 2050`)
   uses `idx_meta_year` only if the planner can tell the range is selective, which needs
@@ -354,7 +356,7 @@ later is the same `CREATE INDEX IF NOT EXISTS`; SQLite backfills it. Stale
 
 ### The query planner, honestly
 
-Every predicate is built through `meta_expr()`, so expressions match textually. Two
+Every predicate is built through `Field.expr`, so expressions match textually. Two
 caveats about what the planner then does:
 
 - **`ne` (`<>`) is not a seekable B-tree constraint** — in any SQL engine. Queries
@@ -567,7 +569,7 @@ tiler/
   events.py          # what a tile stream consists of: Begin, Tile, Committed (Error on the wire); an event's NDJSON line
   tiles.py           # Tiles: a stored doc's tiles by its id, rendered from its blob (one tile, or its event stream); the tile cache
   capture.py         # URL capture: SSRF policy + guard proxy + MHTML snapshot
-  metadata.py        # the declared metadata schema: load, meta_expr(), validation, CREATE INDEX statements
+  metadata.py        # the declared metadata schema: MetadataSchema (load, validation, CREATE INDEX statements) and its Fields (expr, coerce)
   revision.py        # serving gate + the job that brings stored docs to the current render_version
   config.py          # the TILER_* variables in sections (geometry, pixel, render, store, capture, revision, api) + render_version
   volume.py          # Volume.open: the DB and the blob dir opened, bound to their geometry (service_meta), indexed by the schema
@@ -584,5 +586,5 @@ tiler/
   ssrf.py  ssrf_proxy.py  hashing.py               # URL policy + the proxy that pins Chromium to it + sha256
 ```
 
-`meta_expr()` is the single source of the JSON extraction expression used by both index
+`Field.expr` is the single source of the JSON extraction expression used by both index
 creation and query building. `tini` is PID 1 to reap Chromium's zombie renderers.

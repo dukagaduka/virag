@@ -23,7 +23,6 @@ from typing import AsyncIterable, AsyncIterator, BinaryIO
 import anyio
 
 from ..errors import not_found
-from ..hashing import blob_rel_path
 
 
 @dataclass(frozen=True)
@@ -60,14 +59,16 @@ class BlobStore:
         probe.unlink()
 
 
-    def rel_path(self, doc_id: str) -> str:
-        """Return the blob's path relative to the root."""
-        return blob_rel_path(doc_id)
+    @staticmethod
+    def rel_path(doc_id: str) -> str:
+        """The blob's path relative to the root: `ab/cd/<hash>` — deliberately
+        isomorphic to an S3 key."""
+        return f"{doc_id[0:2]}/{doc_id[2:4]}/{doc_id}"
 
 
     def path(self, doc_id: str) -> Path:
         """Return the blob's absolute filesystem path."""
-        return self.root / blob_rel_path(doc_id)
+        return self.root / self.rel_path(doc_id)
 
 
     def exists(self, doc_id: str) -> bool:
@@ -122,7 +123,7 @@ class BlobStore:
         blob may be there already (identical content): the upload is then dropped."""
         await asyncio.to_thread(self._commit, incoming.path, self.path(incoming.doc_id))
 
-        return blob_rel_path(incoming.doc_id)
+        return self.rel_path(incoming.doc_id)
 
 
     async def discard(self, incoming: Incoming) -> None:

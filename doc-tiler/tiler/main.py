@@ -20,7 +20,7 @@ from .capture import UrlCapture
 from .config import ConfigError, Settings, configure_logging
 from .errors import install_error_handlers
 from .ingest import Ingester
-from .metadata import SchemaError, load_schema
+from .metadata import MetadataSchema, SchemaError
 from .render.pool import RenderPool
 from .render.readers import RenderParams
 from .render.renderer import Renderer
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
 
     try:
         settings = Settings.from_env()
-        schema = load_schema(settings.store_settings.metadata_schema_path)
+        schema = MetadataSchema.load(settings.store_settings.metadata_schema_path)
 
     except (ConfigError, SchemaError) as exc:
         log.critical("FATAL: %s", exc)
