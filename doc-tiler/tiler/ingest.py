@@ -27,7 +27,6 @@ import anyio
 
 from . import events, media, metrics
 from .capture import UrlCapture
-from .config import Settings
 from .errors import ApiError, bad_request, conflict
 from .meta.schema import MetadataSchema
 from .models import DocType
@@ -51,7 +50,8 @@ class Ingester:
         capture: UrlCapture,
         tiles: Tiles,
         schema: MetadataSchema,
-        settings: Settings,
+        *,
+        render_version: str,
     ):
 
         self.store    = store
@@ -61,7 +61,7 @@ class Ingester:
         self.tiles    = tiles
         self.schema   = schema
 
-        self.render_version = settings.render_version
+        self.render_version = render_version
 
 
     async def ingest(

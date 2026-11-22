@@ -71,7 +71,7 @@ async def readyz(request: Request) -> Response:
 
     browser = state.pool.browser
 
-    if state.settings.browser_enabled:
+    if state.settings.render_settings.browser_enabled:
         checks["browser"] = "ok" if browser.available else f"unavailable: {browser.start_error}"
 
         if not browser.available:
@@ -110,29 +110,31 @@ async def info(request: Request) -> dict[str, Any]:
     """Report effective geometry, render_version, revision gate, policy, pools and cache stats."""
     state = request.app.state
     settings = state.settings
+    render = settings.render_settings
+    capture = settings.capture_settings
 
     return {
         "version": __version__,
-        "geometry": settings.geometry,
+        "geometry": settings.geometry_settings.tier,
         "render_version": settings.render_version,
         "volume_id": state.volume_id,
-        "pixel_tier": settings.pixel_tier,
+        "pixel_tier": settings.pixel_settings.tier,
         "revision": state.revision.status,
         "policy": {
-            "revision_on_render_mismatch": settings.revision_on_render_mismatch,
-            "url_fetch_enabled": settings.url_fetch_enabled,
-            "url_allow_private": settings.url_allow_private,
-            "allow_delete": settings.allow_delete,
+            "revision_on_render_mismatch": settings.revision_settings.revision_on_render_mismatch,
+            "url_fetch_enabled": capture.url_fetch_enabled,
+            "url_allow_private": capture.url_allow_private,
+            "allow_delete": settings.api_settings.allow_delete,
             "ssrf_guard_proxy": state.capture.guard_proxy.url if state.capture.guard_proxy else None,
         },
         "pools": {
-            "browsers": settings.browsers,
-            "render_workers": settings.render_workers,
-            "bulk_browsers": settings.bulk_browsers,
-            "bulk_render_workers": settings.bulk_render_workers,
+            "browsers": render.browsers,
+            "render_workers": render.render_workers,
+            "bulk_browsers": render.bulk_browsers,
+            "bulk_render_workers": render.bulk_render_workers,
             "browser_available": state.pool.browser.available,
-            "render_worker_memory": settings.render_worker_memory,
-            "render_timeout_sec": settings.render_timeout_sec,
+            "render_worker_memory": render.render_worker_memory,
+            "render_timeout_sec": render.render_timeout_sec,
             "render_worker_restarts": state.pool.worker_restarts,
         },
         "cache": {"tile": state.tiles.cache.stats(), "page": state.pool.page_cache.stats()},

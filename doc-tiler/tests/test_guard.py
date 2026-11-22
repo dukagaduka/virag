@@ -95,26 +95,27 @@ def test_preflight_exits_non_zero_on_geometry_change(tmp_path):
 
 
 async def test_render_version_covers_both_tiers():
-    from tiler.config import Settings
+    from tiler.config import GeometrySettings, PixelSettings, Settings, StoreSettings
 
     base = Settings()
-    assert base.render_version != Settings(tile_height=512).render_version
-    assert base.render_version != Settings(jpeg_quality=90).render_version
-    assert base.render_version != Settings(pdf_dpi=150).render_version
+    assert base.render_version != Settings(geometry_settings=GeometrySettings(tile_height=512)).render_version
+    assert base.render_version != Settings(pixel_settings=PixelSettings(jpeg_quality=90)).render_version
+    assert base.render_version != Settings(pixel_settings=PixelSettings(pdf_dpi=150)).render_version
     assert base.render_version == Settings().render_version  # stable
-    assert base.render_version == Settings(max_doc_bytes=1).render_version  # not a tier
+    assert base.render_version == Settings(store_settings=StoreSettings(max_doc_bytes=1)).render_version  # not a tier
 
 
-@pytest.mark.parametrize("overrides", [{}, {"pdf_slice": True}, {"jpeg_quality": 60}])
-async def test_render_version_is_serializer_independent(overrides):
+@pytest.mark.parametrize("geometry, pixel", [({}, {}), ({"pdf_slice": True}, {}), ({}, {"jpeg_quality": 60})])
+async def test_render_version_is_serializer_independent(geometry, pixel):
     """orjson must hash exactly the bytes stdlib json did, or every volume would revise."""
     import hashlib
     import json
 
-    from tiler.config import Settings
+    from tiler.config import GeometrySettings, PixelSettings, Settings
 
-    s = Settings(**overrides)
-    tiers = {"geometry": s.geometry, "pixel": s.pixel_tier, **({"pdf": s.pdf_tier} if s.pdf_slice else {})}
+    g, p = GeometrySettings(**geometry), PixelSettings(**pixel)
+    s = Settings(geometry_settings=g, pixel_settings=p)
+    tiers = {"geometry": g.tier, "pixel": p.tier, **({"pdf": g.pdf_tier} if g.pdf_slice else {})}
     legacy = json.dumps(tiers, sort_keys=True, separators=(",", ":"))
     assert s.render_version == hashlib.sha256(legacy.encode()).hexdigest()[:16]
 

@@ -74,7 +74,7 @@ tiler/            the service package
   events.py       the events of a tile stream (Begin, Tile, Committed) and their NDJSON lines
   tiles.py        Tiles: a stored doc's tiles by its id, rendered from its blob; the tile cache
   revision.py     serving gate + re-render of docs from another render_version
-  config.py       env, geometry/pixel tiers, render_version
+  config.py       the TILER_* variables in sections, geometry/pixel tiers, render_version
   guard.py        startup geometry guard
   api/            ingest, tiles, docs, metadata, search, revision, ops
   render/         renderer (file → tiles), documents, readers (PDF, images), pool (render workers + Chromium), browser, geometry, types

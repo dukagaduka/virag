@@ -24,7 +24,7 @@ from typing import Any, ClassVar
 import pymupdf
 from PIL import Image
 
-from ..config import MAX_SUPERSAMPLE, Settings
+from ..config import MAX_SUPERSAMPLE, GeometrySettings, PixelSettings
 from ..models import DocType
 from .geometry import Tile, Tiling, resized_height
 from .render import DecodeError, EmptyDocument, RenderTooLarge, crop_rows, fit_width, open_image
@@ -32,7 +32,8 @@ from .render import DecodeError, EmptyDocument, RenderTooLarge, crop_rows, fit_w
 
 @dataclass(frozen=True)
 class RenderParams:
-    """The render settings a document needs; small and picklable, unlike Settings."""
+    """What a document renders by — its geometry and pixel settings; small and picklable,
+    unlike the settings themselves."""
 
     tile_width: int
     jpeg_quality: int
@@ -43,16 +44,16 @@ class RenderParams:
 
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> RenderParams:
+    def from_settings(cls, geometry: GeometrySettings, pixel: PixelSettings) -> RenderParams:
         """The render params of the running configuration."""
-        s = settings
+        g = geometry
 
         return cls(
-            tile_width=s.tile_width,
-            jpeg_quality=s.jpeg_quality,
-            pdf_dpi=s.pdf_dpi,
-            tiling=Tiling(s.tile_height, s.tile_overlap, s.min_tile_height),
-            pdf_tiling=Tiling(s.pdf_tile_height, s.pdf_tile_overlap, s.min_tile_height, whole=not s.pdf_slice),
+            tile_width=g.tile_width,
+            jpeg_quality=pixel.jpeg_quality,
+            pdf_dpi=pixel.pdf_dpi,
+            tiling=Tiling(g.tile_height, g.tile_overlap, g.min_tile_height),
+            pdf_tiling=Tiling(g.pdf_tile_height, g.pdf_tile_overlap, g.min_tile_height, whole=not g.pdf_slice),
         )
 
 

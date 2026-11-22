@@ -12,7 +12,7 @@ import logging
 import os
 import sys
 
-from .config import ConfigError, load_settings
+from .config import ConfigError, Settings
 from .guard import GeometryMismatch, enforce
 from .main import configure_logging
 from .meta.schema import SchemaError, index_statements, load_schema
@@ -24,15 +24,16 @@ log = logging.getLogger("tiler.preflight")
 
 async def _run() -> int:
     """Load config/schema, prepare storage, and enforce the geometry guard."""
-    settings = load_settings()
-    schema = load_schema(settings.metadata_schema_path)
+    settings = Settings.from_env()
+    paths = settings.store_settings
+    schema = load_schema(paths.metadata_schema_path)
 
-    os.makedirs(os.path.dirname(os.path.abspath(settings.db_path)) or ".", exist_ok=True)
-    os.makedirs(settings.temp_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(paths.db_path)) or ".", exist_ok=True)
+    os.makedirs(paths.temp_dir, exist_ok=True)
 
-    BlobStore(settings.blob_dir).ensure_root()
+    BlobStore(paths.blob_dir).ensure_root()
 
-    store = MetaStore(settings.db_path)
+    store = MetaStore(paths.db_path)
     await store.connect()
 
     try:
@@ -47,7 +48,7 @@ async def _run() -> int:
 
     log.info(
         "preflight ok: geometry=%s render_version=%s docs=%d to_revise=%d searchable=%s",
-        settings.geometry,
+        settings.geometry_settings.tier,
         settings.render_version,
         docs,
         revisable,

@@ -14,7 +14,7 @@ from contextlib import aclosing
 from typing import AsyncIterator
 
 from . import events, metrics
-from .config import Settings
+from .config import RenderSettings
 from .errors import bad_request, conflict, gone, not_found
 from .hashing import sha256_hex
 from .render.geometry import Tile
@@ -32,7 +32,7 @@ class Tiles:
     owns the tile cache."""
 
 
-    def __init__(self, store: MetaStore, blobs: BlobStore, renderer: Renderer, settings: Settings):
+    def __init__(self, store: MetaStore, blobs: BlobStore, renderer: Renderer, settings: RenderSettings):
         self.store    = store
         self.blobs    = blobs
         self.renderer = renderer

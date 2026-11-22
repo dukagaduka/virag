@@ -57,7 +57,7 @@ async def get_tile(
             "X-Image-Hash": tile_row.image_hash,
             "X-Render-Version": row.render_version,
             "X-Tile-Height": str(tile_row.height),
-            "X-Tile-Width": str(state.settings.tile_width),
+            "X-Tile-Width": str(state.settings.geometry_settings.tile_width),
             "Cache-Control": "public, max-age=31536000, immutable",
         },
     )

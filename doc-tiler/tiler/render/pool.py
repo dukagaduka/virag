@@ -24,7 +24,7 @@ from typing import Any, AsyncIterator, Callable
 import pebble
 
 from .. import metrics
-from ..config import Settings
+from ..config import RenderSettings
 from ..errors import ApiError, bad_gateway, gateway_timeout, unprocessable
 from ..store.cache import AsyncLRU
 from . import render, worker
@@ -38,10 +38,12 @@ class RenderPool:
     """Owns the render process pool and the Chromium pool."""
 
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: RenderSettings, params: RenderParams, *, temp_dir: str):
         self.settings = settings
-        self.params = RenderParams.from_settings(settings)
-        self.browser = BrowserPool(settings)
+        self.params   = params
+        self.temp_dir = temp_dir  # scratch files of a render (MHTML archives opened by Chromium)
+
+        self.browser = BrowserPool(settings, viewport=(params.tile_width, params.tiling.height))
         # Full-page MHTML captures, per document: one render serves all of a doc's tiles.
         self.page_cache = AsyncLRU(max(2, settings.render_cache_size // 8), "page")
         self.worker_restarts = 0

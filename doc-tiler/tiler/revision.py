@@ -39,7 +39,7 @@ import time
 from typing import Any, AsyncIterator
 
 from . import metrics
-from .config import Settings
+from .config import RevisionSettings
 from .errors import ApiError, conflict
 from .render.renderer import Renderer
 from .store.blobs import BlobStore
@@ -65,7 +65,9 @@ class Revision:
         blobs: BlobStore,
         renderer: Renderer,
         tiles: Tiles,
-        settings: Settings,
+        settings: RevisionSettings,
+        *,
+        render_version: str,
     ):
 
         self.store    = store
@@ -73,10 +75,9 @@ class Revision:
         self.renderer = renderer
         self.tiles    = tiles
 
-        self.render_version = settings.render_version
+        self.render_version = render_version
         self.on_mismatch    = settings.revision_on_render_mismatch
         self.concurrency    = settings.revision_concurrency
-        self.db_path        = settings.db_path
 
         self.serving = False
         self._task: asyncio.Task | None = None
@@ -304,7 +305,7 @@ class Revision:
     async def _backup(self) -> None:
         """Copy the DB aside once per source render_version, before the first write."""
         meta = await self.store.get_service_meta()
-        path = f"{self.db_path}.bak-{meta.render_version}"
+        path = f"{self.store.db_path}.bak-{meta.render_version}"
 
         if os.path.exists(path):
             log.info("revision: keeping the existing backup %s", path)

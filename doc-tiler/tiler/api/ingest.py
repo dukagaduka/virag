@@ -48,7 +48,7 @@ async def ingest_document(
     absence of `committed` means the ingest did not complete.
     """
     state = request.app.state
-    limit = state.settings.max_doc_bytes
+    limit = state.settings.store_settings.max_doc_bytes
 
     doc_type = _doc_type(doc_type, document)
     _check_declared_size(request, limit)

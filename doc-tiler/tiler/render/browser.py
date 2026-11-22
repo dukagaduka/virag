@@ -15,7 +15,7 @@ import shutil
 import tempfile
 from typing import Any
 
-from ..config import Settings
+from ..config import RenderSettings
 from ..metrics import BROWSER_RECYCLES
 
 log = logging.getLogger("tiler.browser")
@@ -72,8 +72,9 @@ class BrowserPool:
     """One long-lived Chromium, `N_BROWSERS` concurrent contexts, periodic recycle."""
 
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: RenderSettings, *, viewport: tuple[int, int]):
         self._s = settings
+        self._viewport = viewport  # a tile's width and height
         self._pw: Any = None
         self._browser: Any = None
         self._sem = asyncio.Semaphore(settings.browsers)
@@ -192,7 +193,7 @@ class BrowserPool:
 
             try:
                 opts: dict[str, Any] = {
-                    "viewport": {"width": self._s.tile_width, "height": self._s.tile_height},
+                    "viewport": {"width": self._viewport[0], "height": self._viewport[1]},
                     "device_scale_factor": 1,
                     "locale": "en-US",
                     "timezone_id": "UTC",
@@ -237,7 +238,7 @@ class BrowserPool:
 # --------------------------------------------------------------------------- #
 # Rendering operations
 # --------------------------------------------------------------------------- #
-async def _prepare(page: Any, settings: Settings) -> None:
+async def _prepare(page: Any, settings: RenderSettings) -> None:
     """Settle the page before capture: await network idle, freeze animations, wait for fonts."""
     if settings.wait_network_idle:
         with contextlib.suppress(Exception):
@@ -288,7 +289,7 @@ def _map_error(exc: Exception) -> Exception:
 
 
 async def capture_url_mhtml(
-    pool: BrowserPool, settings: Settings, url: str, proxy: str | None
+    pool: BrowserPool, settings: RenderSettings, url: str, proxy: str | None
 ) -> bytes:
     """Navigate to `url` and snapshot it as MHTML — the archived blob we store.
 
@@ -316,14 +317,14 @@ async def capture_url_mhtml(
 
 
 @contextlib.asynccontextmanager
-async def mhtml_page(pool: BrowserPool, settings: Settings, path: str):
+async def mhtml_page(pool: BrowserPool, settings: RenderSettings, temp_dir: str, path: str):
     """Load a stored MHTML archive in a fresh tab (Chromium reads MHTML natively).
 
     Chromium recognises the archive by its `.mhtml` suffix, which a content-addressed
     blob lacks, so it is opened through a hard link (a copy across file systems).
     """
-    os.makedirs(settings.temp_dir, exist_ok=True)
-    fd, link = tempfile.mkstemp(suffix=".mhtml", dir=settings.temp_dir)
+    os.makedirs(temp_dir, exist_ok=True)
+    fd, link = tempfile.mkstemp(suffix=".mhtml", dir=temp_dir)
     os.close(fd)
     os.unlink(link)
 
@@ -351,8 +352,8 @@ async def mhtml_page(pool: BrowserPool, settings: Settings, path: str):
             os.unlink(link)
 
 
-async def clip(page: Any, settings: Settings, offset: int, height: int) -> bytes:
-    """Screenshot rows `[offset, offset + height)` of the page as PNG bytes."""
+async def clip(page: Any, settings: RenderSettings, width: int, offset: int, height: int) -> bytes:
+    """Screenshot rows `[offset, offset + height)` of the page, `width` wide, as PNG bytes."""
     try:
         # Scroll the region into view first so lazy-loaded content rasterizes.
         await page.evaluate("y => window.scrollTo(0, y)", offset)
@@ -369,7 +370,7 @@ async def clip(page: Any, settings: Settings, offset: int, height: int) -> bytes
             animations="disabled",
             caret="hide",
             scale="css",
-            clip={"x": 0, "y": offset - scroll_y, "width": settings.tile_width, "height": height},
+            clip={"x": 0, "y": offset - scroll_y, "width": width, "height": height},
         )
 
     except Exception as exc:

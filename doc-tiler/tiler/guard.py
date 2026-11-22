@@ -58,7 +58,7 @@ async def enforce(store: MetaStore, settings: Settings) -> ServiceMeta:
         raise OutdatedVolume(message)
 
     row = await store.get_service_meta()
-    geometry = settings.geometry
+    geometry = settings.geometry_settings.tier
     render_version = settings.render_version
 
     if row is None:

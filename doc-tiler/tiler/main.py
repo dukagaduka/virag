@@ -19,11 +19,12 @@ from .api import search as search_api
 from .api import tiles as tiles_api
 from .api.deps import require_api_key, require_serving
 from .capture import UrlCapture
-from .config import ConfigError, load_settings
+from .config import ConfigError, Settings
 from .errors import install_error_handlers
 from .ingest import Ingester
 from .meta.schema import SchemaError, index_statements, load_schema
 from .render.pool import RenderPool
+from .render.readers import RenderParams
 from .render.renderer import Renderer
 from .responses import OrjsonResponse
 from .revision import Revision
@@ -54,25 +55,33 @@ async def lifespan(app: FastAPI):
     configure_logging()
 
     try:
-        settings = load_settings()
-        schema = load_schema(settings.metadata_schema_path)
+        settings = Settings.from_env()
+        schema = load_schema(settings.store_settings.metadata_schema_path)
 
     except (ConfigError, SchemaError) as exc:
         log.critical("FATAL: %s", exc)
         raise SystemExit(1) from exc
 
-    os.makedirs(os.path.dirname(os.path.abspath(settings.db_path)) or ".", exist_ok=True)
-    os.makedirs(settings.temp_dir, exist_ok=True)
+    paths = settings.store_settings
+    render_version = settings.render_version
 
-    store = MetaStore(settings.db_path)
-    blobs = BlobStore(settings.blob_dir)
-    pool = RenderPool(settings)
+    os.makedirs(os.path.dirname(os.path.abspath(paths.db_path)) or ".", exist_ok=True)
+    os.makedirs(paths.temp_dir, exist_ok=True)
+
+    store = MetaStore(paths.db_path)
+    blobs = BlobStore(paths.blob_dir)
+
+    pool = RenderPool(
+        settings.render_settings,
+        RenderParams.from_settings(settings.geometry_settings, settings.pixel_settings),
+        temp_dir=paths.temp_dir,
+    )
     renderer = Renderer(pool)
-    capture = UrlCapture(settings, pool)
+    capture = UrlCapture(settings.capture_settings, pool)
 
-    tiles = Tiles(store, blobs, renderer, settings)
-    ingester = Ingester(store, blobs, renderer, capture, tiles, schema, settings)
-    revision = Revision(store, blobs, renderer, tiles, settings)
+    tiles = Tiles(store, blobs, renderer, settings.render_settings)
+    ingester = Ingester(store, blobs, renderer, capture, tiles, schema, render_version=render_version)
+    revision = Revision(store, blobs, renderer, tiles, settings.revision_settings, render_version=render_version)
 
     # Everything below must succeed before the first request is served. Whatever is
     # started registers its own shutdown at once, so a failed step still closes what
@@ -124,7 +133,7 @@ async def lifespan(app: FastAPI):
         await capture.start()
         stack.push_async_callback(capture.stop)
 
-        await pool.start(browser=settings.browser_enabled, per_context_proxy=capture.proxied)
+        await pool.start(browser=settings.render_settings.browser_enabled, per_context_proxy=capture.proxied)
         stack.push_async_callback(pool.stop)
 
         metrics.DOCS.set(await store.count_docs())
@@ -147,16 +156,16 @@ async def lifespan(app: FastAPI):
         log.info(
             "%s: geometry=%s render_version=%s browsers=%d render_workers=%d",
             "ready" if revision.serving else f"not serving (revision {revision.status['state']})",
-            settings.geometry,
-            settings.render_version,
-            settings.browsers,
-            settings.render_workers,
+            settings.geometry_settings.tier,
+            render_version,
+            settings.render_settings.browsers,
+            settings.render_settings.render_workers,
         )
 
-        if not settings.api_key:
+        if not settings.api_settings.api_key:
             log.warning("TILER_API_KEY is empty: every route is open to anyone who reaches the port")
 
-        if not settings.render_worker_memory:
+        if not settings.render_settings.render_worker_memory:
             log.warning(
                 "TILER_RENDER_WORKER_MEMORY is 0: a heavy document can exhaust the container's "
                 "memory and draw the OOM killer instead of failing on its own"

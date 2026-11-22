@@ -231,7 +231,7 @@ class MhtmlDocument(Document):
 
         for tile in tiles:
             async with self.pool.browser_errors():
-                png = await web.clip(await self._page(), self.pool.settings, tile.offset, tile.height)
+                png = await web.clip(await self._page(), self.pool.settings, self.params.tile_width, tile.offset, tile.height)
 
             encoded.append(await self.pool.run(render.encode_strip, png, p.tile_width, p.jpeg_quality, bulk=self.bulk))
 
@@ -260,7 +260,7 @@ class MhtmlDocument(Document):
         """The loaded archive in a Chromium tab, opened on first use."""
         if self._tab is None:
             self._tab = await self._stack.enter_async_context(
-                web.mhtml_page(self.pool.browser, self.pool.settings, self.path)
+                web.mhtml_page(self.pool.browser, self.pool.settings, self.pool.temp_dir, self.path)
             )
 
         return self._tab

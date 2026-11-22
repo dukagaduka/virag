@@ -75,7 +75,7 @@ async def delete_document(request: Request, doc_id: str) -> Response:
     """Delete a document's rows and blob when deletion is enabled."""
     state = request.app.state
 
-    if not state.settings.allow_delete:
+    if not state.settings.api_settings.allow_delete:
         raise ApiError(
             405, "DELETE_DISABLED", "deletion is disabled; start with TILER_ALLOW_DELETE=true"
         )

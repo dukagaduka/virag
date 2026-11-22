@@ -223,9 +223,9 @@ async def test_revision_keeps_pdf_strip_slicing(tmp_path):
 
 
 async def test_bulk_slots_default_to_half_the_pools(tmp_path):
-    from tiler.config import Settings
+    from tiler.config import RenderSettings
 
-    s = Settings(n_render_workers=8, n_browsers=3)
+    s = RenderSettings(n_render_workers=8, n_browsers=3)
     assert (s.bulk_render_workers, s.bulk_browsers) == (4, 1)
-    assert Settings(n_render_workers=1).bulk_render_workers == 1
-    assert Settings(n_render_workers=8, n_bulk_render_workers=6).bulk_render_workers == 6
+    assert RenderSettings(n_render_workers=1).bulk_render_workers == 1
+    assert RenderSettings(n_render_workers=8, n_bulk_render_workers=6).bulk_render_workers == 6

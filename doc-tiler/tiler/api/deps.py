@@ -42,7 +42,7 @@ def require_api_key(
 ) -> None:
     """Router dependency: a request must carry `Authorization: Bearer <TILER_API_KEY>`;
     an empty TILER_API_KEY leaves the routes open."""
-    expected = request.app.state.settings.api_key
+    expected = request.app.state.settings.api_settings.api_key
 
     if not expected:
         return
