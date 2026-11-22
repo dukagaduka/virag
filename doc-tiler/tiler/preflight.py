@@ -2,49 +2,55 @@
 
 The entrypoint runs this before exec'ing uvicorn so a mismatched volume or a bad
 config produces one clear log line and a non-zero exit — instead of a partially
-started ASGI server reporting a generic startup failure.
+started ASGI server reporting a generic startup failure. It opens the volume exactly
+as the service is about to (`Volume.open`), and closes it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 
-from .config import ConfigError, Settings
-from .guard import GeometryMismatch, enforce
-from .main import configure_logging
-from .meta.schema import SchemaError, index_statements, load_schema
-from .store.blobs import BlobStore
-from .store.meta import MetaStore
+from .config import ConfigError, Settings, configure_logging
+from .meta.schema import SchemaError, load_schema
+from .volume import GeometryMismatch, Volume
 
 log = logging.getLogger("tiler.preflight")
 
 
-async def _run() -> int:
-    """Load config/schema, prepare storage, and enforce the geometry guard."""
-    settings = Settings.from_env()
-    paths = settings.store_settings
-    schema = load_schema(paths.metadata_schema_path)
-
-    os.makedirs(os.path.dirname(os.path.abspath(paths.db_path)) or ".", exist_ok=True)
-    os.makedirs(paths.temp_dir, exist_ok=True)
-
-    BlobStore(paths.blob_dir).ensure_root()
-
-    store = MetaStore(paths.db_path)
-    await store.connect()
+def main() -> int:
+    """Run preflight, returning 0 on success or 1 on any fatal problem."""
+    configure_logging()
 
     try:
-        await store.create_tables()
-        await enforce(store, settings)
-        await store.create_metadata_indexes(index_statements(schema))
-        docs = await store.count_docs()
-        revisable = await store.count_revisable(settings.render_version)
+        return asyncio.run(_run())
+
+    except GeometryMismatch:
+        return 1  # already logged at CRITICAL where it was found
+
+    except (ConfigError, SchemaError) as exc:
+        log.critical("FATAL: %s", exc)
+        return 1
+
+    except Exception as exc:  # storage/permission problems
+        log.critical("FATAL: preflight failed: %s: %s", type(exc).__name__, exc)
+        return 1
+
+
+async def _run() -> int:
+    """Load the config and the schema, open the volume, report what is in it."""
+    settings = Settings.from_env()
+    schema = load_schema(settings.store_settings.metadata_schema_path)
+
+    volume = await Volume.open(settings, schema)
+
+    try:
+        docs = await volume.store.count_docs()
+        revisable = await volume.store.count_revisable(settings.render_version)
 
     finally:
-        await store.close()
+        await volume.close()
 
     log.info(
         "preflight ok: geometry=%s render_version=%s docs=%d to_revise=%d searchable=%s",
@@ -56,25 +62,6 @@ async def _run() -> int:
     )
 
     return 0
-
-
-def main() -> int:
-    """Run preflight, returning 0 on success or 1 on any fatal problem."""
-    configure_logging()
-
-    try:
-        return asyncio.run(_run())
-
-    except GeometryMismatch:
-        return 1  # already logged at CRITICAL by the guard
-
-    except (ConfigError, SchemaError) as exc:
-        log.critical("FATAL: %s", exc)
-        return 1
-
-    except Exception as exc:  # storage/permission problems
-        log.critical("FATAL: preflight failed: %s: %s", type(exc).__name__, exc)
-        return 1
 
 
 if __name__ == "__main__":

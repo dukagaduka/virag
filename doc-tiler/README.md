@@ -69,13 +69,13 @@ model.
 
 ```
 tiler/            the service package
-  main.py         app + lifespan (guard → indexes → pools → revision gate), routes
+  main.py         app + lifespan (volume → pools → revision gate), routes
   ingest.py       Ingester: a document's way into the store, and out of it
   events.py       the events of a tile stream (Begin, Tile, Committed) and their NDJSON lines
   tiles.py        Tiles: a stored doc's tiles by its id, rendered from its blob; the tile cache
   revision.py     serving gate + re-render of docs from another render_version
   config.py       the TILER_* variables in sections, geometry/pixel tiers, render_version
-  guard.py        startup geometry guard
+  volume.py       the volume opened: DB + blobs, the startup geometry guard, metadata indexes
   api/            ingest, tiles, docs, metadata, search, revision, ops
   render/         renderer (file → tiles), documents, readers (PDF, images), pool (render workers + Chromium), browser, geometry, types
   store/          blobs (content-addressed FS), meta (SQLite), cache (async LRU)

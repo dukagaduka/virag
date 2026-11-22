@@ -1,15 +1,13 @@
-"""FastAPI app: startup wiring (guard, DB, metadata indexes, pools, revision gate) and route registration."""
+"""FastAPI app: startup wiring (the volume, the pools, the revision gate) and route registration."""
 
 from __future__ import annotations
 
 import logging
-import os
-import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__, guard, metrics
+from . import __version__, metrics
 from .api import docs as docs_api
 from .api import ingest as ingest_api
 from .api import metadata as metadata_api
@@ -19,18 +17,17 @@ from .api import search as search_api
 from .api import tiles as tiles_api
 from .api.deps import require_api_key, require_serving
 from .capture import UrlCapture
-from .config import ConfigError, Settings
+from .config import ConfigError, Settings, configure_logging
 from .errors import install_error_handlers
 from .ingest import Ingester
-from .meta.schema import SchemaError, index_statements, load_schema
+from .meta.schema import SchemaError, load_schema
 from .render.pool import RenderPool
 from .render.readers import RenderParams
 from .render.renderer import Renderer
 from .responses import OrjsonResponse
 from .revision import Revision
-from .store.blobs import BlobStore
-from .store.meta import MetaStore
 from .tiles import Tiles
+from .volume import GeometryMismatch, Volume
 
 log = logging.getLogger("tiler")
 
@@ -39,15 +36,6 @@ DESCRIPTION = (
     "(width=875, height<=1024) for a pixel-based RAG embedder, and regenerates any "
     "single tile on demand from the stored original."
 )
-
-
-def configure_logging() -> None:
-    """Send structured logs to stdout at the LOG_LEVEL from the environment."""
-    logging.basicConfig(
-        level=os.environ.get("TILER_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        stream=sys.stdout,
-    )
 
 
 @asynccontextmanager
@@ -62,72 +50,47 @@ async def lifespan(app: FastAPI):
         log.critical("FATAL: %s", exc)
         raise SystemExit(1) from exc
 
-    paths = settings.store_settings
     render_version = settings.render_version
-
-    os.makedirs(os.path.dirname(os.path.abspath(paths.db_path)) or ".", exist_ok=True)
-    os.makedirs(paths.temp_dir, exist_ok=True)
-
-    store = MetaStore(paths.db_path)
-    blobs = BlobStore(paths.blob_dir)
-
-    pool = RenderPool(
-        settings.render_settings,
-        RenderParams.from_settings(settings.geometry_settings, settings.pixel_settings),
-        temp_dir=paths.temp_dir,
-    )
-    renderer = Renderer(pool)
-    capture = UrlCapture(settings.capture_settings, pool)
-
-    tiles = Tiles(store, blobs, renderer, settings.render_settings)
-    ingester = Ingester(store, blobs, renderer, capture, tiles, schema, render_version=render_version)
-    revision = Revision(store, blobs, renderer, tiles, settings.revision_settings, render_version=render_version)
 
     # Everything below must succeed before the first request is served. Whatever is
     # started registers its own shutdown at once, so a failed step still closes what
     # was already opened (LIFO).
     async with AsyncExitStack() as stack:
-        blobs.ensure_root()
-
-        await store.connect()
-        stack.push_async_callback(store.close)
-
-        await store.create_tables()
-
         try:
-            # Hard geometry gate: refuse to start against a volume built with different geometry.
-            volume_id = (await guard.enforce(store, settings)).volume_id
+            # The volume as the configuration wants it — or no start at all: never a
+            # single request against a volume built with another geometry.
+            volume = await Volume.open(settings, schema)
 
-        except guard.GeometryMismatch as exc:
-            # Never serve a single request against a mismatched volume.
+        except GeometryMismatch as exc:
             raise SystemExit(1) from exc
 
-        # No ingest outlives its process: drop what a killed one left half-done.
-        unfinished = await store.delete_incomplete()
-        spooled = blobs.purge_incoming()
+        stack.push_async_callback(volume.close)
+        store, blobs = volume.store, volume.blobs
 
-        if unfinished or spooled:
-            log.warning(
-                "removed %d unfinished ingest(s) and %d spooled upload(s) the previous run left behind",
-                unfinished,
-                spooled,
-            )
-
-        created = await store.create_metadata_indexes(index_statements(schema))
-        dropped = await store.drop_stale_metadata_indexes({f.index_name for f in schema.fields})
+        await volume.drop_unfinished()
 
         log.info(
-            "metadata schema v%s: %d searchable field(s) %s%s",
+            "metadata schema v%s: %d searchable field(s) %s",
             schema.version,
             len(schema.fields),
             [f.key for f in schema.fields],
-            f"; dropped stale index(es) {dropped}" if dropped else "",
         )
-        log.debug("index statements: %s", created)
 
         # Give the planner statistics; without them a selective range filter can lose
         # out to the created_at index (see README, "search and the query planner").
         await store.optimize()
+
+        pool = RenderPool(
+            settings.render_settings,
+            RenderParams.from_settings(settings.geometry_settings, settings.pixel_settings),
+            temp_dir=settings.store_settings.temp_dir,
+        )
+        renderer = Renderer(pool)
+        capture = UrlCapture(settings.capture_settings, pool)
+
+        tiles = Tiles(store, blobs, renderer, settings.render_settings)
+        ingester = Ingester(store, blobs, renderer, capture, tiles, schema, render_version=render_version)
+        revision = Revision(store, blobs, renderer, tiles, settings.revision_settings, render_version=render_version)
 
         # The SSRF guard proxy first: Chromium starts knowing whether it goes through one.
         await capture.start()
@@ -144,7 +107,7 @@ async def lifespan(app: FastAPI):
 
         app.state.settings = settings
         app.state.schema = schema
-        app.state.volume_id = volume_id
+        app.state.volume_id = volume.volume_id
         app.state.store = store
         app.state.blobs = blobs
         app.state.pool = pool

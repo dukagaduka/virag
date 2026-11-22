@@ -399,9 +399,10 @@ if docs rendered by another render_version exist:         # pixel tier
 
 Geometry mismatch is caught **once, globally, before serving anything** — there is no
 per-request geometry gate. To change geometry, deploy against a fresh volume and
-re-ingest. The guard runs both in `lifespan` and standalone as `python -m
-tiler.preflight`, which the container entrypoint runs before uvicorn so a mismatched
-volume produces one clear log line instead of a generic ASGI startup failure.
+re-ingest. The guard is a part of opening the volume (`Volume.open`, `volume.py`), which
+runs both in `lifespan` and standalone as `python -m tiler.preflight` — the container
+entrypoint runs that before uvicorn, so a mismatched volume produces one clear log line
+instead of a generic ASGI startup failure.
 
 The `volume_id` column is a random id given to the volume at init and reported on
 `GET /info`, so a consumer can tell this volume from a fresh or another one behind the
@@ -561,15 +562,15 @@ sliced PDF stream never waits on a group that is itself waiting for a slot.
 ```
 tiler/
   __init__.py        # routes sqlite3 → pysqlite3 (STAT4) before aiosqlite loads; __version__
-  main.py            # app, lifespan (wires the components below: guard, DB, schema+index creation, pools, revision gate), routes
+  main.py            # app, lifespan (opens the volume, wires the components below, starts the pools and the revision gate), routes
   ingest.py          # Ingester: a document's way into the store (spool, render, one commit) and out of it
   events.py          # what a tile stream consists of: Begin, Tile, Committed (Error on the wire); an event's NDJSON line
   tiles.py           # Tiles: a stored doc's tiles by its id, rendered from its blob (one tile, or its event stream); the tile cache
   capture.py         # URL capture: SSRF policy + guard proxy + MHTML snapshot
   revision.py        # serving gate + the job that brings stored docs to the current render_version
   config.py          # the TILER_* variables in sections (geometry, pixel, render, store, capture, revision, api) + render_version
-  guard.py           # startup geometry guard (service_meta)
-  preflight.py       # standalone startup validation (runs before uvicorn)
+  volume.py          # Volume.open: the DB and the blob dir opened, bound to their geometry (service_meta), indexed by the schema
+  preflight.py       # standalone startup validation (runs before uvicorn): opens the volume as the service will
   media.py  metrics.py  errors.py  models.py  responses.py  # mime sniff, Prometheus, error envelope, pydantic, orjson response
   api/  deps.py  ingest.py  tiles.py  docs.py  metadata.py  search.py  revision.py  ops.py
   render/ renderer.py   # Renderer: the one way from a document's file to its tiles; records the renders

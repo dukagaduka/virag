@@ -11,8 +11,10 @@ below double as the reference; the irregular names are spelled out with
 from __future__ import annotations
 
 import hashlib
+import logging
 import multiprocessing
 import os
+import sys
 from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
@@ -32,6 +34,15 @@ MAX_SUPERSAMPLE = 4
 
 class ConfigError(RuntimeError):
     """Raised for an env configuration that can never work; fatal at startup."""
+
+
+def configure_logging() -> None:
+    """Send structured logs to stdout at the LOG_LEVEL from the environment."""
+    logging.basicConfig(
+        level=os.environ.get("TILER_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
 
 
 class _Section(BaseSettings):
@@ -319,7 +330,7 @@ class Settings(_Section):
             tiers["pdf"] = geometry.pdf_tier
 
         # Byte-identical to json.dumps(sort_keys=True, separators=(",", ":")): changing
-        # the serializer must never shift render_version (see test_guard).
+        # the serializer must never shift render_version (see test_volume).
         payload = orjson.dumps(tiers, option=orjson.OPT_SORT_KEYS)
 
         return hashlib.sha256(payload).hexdigest()[:16]

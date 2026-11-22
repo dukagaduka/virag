@@ -1,4 +1,4 @@
-"""The startup geometry guard."""
+"""Opening a volume: its geometry binding, its id, its render_version."""
 
 from __future__ import annotations
 
