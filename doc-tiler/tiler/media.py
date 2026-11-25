@@ -61,7 +61,7 @@ def looks_like_mhtml(data: bytes) -> bool:
     )
 
 
-def check_and_mime(doc_type: DocType, data: bytes) -> str:
+def mime_of(doc_type: DocType, data: bytes) -> str:
     """Validate the payload against the declared type; return the stored mime type."""
     if not data:
         raise unprocessable("document is empty", "EMPTY_DOCUMENT")

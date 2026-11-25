@@ -75,7 +75,7 @@ class Ingester:
         """Ingest a document into the store and return its summary — the event its
         stream ends with.
 
-        Runs the same pipeline as `ingest_stream`, only without emitting the tiles: bytes
+        Runs the same pipeline as `stream`, only without emitting the tiles: bytes
         the store already serves return at once instead of being replayed.
         """
         committed = None
@@ -92,7 +92,7 @@ class Ingester:
         return committed
 
 
-    def ingest_stream(
+    def stream(
         self,
         *,
         doc_type: DocType,
@@ -155,7 +155,7 @@ class Ingester:
                     raise bad_request(f"document is required when doc_type={doc_type}", "MISSING_FILE")
 
                 effective_type = doc_type
-                mime = media.check_and_mime(doc_type, await self.blobs.head(upload))
+                mime = media.mime_of(doc_type, await self.blobs.head(upload))
 
             existing = await self.store.get_doc(upload.doc_id)
 

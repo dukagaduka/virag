@@ -181,7 +181,7 @@ async def test_an_abandoned_reingest_leaves_a_quarantined_doc_as_it_was(tmp_path
         assert (await _revised(state))["quarantined"] == 1
         before = await state.store.get_doc(doc_id)
 
-        stream = state.ingester.ingest_stream(
+        stream = state.ingester.stream(
             doc_type=DocType.IMG, upload=await state.blobs.spool(png), url=None, metadata=None
         )
         assert isinstance(await anext(stream), Begin)

@@ -57,7 +57,7 @@ async def ingest_document(
 
     if tiles:
         return await ndjson_response(
-            state.ingester.ingest_stream(doc_type=doc_type, upload=upload, url=url, metadata=parsed)
+            state.ingester.stream(doc_type=doc_type, upload=upload, url=url, metadata=parsed)
         )
 
     committed = await state.ingester.ingest(doc_type=doc_type, upload=upload, url=url, metadata=parsed)

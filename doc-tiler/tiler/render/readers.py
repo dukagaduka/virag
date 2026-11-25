@@ -76,6 +76,7 @@ class PdfReader(DocumentReader):
     (plus the resampling margin) before downscaling them to tile width.
     """
 
+
     @dataclass(frozen=True)
     class _Page:
         """Where one page sits in the document image and how it is rasterized."""
@@ -119,6 +120,27 @@ class PdfReader(DocumentReader):
         return self._rasterize(page, y0 - page.top, y1 - page.top)
 
 
+    def trim(self) -> None:
+        """Drop the current page's display list; the document and its layout stay."""
+        self._drawn = None
+
+
+    def close(self) -> None:
+        """Close the document."""
+        self.trim()
+
+        if self._doc is not None:
+            with contextlib.suppress(Exception):
+                self._doc.close()
+
+            self._doc = None
+
+        self._pages = None
+
+
+    # ------------------------------------------------------------------ #
+    # internals
+    # ------------------------------------------------------------------ #
     def _open(self) -> Any:
         """The open document; DecodeError when it is not a readable PDF."""
         if self._doc is None:
@@ -253,24 +275,6 @@ class PdfReader(DocumentReader):
             return RenderTooLarge(f"{what}: out of memory ({exc})")
 
         return DecodeError(f"{what}: {exc}")
-
-
-    def trim(self) -> None:
-        """Drop the current page's display list; the document and its layout stay."""
-        self._drawn = None
-
-
-    def close(self) -> None:
-        """Close the document."""
-        self.trim()
-
-        if self._doc is not None:
-            with contextlib.suppress(Exception):
-                self._doc.close()
-
-            self._doc = None
-
-        self._pages = None
 
 
 # --------------------------------------------------------------------------- #

@@ -84,12 +84,12 @@ def not_found(msg: str, code: str = "NOT_FOUND", **details: Any) -> ApiError:
     return ApiError(404, code, msg, details or None)
 
 
-def conflict(msg: str, code: str = "RENDER_MISMATCH", **details: Any) -> ApiError:
+def conflict(msg: str, code: str = "CONFLICT", **details: Any) -> ApiError:
     """Build a 409 error."""
     return ApiError(409, code, msg, details or None)
 
 
-def gone(msg: str, code: str = "QUARANTINED", **details: Any) -> ApiError:
+def gone(msg: str, code: str = "GONE", **details: Any) -> ApiError:
     """Build a 410 error."""
     return ApiError(410, code, msg, details or None)
 
@@ -119,7 +119,7 @@ def not_ready(msg: str, code: str = "NOT_READY", retry_after: int = 30, **detail
     return ApiError(503, code, msg, details or None, headers={"Retry-After": str(retry_after)})
 
 
-def gateway_timeout(msg: str, code: str = "RENDER_TIMEOUT", **details: Any) -> ApiError:
+def gateway_timeout(msg: str, code: str = "GATEWAY_TIMEOUT", **details: Any) -> ApiError:
     """Build a 504 error."""
     return ApiError(504, code, msg, details or None)
 

@@ -96,62 +96,8 @@ class RenderPool:
         return self.running
 
 
-    def _new_pool(self) -> pebble.ProcessPool:
-        """A process pool whose workers cap their own memory and hold the render params."""
-        # 'spawn': the parent runs an event loop and Playwright threads; forking those
-        # into workers is a well-known source of deadlocks.
-        return pebble.ProcessPool(
-            max_workers=self.settings.render_workers,
-            initializer=Worker.start,
-            initargs=(self.settings.render_worker_memory, self.params),
-            context=multiprocessing.get_context("spawn"),
-        )
-
-
-    async def _live_pool(self) -> pebble.ProcessPool:
-        """The process pool, replaced when pebble gave up on it."""
-        pool = self._pool
-
-        if pool is None:
-            raise bad_gateway("the render pool is not running", "WORKER_CRASH")
-
-        if not pool.active:
-            await self._rebuild(pool)
-
-        return self._pool
-
-
-    async def _rebuild(self, broken: pebble.ProcessPool) -> None:
-        """Replace a broken pool, once however many tasks report it, and prove the new
-        one starts: workers that cannot start (WORKER_CRASH) leave it broken."""
-        async with self._rebuild_lock:
-            if self._pool is not broken:
-                return
-
-            log.warning("render pool broken (a worker died with no task running); restarting it")
-            await self._close(broken)
-            self._pool = self._new_pool()
-            self.worker_restarts += 1
-            metrics.WORKER_RESTARTS.labels(reason="pool_broken").inc()
-
-            try:
-                await asyncio.wait_for(asyncio.wrap_future(self._pool.schedule(abs, (0,))), 60)
-
-            except (BrokenProcessPool, TimeoutError) as exc:
-                log.critical("render workers cannot start: %s", exc)
-
-                raise bad_gateway(f"render workers cannot start: {exc}", "WORKER_CRASH") from exc
-
-
-    @staticmethod
-    async def _close(pool: pebble.ProcessPool) -> None:
-        """Stop a pool and reap its workers."""
-        pool.stop()
-        await asyncio.to_thread(pool.join, 10)
-
-
     # ------------------------------------------------------------------ #
-    # CPU tasks
+    # work
     # ------------------------------------------------------------------ #
     async def run(self, fn: Callable[..., Any], *args: Any, bulk: bool = False) -> Any:
         """Run `fn(*args)` in a render worker, mapping render failures to API errors."""
@@ -178,6 +124,41 @@ class RenderPool:
                 metrics.INFLIGHT.labels(layer="cpu").dec()
 
 
+    async def browser_call(self, fn: Callable[..., Any], *args: Any, bulk: bool = False) -> Any:
+        """Run one Chromium operation (e.g. a URL capture) under the browser limits."""
+        async with self.browser_slot(bulk), self.browser_errors():
+            return await fn(*args)
+
+
+    def browser_slot(self, bulk: bool) -> AbstractAsyncContextManager:
+        """What bulk work holds while it uses Chromium (interactive work holds nothing)."""
+        return self._bulk_browser if bulk else nullcontext()
+
+
+    @contextlib.asynccontextmanager
+    async def browser_errors(self) -> AsyncIterator[None]:
+        """Map Chromium failures to API errors, counting the render as in flight."""
+        metrics.INFLIGHT.labels(layer="browser").inc()
+
+        try:
+            yield
+
+        except BrowserUnavailable as exc:
+            raise bad_gateway(f"Chromium is unavailable: {exc}", "BROWSER_UNAVAILABLE") from exc
+
+        except RenderTimeout as exc:
+            raise gateway_timeout(f"render timed out: {exc}", "RENDER_TIMEOUT") from exc
+
+        except RenderFailure as exc:
+            raise bad_gateway(f"render failed: {exc}") from exc
+
+        finally:
+            metrics.INFLIGHT.labels(layer="browser").dec()
+
+
+    # ------------------------------------------------------------------ #
+    # internals
+    # ------------------------------------------------------------------ #
     async def _attempt(self, fn: Callable[..., Any], args: tuple) -> Any:
         """Run the task; when its worker dies, once more.
 
@@ -225,6 +206,53 @@ class RenderPool:
                     raise bad_gateway(f"render workers cannot start: {exc}", "WORKER_CRASH") from exc
 
 
+    async def _live_pool(self) -> pebble.ProcessPool:
+        """The process pool, replaced when pebble gave up on it."""
+        pool = self._pool
+
+        if pool is None:
+            raise bad_gateway("the render pool is not running", "WORKER_CRASH")
+
+        if not pool.active:
+            await self._rebuild(pool)
+
+        return self._pool
+
+
+    async def _rebuild(self, broken: pebble.ProcessPool) -> None:
+        """Replace a broken pool, once however many tasks report it, and prove the new
+        one starts: workers that cannot start (WORKER_CRASH) leave it broken."""
+        async with self._rebuild_lock:
+            if self._pool is not broken:
+                return
+
+            log.warning("render pool broken (a worker died with no task running); restarting it")
+            await self._close(broken)
+            self._pool = self._new_pool()
+            self.worker_restarts += 1
+            metrics.WORKER_RESTARTS.labels(reason="pool_broken").inc()
+
+            try:
+                await asyncio.wait_for(asyncio.wrap_future(self._pool.schedule(abs, (0,))), 60)
+
+            except (BrokenProcessPool, TimeoutError) as exc:
+                log.critical("render workers cannot start: %s", exc)
+
+                raise bad_gateway(f"render workers cannot start: {exc}", "WORKER_CRASH") from exc
+
+
+    def _new_pool(self) -> pebble.ProcessPool:
+        """A process pool whose workers cap their own memory and hold the render params."""
+        # 'spawn': the parent runs an event loop and Playwright threads; forking those
+        # into workers is a well-known source of deadlocks.
+        return pebble.ProcessPool(
+            max_workers=self.settings.render_workers,
+            initializer=Worker.start,
+            initargs=(self.settings.render_worker_memory, self.params),
+            context=multiprocessing.get_context("spawn"),
+        )
+
+
     def _replaced(self, reason: str, exc: BaseException | None = None) -> None:
         """Account for a worker pebble killed or lost and replaced."""
         self.worker_restarts += 1
@@ -233,36 +261,8 @@ class RenderPool:
         log.warning("render worker replaced (%s)%s", reason, f": {exc}" if exc else "")
 
 
-    # ------------------------------------------------------------------ #
-    # Chromium
-    # ------------------------------------------------------------------ #
-    def browser_slot(self, bulk: bool) -> AbstractAsyncContextManager:
-        """What bulk work holds while it uses Chromium (interactive work holds nothing)."""
-        return self._bulk_browser if bulk else nullcontext()
-
-
-    @contextlib.asynccontextmanager
-    async def browser_errors(self) -> AsyncIterator[None]:
-        """Map Chromium failures to API errors, counting the render as in flight."""
-        metrics.INFLIGHT.labels(layer="browser").inc()
-
-        try:
-            yield
-
-        except BrowserUnavailable as exc:
-            raise bad_gateway(f"Chromium is unavailable: {exc}", "BROWSER_UNAVAILABLE") from exc
-
-        except RenderTimeout as exc:
-            raise gateway_timeout(f"render timed out: {exc}") from exc
-
-        except RenderFailure as exc:
-            raise bad_gateway(f"render failed: {exc}") from exc
-
-        finally:
-            metrics.INFLIGHT.labels(layer="browser").dec()
-
-
-    async def browser_call(self, fn: Callable[..., Any], *args: Any, bulk: bool = False) -> Any:
-        """Run one Chromium operation (e.g. a URL capture) under the browser limits."""
-        async with self.browser_slot(bulk), self.browser_errors():
-            return await fn(*args)
+    @staticmethod
+    async def _close(pool: pebble.ProcessPool) -> None:
+        """Stop a pool and reap its workers."""
+        pool.stop()
+        await asyncio.to_thread(pool.join, 10)

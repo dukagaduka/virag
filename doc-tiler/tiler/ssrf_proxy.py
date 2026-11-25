@@ -127,9 +127,9 @@ class GuardProxy:
 
         try:
             if method.upper() == b"CONNECT":
-                await self._do_connect(target.decode("latin-1"), reader, writer)
+                await self._tunnel(target.decode("latin-1"), reader, writer)
             else:
-                await self._do_plain(method, target, version, lines[1:], reader, writer)
+                await self._forward(method, target, version, lines[1:], reader, writer)
 
         except BlockedTarget as exc:
             self.blocked.append(str(exc))
@@ -161,7 +161,7 @@ class GuardProxy:
         raise BlockedTarget(f"cannot connect to {host}:{port}: {last}")
 
 
-    async def _do_connect(
+    async def _tunnel(
         self, authority: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """Handle a CONNECT tunnel (HTTPS): validate the target, then splice."""
@@ -181,10 +181,10 @@ class GuardProxy:
         up_reader, up_writer = await self._dial(host, port)
         writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await writer.drain()
-        await self._pipe_both(reader, writer, up_reader, up_writer)
+        await self._splice(reader, writer, up_reader, up_writer)
 
 
-    async def _do_plain(
+    async def _forward(
         self,
         method: bytes,
         target: bytes,
@@ -228,11 +228,11 @@ class GuardProxy:
         out.append(b"Connection: close")
         up_writer.write(b"\r\n".join(out) + b"\r\n\r\n")
         await up_writer.drain()
-        await self._pipe_both(reader, writer, up_reader, up_writer)
+        await self._splice(reader, writer, up_reader, up_writer)
 
 
     @staticmethod
-    async def _pipe_both(
+    async def _splice(
         c_reader: asyncio.StreamReader,
         c_writer: asyncio.StreamWriter,
         u_reader: asyncio.StreamReader,

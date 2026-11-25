@@ -222,15 +222,9 @@ class MetaStore:
         self._lock: Any = None
 
 
-    @property
-    def db(self) -> aiosqlite.Connection:
-        """The open write connection; raises if the store is not connected."""
-        if self._db is None:
-            raise RuntimeError("MetaStore is not connected")
-
-        return self._db
-
-
+    # ------------------------------------------------------------------ #
+    # connection
+    # ------------------------------------------------------------------ #
     async def connect(self) -> None:
         """Open the write connection, apply the startup pragmas, then open the
         read-only one (the database file and its WAL mode must exist by then)."""
@@ -253,30 +247,23 @@ class MetaStore:
         self._reader = self._db = None
 
 
-    async def _open_reader(self) -> None:
-        """(Re)open the read-only connection."""
-        if self._reader is not None:
-            await self._reader.close()
-
-        self._reader = await self._open(f"{Path(self.db_path).resolve().as_uri()}?mode=ro", uri=True)
-        await self._read("PRAGMA busy_timeout=5000")
-
-
-    async def _read(self, sql: str, params: Sequence[Any] = ()) -> list[aiosqlite.Row]:
-        """Run a query on the read-only connection and return all its rows. Fetched to
-        the end at once: a statement left half-read would pin the connection to an old
-        snapshot."""
-        if self._reader is None:
-            raise RuntimeError("MetaStore is not connected")
-
-        return list(await self._reader.execute_fetchall(sql, params))
-
-
     async def ping(self) -> None:
         """Touch the database (the readiness probe)."""
         await self._read("SELECT 1")
 
 
+    @property
+    def db(self) -> aiosqlite.Connection:
+        """The open write connection; raises if the store is not connected."""
+        if self._db is None:
+            raise RuntimeError("MetaStore is not connected")
+
+        return self._db
+
+
+    # ------------------------------------------------------------------ #
+    # the volume
+    # ------------------------------------------------------------------ #
     async def create_tables(self) -> None:
         """Create the base tables and indexes if they do not exist."""
         async with self._lock:
@@ -335,9 +322,6 @@ class MetaStore:
         return dropped
 
 
-    # ------------------------------------------------------------------ #
-    # service_meta
-    # ------------------------------------------------------------------ #
     async def get_service_meta(self) -> ServiceMeta | None:
         """Return the singleton service-config row, or None if uninitialized."""
         rows = await self._read("SELECT * FROM service_meta WHERE id = 1")
@@ -399,8 +383,25 @@ class MetaStore:
             await self.db.commit()
 
 
+    async def optimize(self) -> None:
+        """Refresh planner statistics (cheap; a no-op when nothing changed) — at
+        startup. A connection loads the statistics with the schema, so the read-only
+        one is reopened to plan with the fresh ones."""
+        async with self._lock:
+            await self.db.execute("PRAGMA optimize")
+            await self.db.commit()
+
+        await self._open_reader()
+
+
+    async def backup(self, path: str) -> None:
+        """Write a consistent copy of the database to `path` (online, WAL-safe)."""
+        async with self._lock:
+            await self.db.execute("VACUUM INTO ?", (path,))
+
+
     # ------------------------------------------------------------------ #
-    # docs / tiles
+    # docs and tiles
     # ------------------------------------------------------------------ #
     async def get_doc(self, doc_id: str) -> DocRow | None:
         """Return the doc row for `doc_id`, or None if absent."""
@@ -529,91 +530,6 @@ class MetaStore:
                 raise
 
 
-    async def _replace_tiles(self, doc_id: str, tiles: Sequence[TileRow]) -> None:
-        """Inside an open transaction: replace a doc's tile rows and lift its quarantine."""
-        await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
-        await self.db.execute("DELETE FROM quarantine WHERE doc_id = ?", (doc_id,))
-        await self.db.executemany(
-            "INSERT INTO tiles (doc_id, tile_num, offset, height, image_hash) VALUES (?,?,?,?,?)",
-            [(doc_id, t.tile_num, t.offset, t.height, t.image_hash) for t in tiles],
-        )
-
-
-    async def delete_incomplete(self) -> int:
-        """Delete every doc an ingest left incomplete — at startup, when no ingest can
-        be alive. Returns how many there were."""
-        async with self._lock:
-            cur = await self.db.execute("DELETE FROM docs WHERE complete = 0")
-            await self.db.commit()
-
-            return cur.rowcount
-
-
-    # ------------------------------------------------------------------ #
-    # revision
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _revisable(render_version: str, force: bool) -> tuple[str, list[Any]]:
-        """WHERE clause for the docs a revision re-renders: complete docs rendered by
-        another render_version, minus those already quarantined at this one — or every
-        complete doc with `force`. An incomplete doc belongs to the ingest rendering it."""
-        if force:
-            return "complete = 1", []
-
-        return (
-            "complete = 1 AND render_version <> ? AND doc_id NOT IN "
-            "(SELECT doc_id FROM quarantine WHERE render_version = ?)",
-            [render_version, render_version],
-        )
-
-
-    async def count_revisable(self, render_version: str, *, force: bool = False) -> int:
-        """Return how many docs a revision at `render_version` would re-render."""
-        where, params = self._revisable(render_version, force)
-        rows = await self._read(f"SELECT COUNT(*) AS n FROM docs WHERE {where}", params)
-
-        return int(rows[0]["n"])
-
-
-    async def list_revisable(
-        self, render_version: str, *, force: bool, after: str, limit: int
-    ) -> list[DocRow]:
-        """One page of revisable docs, keyset-paged by doc_id — stable while re-rendered
-        docs drop out of the stale set."""
-        where, params = self._revisable(render_version, force)
-        rows = await self._read(
-            f"SELECT *, {self.QUARANTINE_REASON} FROM docs WHERE {where} AND doc_id > ? "
-            "ORDER BY doc_id LIMIT ?",
-            [*params, after, limit],
-        )
-
-        return [DocRow.from_row(row) for row in rows]
-
-
-    async def quarantine(self, doc_id: str, render_version: str, reason: str) -> None:
-        """Mark a doc a revision could not re-render at `render_version`."""
-        async with self._lock:
-            await self.db.execute(
-                "INSERT OR REPLACE INTO quarantine (doc_id, render_version, reason, quarantined_at) "
-                "VALUES (?,?,?,?)",
-                (doc_id, render_version, reason, int(time.time())),
-            )
-            await self.db.commit()
-
-
-    async def count_quarantined(self) -> int:
-        """Return the number of quarantined documents."""
-        rows = await self._read("SELECT COUNT(*) AS n FROM quarantine")
-
-        return int(rows[0]["n"])
-
-
-    async def backup(self, path: str) -> None:
-        """Write a consistent copy of the database to `path` (online, WAL-safe)."""
-        async with self._lock:
-            await self.db.execute("VACUUM INTO ?", (path,))
-
-
     async def set_metadata(self, doc_id: str, metadata: dict[str, Any]) -> None:
         """Replace a doc's metadata JSON; the expression indexes follow automatically."""
         async with self._lock:
@@ -633,15 +549,14 @@ class MetaStore:
             return cur.rowcount > 0
 
 
-    async def optimize(self) -> None:
-        """Refresh planner statistics (cheap; a no-op when nothing changed) — at
-        startup. A connection loads the statistics with the schema, so the read-only
-        one is reopened to plan with the fresh ones."""
+    async def delete_incomplete(self) -> int:
+        """Delete every doc an ingest left incomplete — at startup, when no ingest can
+        be alive. Returns how many there were."""
         async with self._lock:
-            await self.db.execute("PRAGMA optimize")
+            cur = await self.db.execute("DELETE FROM docs WHERE complete = 0")
             await self.db.commit()
 
-        await self._open_reader()
+            return cur.rowcount
 
 
     async def count_docs(self) -> int:
@@ -651,6 +566,8 @@ class MetaStore:
         return int(rows[0]["n"])
 
 
+    # ------------------------------------------------------------------ #
+    # search
     # ------------------------------------------------------------------ #
     async def search(
         self,
@@ -670,13 +587,6 @@ class MetaStore:
             next_cursor = self._encode_cursor(last.created_at, last.doc_id)
 
         return rows, next_cursor
-
-
-    async def explain(self, sql: str, params: Sequence[Any]) -> list[str]:
-        """Return the query plan detail lines for a SQL statement."""
-        rows = await self._read(f"EXPLAIN QUERY PLAN {sql}", list(params))
-
-        return [row["detail"] for row in rows]
 
 
     @staticmethod
@@ -739,6 +649,95 @@ class MetaStore:
         return sql, params
 
 
+    async def explain(self, sql: str, params: Sequence[Any]) -> list[str]:
+        """Return the query plan detail lines for a SQL statement."""
+        rows = await self._read(f"EXPLAIN QUERY PLAN {sql}", list(params))
+
+        return [row["detail"] for row in rows]
+
+
+    # ------------------------------------------------------------------ #
+    # revision
+    # ------------------------------------------------------------------ #
+    async def count_revisable(self, render_version: str, *, force: bool = False) -> int:
+        """Return how many docs a revision at `render_version` would re-render."""
+        where, params = self._revisable(render_version, force)
+        rows = await self._read(f"SELECT COUNT(*) AS n FROM docs WHERE {where}", params)
+
+        return int(rows[0]["n"])
+
+
+    async def list_revisable(
+        self, render_version: str, *, force: bool, after: str, limit: int
+    ) -> list[DocRow]:
+        """One page of revisable docs, keyset-paged by doc_id — stable while re-rendered
+        docs drop out of the stale set."""
+        where, params = self._revisable(render_version, force)
+        rows = await self._read(
+            f"SELECT *, {self.QUARANTINE_REASON} FROM docs WHERE {where} AND doc_id > ? "
+            "ORDER BY doc_id LIMIT ?",
+            [*params, after, limit],
+        )
+
+        return [DocRow.from_row(row) for row in rows]
+
+
+    async def quarantine(self, doc_id: str, render_version: str, reason: str) -> None:
+        """Mark a doc a revision could not re-render at `render_version`."""
+        async with self._lock:
+            await self.db.execute(
+                "INSERT OR REPLACE INTO quarantine (doc_id, render_version, reason, quarantined_at) "
+                "VALUES (?,?,?,?)",
+                (doc_id, render_version, reason, int(time.time())),
+            )
+            await self.db.commit()
+
+
+    async def count_quarantined(self) -> int:
+        """Return the number of quarantined documents."""
+        rows = await self._read("SELECT COUNT(*) AS n FROM quarantine")
+
+        return int(rows[0]["n"])
+
+
+    # ------------------------------------------------------------------ #
+    # internals
+    # ------------------------------------------------------------------ #
+    async def _read(self, sql: str, params: Sequence[Any] = ()) -> list[aiosqlite.Row]:
+        """Run a query on the read-only connection and return all its rows. Fetched to
+        the end at once: a statement left half-read would pin the connection to an old
+        snapshot."""
+        if self._reader is None:
+            raise RuntimeError("MetaStore is not connected")
+
+        return list(await self._reader.execute_fetchall(sql, params))
+
+
+    async def _replace_tiles(self, doc_id: str, tiles: Sequence[TileRow]) -> None:
+        """Inside an open transaction: replace a doc's tile rows and lift its quarantine."""
+        await self.db.execute("DELETE FROM tiles WHERE doc_id = ?", (doc_id,))
+        await self.db.execute("DELETE FROM quarantine WHERE doc_id = ?", (doc_id,))
+        await self.db.executemany(
+            "INSERT INTO tiles (doc_id, tile_num, offset, height, image_hash) VALUES (?,?,?,?,?)",
+            [(doc_id, t.tile_num, t.offset, t.height, t.image_hash) for t in tiles],
+        )
+
+
+    @staticmethod
+    def _revisable(render_version: str, force: bool) -> tuple[str, list[Any]]:
+        """WHERE clause for the docs a revision re-renders: complete docs rendered by
+        another render_version, minus those already quarantined at this one — or every
+        complete doc with `force`. An incomplete doc belongs to the ingest rendering it."""
+        if force:
+            return "complete = 1", []
+
+        return (
+            "complete = 1 AND render_version <> ? AND doc_id NOT IN "
+            "(SELECT doc_id FROM quarantine WHERE render_version = ?)",
+            [render_version, render_version],
+        )
+
+
     @staticmethod
     def _encode_cursor(created_at: int, doc_id: str) -> str:
         """Encode a `(created_at, doc_id)` pagination cursor to a token."""
@@ -765,6 +764,15 @@ class MetaStore:
             return None
 
         return orjson.dumps(value, option=orjson.OPT_SORT_KEYS if sort_keys else None).decode()
+
+
+    async def _open_reader(self) -> None:
+        """(Re)open the read-only connection."""
+        if self._reader is not None:
+            await self._reader.close()
+
+        self._reader = await self._open(f"{Path(self.db_path).resolve().as_uri()}?mode=ro", uri=True)
+        await self._read("PRAGMA busy_timeout=5000")
 
 
     @staticmethod

@@ -130,7 +130,7 @@ class PixelSettings(_Section):
     @property
     def chromium_revision(self) -> str:
         """Resolved Chromium build id (env override or pinned bundle)."""
-        return self.chromium_revision_override or self.chromium_build_id()
+        return self.chromium_revision_override or self._chromium_build_id()
 
 
     @property
@@ -151,7 +151,7 @@ class PixelSettings(_Section):
 
 
     @staticmethod
-    def chromium_build_id() -> str:
+    def _chromium_build_id() -> str:
         """Chromium build stamp folded into `render_version`, resolved without launching.
 
         Reads Playwright's bundled `browsers.json` (the pinned revision), so the value is

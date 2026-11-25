@@ -145,11 +145,6 @@ class BlobStore:
     # ------------------------------------------------------------------ #
     # stored blobs
     # ------------------------------------------------------------------ #
-    async def read(self, doc_id: str) -> bytes:
-        """Return the blob's bytes."""
-        return await asyncio.to_thread(self.path(doc_id).read_bytes)
-
-
     async def size(self, doc_id: str) -> int:
         """Return the blob's size in bytes."""
         return (await asyncio.to_thread(self.path(doc_id).stat)).st_size

@@ -83,17 +83,3 @@ class MetadataSchemaModel(BaseModel):
 
     version: int
     fields: list[MetadataFieldModel]
-
-
-class ErrorDetail(BaseModel):
-    """The inner error object of the error envelope."""
-
-    code: str
-    message: str
-    details: dict[str, Any] | None = None
-
-
-class ErrorResponse(BaseModel):
-    """Top-level error response wrapper."""
-
-    error: ErrorDetail

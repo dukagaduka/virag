@@ -152,7 +152,7 @@ async def _stream(state, data: bytes):
     """The ingester's event stream for a PDF upload, driven by hand."""
     upload = await state.blobs.spool(data)
 
-    return state.ingester.ingest_stream(doc_type=DocType.PDF, upload=upload, url=None, metadata=None)
+    return state.ingester.stream(doc_type=DocType.PDF, upload=upload, url=None, metadata=None)
 
 
 async def test_a_doc_is_incomplete_until_its_ingest_commits(client, sample_pdf):

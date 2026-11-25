@@ -59,7 +59,7 @@ class Tiles:
             raise not_found(f"tile {tile_num} of {doc_id!r} is missing", "UNKNOWN_TILE")
 
         key = (doc_id, tile_num)
-        jpeg = await self.cache.get_or_create(key, lambda: self._render(row, tile_row))
+        jpeg = await self.cache.get_or_create(key, lambda: self._tile(row, tile_row))
 
         if verify:
             self._verify(row, tile_row, sha256_hex(jpeg))
@@ -88,7 +88,7 @@ class Tiles:
             stored = {tile_row.tile_num: tile_row for tile_row in await self.store.get_tiles(row.doc_id)}
 
             # One background render of the whole doc, each tile checked against its stored hash.
-            async with aclosing(self._rendered(row, list(stored.values()), bulk=True)) as rendered:
+            async with aclosing(self._render(row, list(stored.values()), bulk=True)) as rendered:
                 async for tile in rendered:
                     self._verify(row, stored[tile.tile_num], tile.image_hash)
 
@@ -114,6 +114,7 @@ class Tiles:
         if row.quarantined:
             raise gone(
                 f"doc_id {doc_id!r} is quarantined: {row.quarantine_reason}",
+                "QUARANTINED",
                 doc_id=doc_id,
                 reason=row.quarantine_reason,
             )
@@ -121,15 +122,15 @@ class Tiles:
         return row
 
 
-    async def _render(self, row: DocRow, tile_row: TileRow) -> bytes:
+    async def _tile(self, row: DocRow, tile_row: TileRow) -> bytes:
         """Render one tile from the stored blob: the rows it was cut from at ingest."""
-        async with aclosing(self._rendered(row, [tile_row], bulk=False)) as rendered:
+        async with aclosing(self._render(row, [tile_row], bulk=False)) as rendered:
             [tile] = [tile async for tile in rendered]
 
         return tile.jpeg
 
 
-    async def _rendered(
+    async def _render(
         self, row: DocRow, tile_rows: list[TileRow], *, bulk: bool
     ) -> AsyncIterator[RenderedTile]:
         """Tiles of a stored doc rendered in one render, in tile order, as they were cut

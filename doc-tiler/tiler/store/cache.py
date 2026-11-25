@@ -115,11 +115,6 @@ class AsyncLRU:
             self._data.clear()
 
 
-    def _count(self, outcome: str) -> None:
-        """Count one lookup's outcome."""
-        metrics.CACHE.labels(cache=self.name, outcome=outcome).inc()
-
-
     def stats(self) -> dict[str, int]:
         """Return current size and hit/miss/coalesce counters."""
         return {
@@ -129,3 +124,8 @@ class AsyncLRU:
             "misses": self.misses,
             "coalesced": self.coalesced,
         }
+
+
+    def _count(self, outcome: str) -> None:
+        """Count one lookup's outcome."""
+        metrics.CACHE.labels(cache=self.name, outcome=outcome).inc()

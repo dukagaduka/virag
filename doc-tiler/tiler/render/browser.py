@@ -123,11 +123,6 @@ class BrowserPool:
         self._pw = None
 
 
-    async def version(self) -> str:
-        """Chromium version string, or "unavailable" when not running."""
-        return self._browser.version if self.available else "unavailable"
-
-
     # ------------------------------------------------------------------ #
     # documents
     # ------------------------------------------------------------------ #

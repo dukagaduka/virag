@@ -103,7 +103,7 @@ async def lifespan(app: FastAPI):
 
         # Opens the gate, or starts / awaits the revision of docs from another render_version.
         stack.push_async_callback(revision.close)
-        await revision.prepare()
+        await revision.at_startup()
 
         app.state.settings = settings
         app.state.schema = schema

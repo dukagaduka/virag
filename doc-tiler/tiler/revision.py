@@ -97,7 +97,7 @@ class Revision:
         return {**self._status, "serving": self.serving}
 
 
-    async def prepare(self) -> None:
+    async def at_startup(self) -> None:
         """At startup: serve right away, start the revision, or wait for POST /revision."""
         stale = await self.store.count_revisable(self.render_version)
         self._status = {
@@ -107,7 +107,7 @@ class Revision:
         }
 
         if not stale:
-            await self._open()
+            await self._open_gate()
             return
 
         log.warning(
@@ -202,7 +202,7 @@ class Revision:
 
         async def run(row: DocRow) -> None:
             try:
-                await self._revise_one(row)
+                await self._revise_or_quarantine(row)
 
             finally:
                 slots.release()
@@ -234,7 +234,7 @@ class Revision:
             self._status["quarantined"],
         )
         self._finish("succeeded")
-        await self._open()
+        await self._open_gate()
 
 
     async def _candidates(self, force: bool) -> AsyncIterator[DocRow]:
@@ -250,7 +250,7 @@ class Revision:
             after = rows[-1].doc_id
 
 
-    async def _revise_one(self, row: DocRow) -> None:
+    async def _revise_or_quarantine(self, row: DocRow) -> None:
         """Re-render one doc, retrying once; quarantine it if it still fails."""
         for attempt in (1, 2):
             try:
@@ -347,7 +347,7 @@ class Revision:
         )
 
 
-    async def _open(self) -> None:
+    async def _open_gate(self) -> None:
         """Nothing revisable is left: stamp the volume and start serving."""
         meta = await self.store.get_service_meta()
 
