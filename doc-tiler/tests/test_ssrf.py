@@ -8,7 +8,7 @@ import gc
 import pytest
 from conftest import base_env, running_app
 
-from tiler.ssrf import BlockedTarget, ip_is_blocked, validate_url
+from tiler.ssrf import BlockedTarget, SsrfPolicy
 from tiler.ssrf_proxy import GuardProxy
 
 BLOCKED_IPS = [
@@ -39,12 +39,12 @@ ALLOWED_IPS = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111", "6
 
 @pytest.mark.parametrize("ip", BLOCKED_IPS)
 def test_blocked_ip_ranges(ip):
-    assert ip_is_blocked(ip) is True
+    assert SsrfPolicy.ip_is_blocked(ip) is True
 
 
 @pytest.mark.parametrize("ip", ALLOWED_IPS)
 def test_public_ips_pass(ip):
-    assert ip_is_blocked(ip) is False
+    assert SsrfPolicy.ip_is_blocked(ip) is False
 
 
 @pytest.mark.parametrize(
@@ -59,23 +59,23 @@ def test_public_ips_pass(ip):
 )
 async def test_private_urls_are_rejected(url):
     with pytest.raises(BlockedTarget):
-        await validate_url(url, allow_private=False)
+        await SsrfPolicy().check_url(url)
 
 
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "gopher://x/", "ftp://example.com/x", "ws://example.com"])
 async def test_non_http_schemes_are_rejected(url):
     with pytest.raises(BlockedTarget):
-        await validate_url(url, allow_private=False)
+        await SsrfPolicy().check_url(url)
 
 
 async def test_allow_private_opens_the_gate():
-    target = await validate_url("http://127.0.0.1:8000/x", allow_private=True)
+    target = await SsrfPolicy(allow_private=True).check_url("http://127.0.0.1:8000/x")
     assert target.ips == ("127.0.0.1",)
 
 
 async def test_disabled_url_fetching():
     with pytest.raises(BlockedTarget):
-        await validate_url("https://example.com", allow_private=False, enabled=False)
+        await SsrfPolicy(enabled=False).check_url("https://example.com")
 
 
 async def test_url_ingest_returns_403(tmp_path):
@@ -97,7 +97,7 @@ async def test_url_without_url_field_is_400(tmp_path):
 # The guard proxy is what actually pins Chromium's egress.
 # --------------------------------------------------------------------------- #
 async def test_guard_proxy_blocks_connect_to_private_host():
-    proxy = GuardProxy(allow_private=False)
+    proxy = GuardProxy(SsrfPolicy())
     await proxy.start()
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
@@ -112,7 +112,7 @@ async def test_guard_proxy_blocks_connect_to_private_host():
 
 
 async def test_guard_proxy_blocks_plain_http_to_loopback():
-    proxy = GuardProxy(allow_private=False)
+    proxy = GuardProxy(SsrfPolicy())
     await proxy.start()
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
@@ -136,7 +136,7 @@ async def test_guard_proxy_forwards_allowed_http():
 
     origin = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = origin.sockets[0].getsockname()[1]
-    proxy = GuardProxy(allow_private=True)
+    proxy = GuardProxy(SsrfPolicy(allow_private=True))
     await proxy.start()
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy.port)
@@ -181,7 +181,7 @@ async def test_guard_proxy_ends_a_tunnel_when_the_client_leaves():
     loop.set_exception_handler(lambda _, context: lost.append(context))
 
     origin = await asyncio.start_server(handler, "127.0.0.1", 0)
-    proxy = GuardProxy(allow_private=True)
+    proxy = GuardProxy(SsrfPolicy(allow_private=True))
     await proxy.start()
 
     try:
@@ -220,7 +220,7 @@ async def test_guard_proxy_stop_ends_open_tunnels():
         await reader.read()
 
     origin = await asyncio.start_server(handler, "127.0.0.1", 0)
-    proxy = GuardProxy(allow_private=True)
+    proxy = GuardProxy(SsrfPolicy(allow_private=True))
     await proxy.start()
 
     try:

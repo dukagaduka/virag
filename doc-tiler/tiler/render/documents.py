@@ -1,9 +1,9 @@
 """Documents: a document opened for rendering (through `Renderer.open`).
 
 Whatever its format, a document is one image `TILE_WIDTH` wide and `height` tall:
-`tiles()` yields its tiles rendered — `plan()` measures it and cuts it into tiles
-first, unless the cut is given — and `render()` returns the JPEGs of one batch of them.
-Where that happens is the document's own business:
+`tiles()` yields its tiles rendered, measuring the document and cutting it into tiles
+first unless the cut is given. How a format is cut (`_cut`) and how a batch of its tiles
+is rendered (`_render`) is the document's own business:
 
 - `WorkerDocument` (PDF, images) — entirely inside the render workers, by the format's
   reader (`readers.py`);
@@ -23,12 +23,13 @@ from itertools import islice
 from typing import AsyncIterator, Iterator
 
 from ..models import DocType
-from . import pixels, worker
+from . import pixels
 from .browser import Tab
 from .geometry import Tile
 from .pool import RenderPool
 from .readers import READERS
 from .types import EncodedImage, RenderedTile
+from .worker import Worker
 
 
 class Document(ABC):
@@ -69,21 +70,11 @@ class Document(ABC):
 
     @property
     def height(self) -> int:
-        """Height of the document image: measured by `plan()`, or given for a stored doc."""
+        """Height of the document image: measured when it is cut, or given for a stored doc."""
         if self._height is None:
-            raise RuntimeError("the document is not planned yet")
+            raise RuntimeError("the document is not cut yet")
 
         return self._height
-
-
-    @abstractmethod
-    async def plan(self) -> list[Tile]:
-        """Measure the document and cut it into tiles."""
-
-
-    @abstractmethod
-    async def render(self, tiles: list[Tile]) -> list[EncodedImage]:
-        """Render and encode the given tiles, in order."""
 
 
     async def tiles(self, cut: list[Tile] | None = None) -> AsyncIterator[RenderedTile]:
@@ -91,7 +82,7 @@ class Document(ABC):
         for a stored doc), or all of them — the document is then measured and cut first.
         They render batch by batch, up to `_parallel` batches at once."""
         if cut is None:
-            cut = await self.plan()
+            cut = await self._cut()
 
         batches = iter(self._batches(cut))
         running: deque[tuple[list[Tile], asyncio.Task]] = deque()
@@ -118,6 +109,19 @@ class Document(ABC):
         """Release what the session holds."""
 
 
+    # ------------------------------------------------------------------ #
+    # what a format provides
+    # ------------------------------------------------------------------ #
+    @abstractmethod
+    async def _cut(self) -> list[Tile]:
+        """Measure the document and cut it into tiles."""
+
+
+    @abstractmethod
+    async def _render(self, tiles: list[Tile]) -> list[EncodedImage]:
+        """Render and encode the given tiles, in order."""
+
+
     @property
     def _parallel(self) -> int:
         """How many batches may render at once."""
@@ -132,7 +136,7 @@ class Document(ABC):
     def _top_up(self, running: deque[tuple[list[Tile], asyncio.Task]], batches: Iterator[list[Tile]]) -> None:
         """Start the next batches until `_parallel` of them are running."""
         for batch in islice(batches, self._parallel - len(running)):
-            task = asyncio.ensure_future(self.render(batch))
+            task = asyncio.ensure_future(self._render(batch))
             # A batch abandoned after an earlier one failed must not log its error.
             task.add_done_callback(lambda t: t.cancelled() or t.exception())
             running.append((batch, task))
@@ -144,14 +148,14 @@ class WorkerDocument(Document):
     MAX_BATCH = 16  # tiles per task: bounds the result size per hop
 
 
-    async def plan(self) -> list[Tile]:
-        self._height, tiles = await self.pool.run(worker.plan, self.doc_type, self.path, bulk=self.bulk)
+    async def _cut(self) -> list[Tile]:
+        self._height, tiles = await self.pool.run(Worker.cut, self.doc_type, self.path, bulk=self.bulk)
 
         return tiles
 
 
-    async def render(self, tiles: list[Tile]) -> list[EncodedImage]:
-        return await self.pool.run(worker.render, self.doc_type, self.path, tiles, bulk=self.bulk)
+    async def _render(self, tiles: list[Tile]) -> list[EncodedImage]:
+        return await self.pool.run(Worker.render, self.doc_type, self.path, tiles, bulk=self.bulk)
 
 
     @property
@@ -204,7 +208,13 @@ class MhtmlDocument(Document):
         return self
 
 
-    async def plan(self) -> list[Tile]:
+    async def close(self) -> None:
+        """Close the tab, if one was opened, then give the bulk slot back."""
+        await self._stack.aclose()
+        self._tab = None
+
+
+    async def _cut(self) -> list[Tile]:
         async with self.pool.browser_errors():
             height = await (await self._opened()).height()
 
@@ -218,7 +228,7 @@ class MhtmlDocument(Document):
         return self.params.tiling.cut(height)
 
 
-    async def render(self, tiles: list[Tile]) -> list[EncodedImage]:
+    async def _render(self, tiles: list[Tile]) -> list[EncodedImage]:
         p = self.params
 
         if self._whole:
@@ -236,12 +246,6 @@ class MhtmlDocument(Document):
             encoded.append(await self.pool.run(pixels.encode_strip, png, p.tile_width, p.jpeg_quality, bulk=self.bulk))
 
         return encoded
-
-
-    async def close(self) -> None:
-        """Close the tab, if one was opened, then give the bulk slot back."""
-        await self._stack.aclose()
-        self._tab = None
 
 
     @property

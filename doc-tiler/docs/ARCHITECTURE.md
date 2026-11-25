@@ -88,8 +88,8 @@ a tile is a run of its rows `[offset, offset + height)`. The service works on th
 alone, and there is one way from a file to its tiles — the `Renderer`
 (`render/renderer.py`): an ingest, a revision and a request for a stored doc's tiles all
 open the document through it (`renderer.open(...)`) and read `doc.tiles()`. The document
-(`render/documents.py`) measures itself and cuts itself into tiles (`plan()`), unless
-the cut is given, and renders them batch by batch (`render()`). Each tile's `offset` and
+(`render/documents.py`) measures itself and cuts itself into tiles, unless the cut is given, and renders them
+batch by batch — how a format is cut and rendered are its two hooks (`_cut`, `_render`). Each tile's `offset` and
 `height` are stored with it, so a tile request and a stored doc's stream pass that cut back
 and never cut the document again. The Renderer also records every render in the metrics
 (`path` = ingest / tiles / revise).
@@ -580,10 +580,11 @@ tiler/
           documents.py  # what gets rendered: WorkerDocument (PDF, images), MhtmlDocument (Chromium)
           readers.py    # DocumentReader: PdfReader, ImageReader — a format read as one image, inside a worker
           pool.py       # RenderPool: pebble process pool (memory cap, timeout), Chromium, bulk slots
-          worker.py     # what runs in a worker: lay a document out, read and encode its tiles
+          worker.py     # Worker: what runs in a worker process — its tasks (cut a document, render its tiles) and the reader it keeps open
+          params.py     # RenderParams: the geometry and pixel settings as the render layer (and every worker) takes them
           browser.py  pixels.py  geometry.py  types.py  # Chromium (BrowserPool loads a document, Tab captures it); pixel primitives; Tile/Tiling; result dataclasses
   store/  blobs.py  meta.py  cache.py
-  ssrf.py  ssrf_proxy.py  hashing.py               # URL policy + the proxy that pins Chromium to it + sha256
+  ssrf.py  ssrf_proxy.py  hashing.py               # SsrfPolicy (what a URL ingest may reach) + the proxy that pins Chromium to it + sha256
 ```
 
 `Field.expr` is the single source of the JSON extraction expression used by both index

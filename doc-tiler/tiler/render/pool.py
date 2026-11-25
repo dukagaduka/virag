@@ -27,9 +27,10 @@ from .. import metrics
 from ..config import RenderSettings
 from ..errors import ApiError, bad_gateway, gateway_timeout, unprocessable
 from ..store.cache import AsyncLRU
-from . import pixels, worker
+from . import pixels
 from .browser import BrowserPool, BrowserUnavailable, RenderFailure, RenderTimeout
-from .readers import RenderParams
+from .params import RenderParams
+from .worker import Worker
 
 log = logging.getLogger("tiler.render.pool")
 
@@ -101,7 +102,7 @@ class RenderPool:
         # into workers is a well-known source of deadlocks.
         return pebble.ProcessPool(
             max_workers=self.settings.render_workers,
-            initializer=worker.init_worker,
+            initializer=Worker.start,
             initargs=(self.settings.render_worker_memory, self.params),
             context=multiprocessing.get_context("spawn"),
         )

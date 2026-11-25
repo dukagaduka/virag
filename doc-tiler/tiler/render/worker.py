@@ -1,96 +1,115 @@
-"""What runs inside a render worker process: the entry points the RenderPool submits.
+"""Worker: what runs inside a render worker process.
 
-A task names a document by its type and path; the worker opens the reader for it and
-keeps it open (a PDF stays parsed between the tasks of one document), dropping the
-per-task state after every task. The render params are the same for every task, so a
-worker gets them once, at start. Its address space is capped there too, so a document
-that needs more memory fails with RenderTooLarge instead of drawing the kernel's OOM
-killer onto the whole container.
+The RenderPool gives a process its tasks by name — `Worker.cut`, `Worker.render` — and
+a task names a document by its type and path. The process has one Worker: it opens the
+reader for the document and keeps it open (a PDF stays parsed between the tasks of one
+document), dropping the per-task state after every task. The render params are the same
+for every task, so the worker gets them once, at start. Its address space is capped
+there too, so a document that needs more memory fails with RenderTooLarge instead of
+drawing the kernel's OOM killer onto the whole container.
 """
 
 from __future__ import annotations
 
 import resource
+from typing import Any, Callable, ClassVar
 
 from ..models import DocType
 from .geometry import Tile
-from .readers import READERS, DocumentReader, RenderParams
+from .params import RenderParams
 from .pixels import DecodeError, RenderTooLarge, to_jpeg
+from .readers import READERS, DocumentReader
 from .types import EncodedImage
 
-# JPEG cannot hold an image taller than this.
-MAX_JPEG_SIDE = 65_500
 
-_params: RenderParams | None = None
-_current: DocumentReader | None = None
+class Worker:
+    """One render worker process: its render params and the reader it keeps open."""
 
+    # JPEG cannot hold an image taller than this.
+    MAX_JPEG_SIDE = 65_500
 
-def init_worker(memory_bytes: int, params: RenderParams) -> None:
-    """Cap the worker's address space (0 = no cap) and take the render params."""
-    global _params
-
-    if memory_bytes > 0:
-        resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-
-    _params = params
+    # This process's worker. A task reaches a process, not an object, so the process
+    # keeps its one worker here (`start` puts it there).
+    process: ClassVar[Worker | None] = None
 
 
-def plan(doc_type: DocType, path: str) -> tuple[int, list[Tile]]:
-    """The height of the document image and the tiles it is cut into."""
-    return _run(doc_type, path, lambda reader: reader.layout())
+    def __init__(self, params: RenderParams):
+        self.params = params
+        self.reader: DocumentReader | None = None
 
 
-def render(doc_type: DocType, path: str, tiles: list[Tile]) -> list[EncodedImage]:
-    """Read and encode the given tiles of one document, in order."""
-    return _run(doc_type, path, lambda reader: [encode_tile(reader, tile) for tile in tiles])
+    # ------------------------------------------------------------------ #
+    # what the RenderPool runs in a worker process
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def start(cls, memory_bytes: int, params: RenderParams) -> None:
+        """The process's initializer: cap its address space (0 = no cap) and make its
+        worker, with the render params."""
+        if memory_bytes > 0:
+            resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+
+        cls.process = cls(params)
 
 
-def encode_tile(reader: DocumentReader, tile: Tile) -> EncodedImage:
-    """Read one tile's rows and encode them."""
-    if tile.height > MAX_JPEG_SIDE:
-        raise DecodeError(f"tile {tile.num} is {tile.height} px tall; JPEG allows {MAX_JPEG_SIDE}")
-
-    image = reader.read(tile.offset, tile.offset + tile.height)
-
-    return EncodedImage(height=image.height, jpeg=to_jpeg(image, reader.params.jpeg_quality))
+    @classmethod
+    def cut(cls, doc_type: DocType, path: str) -> tuple[int, list[Tile]]:
+        """Task: the height of the document image and the tiles it is cut into."""
+        return cls.process.on(doc_type, path, lambda reader: reader.cut())
 
 
-def _run(doc_type: DocType, path: str, work):
-    """Run `work` on the worker's reader of this document, mapping memory exhaustion."""
-    global _current
-
-    if type(_current) is not READERS[doc_type] or _current.path != path:
-        _forget()
-        _current = READERS[doc_type](path, _params)
-
-    reader = _current
-
-    try:
-        return work(reader)
-
-    except MemoryError as exc:
-        _forget()
-
-        raise RenderTooLarge(str(exc) or "out of memory") from None
-
-    except BaseException:
-        _forget()
-        raise
-
-    finally:
-        reader.trim()
+    @classmethod
+    def render(cls, doc_type: DocType, path: str, tiles: list[Tile]) -> list[EncodedImage]:
+        """Task: read and encode the given tiles of one document, in order."""
+        return cls.process.on(doc_type, path, lambda reader: [cls.encode(reader, tile) for tile in tiles])
 
 
-def _forget() -> None:
-    """Close the reader the worker holds: another document's turn, or a failure left
-    its state untrustworthy."""
-    global _current
+    # ------------------------------------------------------------------ #
+    # the worker
+    # ------------------------------------------------------------------ #
+    def on(self, doc_type: DocType, path: str, work: Callable[[DocumentReader], Any]) -> Any:
+        """Run `work` on the worker's reader of this document — opened now, unless the
+        last task left it open — mapping memory exhaustion."""
+        if type(self.reader) is not READERS[doc_type] or self.reader.path != path:
+            self.forget()
+            self.reader = READERS[doc_type](path, self.params)
 
-    if _current is not None:
+        reader = self.reader
+
         try:
-            _current.close()
+            return work(reader)
 
-        except Exception:  # noqa: BLE001 - it is being thrown away
-            pass
+        except MemoryError as exc:
+            self.forget()
 
-    _current = None
+            raise RenderTooLarge(str(exc) or "out of memory") from None
+
+        except BaseException:
+            self.forget()
+            raise
+
+        finally:
+            reader.trim()
+
+
+    def forget(self) -> None:
+        """Close the reader the worker holds: another document's turn, or a failure left
+        its state untrustworthy."""
+        if self.reader is not None:
+            try:
+                self.reader.close()
+
+            except Exception:  # noqa: BLE001 - it is being thrown away
+                pass
+
+        self.reader = None
+
+
+    @classmethod
+    def encode(cls, reader: DocumentReader, tile: Tile) -> EncodedImage:
+        """Read one tile's rows and encode them."""
+        if tile.height > cls.MAX_JPEG_SIDE:
+            raise DecodeError(f"tile {tile.num} is {tile.height} px tall; JPEG allows {cls.MAX_JPEG_SIDE}")
+
+        image = reader.read(tile.offset, tile.offset + tile.height)
+
+        return EncodedImage(height=image.height, jpeg=to_jpeg(image, reader.params.jpeg_quality))

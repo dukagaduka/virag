@@ -17,10 +17,10 @@ from conftest import base_env, png_form, running_app, make_png
 from tiler.config import GeometrySettings, PixelSettings, RenderSettings
 from tiler.errors import ApiError
 from tiler.models import DocType
-from tiler.render import worker
 from tiler.render.geometry import Tile, Tiling
 from tiler.render.pool import RenderPool
-from tiler.render.readers import RenderParams
+from tiler.render.params import RenderParams
+from tiler.render.worker import Worker
 
 
 def _settings(tmp_path: Path, **overrides) -> tuple[RenderSettings, Path]:
@@ -152,7 +152,7 @@ async def test_a_document_over_the_worker_memory_fails_alone(tmp_path):
 
     try:
         with pytest.raises(ApiError) as caught:
-            await pool.run(worker.plan, DocType.IMG, str(big))
+            await pool.run(Worker.cut, DocType.IMG, str(big))
 
         assert caught.value.status_code == 422
         assert caught.value.code == "RENDER_TOO_LARGE"
@@ -160,7 +160,7 @@ async def test_a_document_over_the_worker_memory_fails_alone(tmp_path):
 
         small = tmp_path / "small.png"
         small.write_bytes(make_png(400, 300))
-        assert await pool.run(worker.plan, DocType.IMG, str(small)) == (656, [Tile(0, 0, 656)])
+        assert await pool.run(Worker.cut, DocType.IMG, str(small)) == (656, [Tile(0, 0, 656)])
 
     finally:
         await pool.stop()

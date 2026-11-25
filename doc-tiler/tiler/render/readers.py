@@ -1,7 +1,7 @@
 """Document readers: a stored document read as one image `TILE_WIDTH` wide.
 
 A reader knows one format. It answers how tall the document image is and how it is cut
-into tiles (`layout`), and hands out rows `[y0, y1)` of it (`read`). How it gets them is
+into tiles (`cut`), and hands out rows `[y0, y1)` of it (`read`). How it gets them is
 its own business — a PDF stacks its pages and rasterizes just the rows asked for, an
 image crops its decoded pixels.
 
@@ -24,37 +24,10 @@ from typing import Any, ClassVar
 import pymupdf
 from PIL import Image
 
-from ..config import MAX_SUPERSAMPLE, GeometrySettings, PixelSettings
 from ..models import DocType
-from .geometry import Tile, Tiling, resized_height
+from .geometry import Tile, resized_height
+from .params import RenderParams
 from .pixels import DecodeError, EmptyDocument, RenderTooLarge, crop_rows, fit_width, open_image
-
-
-@dataclass(frozen=True)
-class RenderParams:
-    """What a document renders by — its geometry and pixel settings; small and picklable,
-    unlike the settings themselves."""
-
-    tile_width: int
-    jpeg_quality: int
-    pdf_dpi: int
-    tiling: Tiling
-    pdf_tiling: Tiling
-    max_supersample: int = MAX_SUPERSAMPLE
-
-
-    @classmethod
-    def from_settings(cls, geometry: GeometrySettings, pixel: PixelSettings) -> RenderParams:
-        """The render params of the running configuration."""
-        g = geometry
-
-        return cls(
-            tile_width=g.tile_width,
-            jpeg_quality=pixel.jpeg_quality,
-            pdf_dpi=pixel.pdf_dpi,
-            tiling=Tiling(g.tile_height, g.tile_overlap, g.min_tile_height),
-            pdf_tiling=Tiling(g.pdf_tile_height, g.pdf_tile_overlap, g.min_tile_height, whole=not g.pdf_slice),
-        )
 
 
 class DocumentReader(ABC):
@@ -74,7 +47,7 @@ class DocumentReader(ABC):
 
 
     @abstractmethod
-    def layout(self) -> tuple[int, list[Tile]]:
+    def cut(self) -> tuple[int, list[Tile]]:
         """The height of the document image and the tiles it is cut into."""
 
 
@@ -121,7 +94,7 @@ class PdfReader(DocumentReader):
         self._drawn: tuple[int, Any] | None = None  # (page number, its display list)
 
 
-    def layout(self) -> tuple[int, list[Tile]]:
+    def cut(self) -> tuple[int, list[Tile]]:
         """Each page cut on its own (or kept whole), so no tile crosses a page boundary."""
         pages = self._layout_pages()
 
@@ -315,7 +288,7 @@ class ImageReader(DocumentReader):
         self._image: Image.Image | None = None
 
 
-    def layout(self) -> tuple[int, list[Tile]]:
+    def cut(self) -> tuple[int, list[Tile]]:
         """The resized image cut top to bottom."""
         height = self._fitted().height
 

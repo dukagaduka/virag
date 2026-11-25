@@ -12,7 +12,7 @@ from . import metrics
 from .config import CaptureSettings
 from .errors import forbidden
 from .render.pool import RenderPool
-from .ssrf import BlockedTarget, validate_url
+from .ssrf import BlockedTarget, SsrfPolicy
 from .ssrf_proxy import GuardProxy
 
 log = logging.getLogger("tiler.capture")
@@ -23,7 +23,7 @@ class UrlCapture:
 
 
     def __init__(self, settings: CaptureSettings, pool: RenderPool):
-        self.settings = settings
+        self.policy = SsrfPolicy.from_settings(settings)
         self.pool = pool
         self.guard_proxy: GuardProxy | None = None
 
@@ -36,8 +36,8 @@ class UrlCapture:
 
     async def start(self) -> None:
         """Start the guard proxy when URLs may be fetched and private targets may not."""
-        if self.settings.url_fetch_enabled and not self.settings.url_allow_private:
-            self.guard_proxy = GuardProxy(allow_private=False)
+        if self.policy.enabled and not self.policy.allow_private:
+            self.guard_proxy = GuardProxy(self.policy)
             await self.guard_proxy.start()
 
 
@@ -49,10 +49,8 @@ class UrlCapture:
 
     async def capture(self, url: str) -> bytes:
         """Validate `url` against the SSRF policy and snapshot it as an MHTML blob."""
-        s = self.settings
-
         try:
-            target = await validate_url(url, allow_private=s.url_allow_private, enabled=s.url_fetch_enabled)
+            target = await self.policy.check_url(url)
 
         except BlockedTarget as exc:
             metrics.SSRF_BLOCKS.inc()

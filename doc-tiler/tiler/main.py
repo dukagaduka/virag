@@ -22,7 +22,7 @@ from .errors import install_error_handlers
 from .ingest import Ingester
 from .metadata import MetadataSchema, SchemaError
 from .render.pool import RenderPool
-from .render.readers import RenderParams
+from .render.params import RenderParams
 from .render.renderer import Renderer
 from .responses import OrjsonResponse
 from .revision import Revision

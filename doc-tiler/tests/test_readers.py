@@ -14,10 +14,11 @@ from PIL import Image, ImageChops, ImageStat
 from conftest import make_pdf, make_png
 
 from tiler.models import DocType
-from tiler.render import worker
 from tiler.render.geometry import Tile, Tiling
-from tiler.render.readers import ImageReader, PdfReader, RenderParams
+from tiler.render.params import RenderParams
 from tiler.render.pixels import DecodeError
+from tiler.render.readers import ImageReader, PdfReader
+from tiler.render.worker import Worker
 
 PARAMS = RenderParams(
     tile_width=875,
@@ -52,7 +53,7 @@ def _decode(jpeg: bytes) -> Image.Image:
 
 
 def test_pdf_pages_are_stacked_into_one_image(tmp_path):
-    height, tiles = PdfReader(_file(tmp_path, make_pdf(pages=3)), PARAMS).layout()
+    height, tiles = PdfReader(_file(tmp_path, make_pdf(pages=3)), PARAMS).cut()
 
     page = tiles[0].height
     assert abs(page - round(875 * 842 / 595)) <= 2                    # A4 at tile width
@@ -64,7 +65,7 @@ def test_pdf_pages_may_differ_in_size(tmp_path):
     """A landscape page among portrait ones is shorter at tile width; each tile starts
     where the page before it ends."""
     path = _file(tmp_path, _text_pdf((595, 842), (842, 595), (595, 842)))
-    height, tiles = PdfReader(path, PARAMS).layout()
+    height, tiles = PdfReader(path, PARAMS).cut()
 
     portrait, landscape = tiles[0].height, tiles[1].height
     assert abs(landscape - round(875 * 595 / 842)) <= 2 and landscape < portrait
@@ -74,7 +75,7 @@ def test_pdf_pages_may_differ_in_size(tmp_path):
 
 def test_sliced_pdf_tiles_never_cross_a_page(tmp_path):
     reader = PdfReader(_file(tmp_path, make_pdf(pages=3)), SLICED)
-    height, tiles = reader.layout()
+    height, tiles = reader.cut()
 
     assert len(tiles) > 3
     assert [t.num for t in tiles] == list(range(len(tiles)))
@@ -86,10 +87,10 @@ def test_sliced_pdf_tiles_never_cross_a_page(tmp_path):
 
 def test_a_tile_is_deterministic(tmp_path):
     path = _file(tmp_path, make_pdf(pages=2))
-    _, tiles = PdfReader(path, PARAMS).layout()
+    _, tiles = PdfReader(path, PARAMS).cut()
 
-    first = worker.encode_tile(PdfReader(path, PARAMS), tiles[1])
-    again = worker.encode_tile(PdfReader(path, PARAMS), tiles[1])     # a fresh worker's view
+    first = Worker.encode(PdfReader(path, PARAMS), tiles[1])
+    again = Worker.encode(PdfReader(path, PARAMS), tiles[1])     # a fresh worker's view
 
     assert first == again
 
@@ -98,7 +99,7 @@ def test_rows_read_apart_join_without_seams(tmp_path):
     """Rows read piece by piece match the page read whole up to resampling noise: a
     tile depends only on its own rows, which is what lets a tile request read just them."""
     path = _file(tmp_path, _text_pdf((595, 842)))
-    height, _ = PdfReader(path, PARAMS).layout()
+    height, _ = PdfReader(path, PARAMS).cut()
 
     whole = PdfReader(path, PARAMS).read(0, height)
     reader = PdfReader(path, PARAMS)
@@ -114,7 +115,7 @@ def test_rows_read_apart_join_without_seams(tmp_path):
 
 def test_a_read_must_stay_within_one_page(tmp_path):
     reader = PdfReader(_file(tmp_path, make_pdf(pages=2)), PARAMS)
-    height, tiles = reader.layout()
+    height, tiles = reader.cut()
     page = tiles[0].height
 
     with pytest.raises(DecodeError):
@@ -130,8 +131,8 @@ def test_a_huge_page_renders_at_capped_resolution(tmp_path):
     reader = PdfReader(_file(tmp_path, _text_pdf((14400, 14400))), PARAMS)
 
     started = time.perf_counter()
-    height, [tile] = reader.layout()
-    encoded = worker.encode_tile(reader, tile)
+    height, [tile] = reader.cut()
+    encoded = Worker.encode(reader, tile)
 
     assert height == 875
     assert _decode(encoded.jpeg).size == (875, 875)
@@ -152,7 +153,7 @@ def test_image_reader_crops_its_rows(tmp_path):
     img.save(path)
 
     reader = ImageReader(str(path), PARAMS)
-    assert reader.layout() == (200, [Tile(0, 0, 200)])                # 1750 → 875 wide
+    assert reader.cut() == (200, [Tile(0, 0, 200)])                # 1750 → 875 wide
 
     top = ImageStat.Stat(reader.read(0, 90)).mean
     bottom = ImageStat.Stat(reader.read(110, 200)).mean
@@ -161,7 +162,7 @@ def test_image_reader_crops_its_rows(tmp_path):
 
 def test_trim_drops_the_pixels_and_close_the_document(tmp_path):
     reader = PdfReader(_file(tmp_path, make_pdf(pages=1)), PARAMS)
-    reader.layout()
+    reader.cut()
     reader.read(0, 10)
     assert reader._drawn is not None
 
@@ -175,20 +176,38 @@ def test_trim_drops_the_pixels_and_close_the_document(tmp_path):
 def test_a_worker_keeps_its_reader_while_the_document_stays(tmp_path):
     pdf = _file(tmp_path, make_pdf(pages=2))
     png = _file(tmp_path, make_png(400, 300), "doc.png")
-    worker.init_worker(0, PARAMS)
+    worker = Worker(PARAMS)
 
     try:
-        _, tiles = worker.plan(DocType.PDF, pdf)
-        reader = worker._current
+        _, tiles = worker.on(DocType.PDF, pdf, lambda reader: reader.cut())
+        reader = worker.reader
         assert isinstance(reader, PdfReader) and reader._doc is not None
 
-        worker.render(DocType.PDF, pdf, tiles[:1])
-        assert worker._current is reader                              # the PDF stayed parsed
+        worker.on(DocType.PDF, pdf, lambda reader: [Worker.encode(reader, tile) for tile in tiles[:1]])
+        assert worker.reader is reader                                # the PDF stayed parsed
         assert reader._drawn is None                                  # its pixels did not
 
-        assert worker.plan(DocType.IMG, png) == (656, [Tile(0, 0, 656)])
-        assert isinstance(worker._current, ImageReader)
+        assert worker.on(DocType.IMG, png, lambda reader: reader.cut()) == (656, [Tile(0, 0, 656)])
+        assert isinstance(worker.reader, ImageReader)
         assert reader._doc is None                                    # closed for the next document
 
     finally:
-        worker._forget()
+        worker.forget()
+
+
+def test_the_tasks_run_on_the_process_worker(tmp_path):
+    """What the pool submits by name: the classmethods reach the worker `start` made."""
+    pdf = _file(tmp_path, make_pdf(pages=2))
+    Worker.start(0, PARAMS)
+
+    try:
+        height, tiles = Worker.cut(DocType.PDF, pdf)
+        encoded = Worker.render(DocType.PDF, pdf, tiles)
+
+        assert [image.height for image in encoded] == [tile.height for tile in tiles]
+        assert sum(tile.height for tile in tiles) == height
+        assert isinstance(Worker.process.reader, PdfReader)
+
+    finally:
+        Worker.process.forget()
+        Worker.process = None

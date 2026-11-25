@@ -18,7 +18,7 @@ import contextlib
 import logging
 from typing import Iterable
 
-from .ssrf import BlockedTarget, resolve_and_check
+from .ssrf import BlockedTarget, SsrfPolicy
 
 log = logging.getLogger("tiler.ssrf_proxy")
 
@@ -41,8 +41,8 @@ class GuardProxy:
     }
 
 
-    def __init__(self, *, allow_private: bool = False, connect_timeout: float = 15.0):
-        self._allow_private = allow_private
+    def __init__(self, policy: SsrfPolicy, *, connect_timeout: float = 15.0):
+        self._policy = policy
         self._connect_timeout = connect_timeout
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[asyncio.Task] = set()
@@ -146,7 +146,7 @@ class GuardProxy:
 
     async def _dial(self, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Resolve+validate `host`, then connect by IP (defeats DNS rebinding)."""
-        ips = await resolve_and_check(host, port, self._allow_private)
+        ips = await self._policy.resolve(host, port)
         last: Exception | None = None
 
         for ip in ips:
