@@ -12,7 +12,7 @@ import orjson
 from fastapi import APIRouter, Request
 from fastapi.responses import Response, StreamingResponse
 
-from virag.errors import ApiError
+from virag.errors import unprocessable
 from virag.responses import OrjsonResponse
 
 
@@ -144,16 +144,9 @@ async def _read_body(request: Request) -> dict:
         body = orjson.loads(raw)
 
     except ValueError as e:
-        raise ApiError(
-            status_code=422,
-            message="Request body must be valid JSON",
-            details={"base_message": str(e)},
-        ) from e
+        raise unprocessable("Request body must be valid JSON", base_message=str(e)) from e
 
     if not isinstance(body, dict):
-        raise ApiError(
-            status_code=422,
-            message="Request body must be a JSON object",
-        )
+        raise unprocessable("Request body must be a JSON object")
 
     return body

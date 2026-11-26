@@ -6,7 +6,7 @@ from contextlib import nullcontext
 import httpx2
 
 from virag.clients.http_service import OpenAIService
-from virag.errors import ApiError
+from virag.errors import not_ready, unprocessable
 from virag.settings import HttpSettings, RetrieverSettings
 from virag.utils import gather
 
@@ -82,19 +82,15 @@ class RetrieverClient(OpenAIService):
 
         text_vectors = await self._probe(["ping"])
         if text_vectors is None:
-            raise ApiError(
-                status_code=503,
-                message=f"Model {self.model_name} rejected a text embedding request",
-            )
+            raise not_ready(f"Model {self.model_name} rejected a text embedding request")
 
         self.dimension = len(text_vectors[0])
         self.batch_images = await self._resolve_image_batching()
 
         if self.bulk_priority and await self._probe(["ping"], priority=self.bulk_priority) is None:
-            raise ApiError(
-                status_code=503,
-                message=f"Retriever rejected priority={self.bulk_priority}: start it with "
-                        f"`--scheduling-policy priority` or set RETRIEVER_BULK_PRIORITY=0",
+            raise not_ready(
+                f"Retriever rejected priority={self.bulk_priority}: start it with "
+                f"`--scheduling-policy priority` or set RETRIEVER_BULK_PRIORITY=0",
             )
 
         log.info(
@@ -118,10 +114,9 @@ class RetrieverClient(OpenAIService):
                 return True
 
             if self.image_batching == "on":
-                raise ApiError(
-                    status_code=503,
-                    message=f"Model {self.model_name} does not accept batched image requests "
-                            f"(RETRIEVER_IMAGE_BATCHING=on)",
+                raise not_ready(
+                    f"Model {self.model_name} does not accept batched image requests "
+                    f"(RETRIEVER_IMAGE_BATCHING=on)",
                 )
 
             log.warning("retriever: batched image requests unsupported; sending one image per request")
@@ -129,10 +124,7 @@ class RetrieverClient(OpenAIService):
         single_vectors = await self._probe([image])
 
         if single_vectors is None:
-            raise ApiError(
-                status_code=503,
-                message=f"Model {self.model_name} does not accept image inputs",
-            )
+            raise not_ready(f"Model {self.model_name} does not accept image inputs")
 
         self._require_dimension(single_vectors)
 
@@ -142,10 +134,9 @@ class RetrieverClient(OpenAIService):
     def _require_dimension(self, vectors: list[list[float]]) -> None:
         """Image and text vectors must share one space — the same size."""
         if len(vectors[0]) != self.dimension:
-            raise ApiError(
-                status_code=503,
-                message=f"Model {self.model_name} returns {len(vectors[0])}-d image vectors "
-                        f"but {self.dimension}-d text vectors",
+            raise not_ready(
+                f"Model {self.model_name} returns {len(vectors[0])}-d image vectors "
+                f"but {self.dimension}-d text vectors",
             )
 
 
@@ -232,10 +223,9 @@ class RetrieverClient(OpenAIService):
 
         if not response.is_success:
             if len(units) == 1:
-                raise ApiError(
-                    status_code=503,
-                    message=f"Upstream {self.route} rejected an item during embedding",
-                    details=self._upstream_details(response),
+                raise not_ready(
+                    f"Upstream {self.route} rejected an item during embedding",
+                    **self._upstream_details(response),
                 )
 
             log.warning(
@@ -249,10 +239,7 @@ class RetrieverClient(OpenAIService):
         vectors = self._json(response, action="embedding", parse=self._vectors)
 
         if len(vectors) != len(units):
-            raise ApiError(
-                status_code=422,
-                message=f"Upstream {self.route} returned {len(vectors)} vectors for {len(units)} inputs",
-            )
+            raise unprocessable(f"Upstream {self.route} returned {len(vectors)} vectors for {len(units)} inputs")
 
         return vectors
 

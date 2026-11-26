@@ -412,14 +412,6 @@ def test_every_client_takes_its_transport_options_from_its_settings():
         assert built.http.timeout == httpx2.Timeout(section.timeout_sec, connect=section.connect_timeout_sec)
 
 
-def test_tiler_doc_exists_statuses():
-    tiler = TilerClient("http://tiler", max_retries=0, **_HTTP)
-    _mock(tiler, lambda req, n: httpx2.Response(206 if req.url.path.endswith("/a") else 404))
-
-    assert _run(tiler.doc_exists("a")) is True
-    assert _run(tiler.doc_exists("b")) is False
-
-
 def test_tiler_tile_is_checked_against_its_embedded_render_version():
     tiler = TilerClient("http://tiler", max_retries=0, **_HTTP)
     seen = []

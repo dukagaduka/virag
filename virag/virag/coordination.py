@@ -86,11 +86,11 @@ class Coordinator:
 
 
     # ------------------------------------------------------------------ #
-    # lease
+    # this process's lease
     # ------------------------------------------------------------------ #
     async def register(self) -> None:
         """Take this process's lease (a fresh token, so it cannot exist yet)."""
-        await self.valkey.set_ttl(self._lease(self.token), self.identity, self.ttl, nx=True)
+        await self.valkey.set_ttl(self._lease_key(self.token), self.identity, self.ttl, nx=True)
         log.info("lease: %s (%s/%s)", self.token, self.identity["host"], self.identity["pid"])
 
 
@@ -102,7 +102,7 @@ class Coordinator:
             await asyncio.sleep(self.ttl / 3)
 
             try:
-                renewed = await self.valkey.set_ttl(self._lease(self.token), self.identity, self.ttl, xx=True)
+                renewed = await self.valkey.set_ttl(self._lease_key(self.token), self.identity, self.ttl, xx=True)
 
             except ApiError as e:
                 log.warning("lease: cannot renew (%s); retrying", e.message)
@@ -119,60 +119,10 @@ class Coordinator:
         """Hand back the reconcile lead and the lease, so the others need not wait out the TTL."""
         try:
             await self._release(RECONCILE_ON)
-            await self.valkey.delete(self._lease(self.token))
+            await self.valkey.delete(self._lease_key(self.token))
 
         except ApiError as e:
             log.warning("lease: cannot release (%s); it expires in %ss", e.message, self.ttl)
-
-
-    async def _alive(self, tokens: Iterable[str]) -> dict[str, bool]:
-        tokens = sorted(set(tokens))
-        found = await self.valkey.exists_each(self._lease(token) for token in tokens)
-
-        return dict(zip(tokens, found))
-
-
-    async def _owner_dead(self, token: str) -> bool:
-        return not (await self._alive([token]))[token]
-
-
-    # ------------------------------------------------------------------ #
-    # what a process holds
-    # ------------------------------------------------------------------ #
-    async def _take(self, name: str) -> str | None:
-        """Take `name` for this process — free, or held by a dead process (taken over).
-        None once taken; otherwise the token of the live process holding it, which may
-        be this one."""
-        while True:
-            if await self.valkey.set_nx(name, self.token):
-                return None
-
-            holder = await self.valkey.get(name)
-            if holder is None:
-                continue                                        # released meanwhile
-
-            if not await self._owner_dead(holder):
-                return holder
-
-            if await self.valkey.set_ifeq(name, self.token, holder):
-                log.warning("%s: taken over from dead process %s", name, holder)
-
-                return None
-            # Another process took it over first: the next round reads its token.
-
-
-    async def _holds(self, name: str) -> bool:
-        """Fencing before an irreversible step: this process still holds `name` and its
-        lease has not expired — nobody may have taken `name` over."""
-        return (
-            await self.valkey.get(name) == self.token
-            and await self.valkey.exists(self._lease(self.token))
-        )
-
-
-    async def _release(self, name: str) -> None:
-        """Release `name` if this process still holds it."""
-        await self.valkey.delete_ifeq(name, self.token)
 
 
     # ------------------------------------------------------------------ #
@@ -189,7 +139,7 @@ class Coordinator:
         The document is held before the alias is resolved, and journaled while a job
         runs: an enroll that still lands in the collection a revision replaces is in
         its journal, and drain waits for it."""
-        name = self._enroll(doc_id)
+        name = self._enroll_key(doc_id)
 
         if await self._take(name) is not None:
             raise EnrollInProgress(doc_id)
@@ -210,13 +160,13 @@ class Coordinator:
 
     async def holds_enroll(self, doc_id: str) -> bool:
         """Fencing before the rollback delete: the document is still this process's."""
-        return await self._holds(self._enroll(doc_id))
+        return await self._holds(self._enroll_key(doc_id))
 
 
     async def enrolling_now(self) -> dict[str, str]:
         """doc_id → the token of the live process enrolling it, across the cluster; what
         dead processes held is dropped on the way."""
-        names = await self.valkey.names(self._enroll("*"))
+        names = await self.valkey.names(self._enroll_key("*"))
         held = {name: holder for name, holder in zip(names, await self.valkey.get_each(names)) if holder is not None}
         alive = await self._alive(held.values())
 
@@ -224,7 +174,7 @@ class Coordinator:
             if not alive[holder]:
                 await self.valkey.delete_ifeq(name, holder)
 
-        return {name.removeprefix(self._enroll("")): holder for name, holder in held.items() if alive[holder]}
+        return {name.removeprefix(self._enroll_key("")): holder for name, holder in held.items() if alive[holder]}
 
 
     async def drain(self, timeout: float) -> bool:
@@ -249,7 +199,7 @@ class Coordinator:
 
 
     # ------------------------------------------------------------------ #
-    # revision / rollback job
+    # the revision / rollback job
     # ------------------------------------------------------------------ #
     async def acquire_revision(self) -> dict | None:
         """Take `revision:on` for a job of this process — free, or held by a dead process
@@ -330,11 +280,61 @@ class Coordinator:
         return await self._take(RECONCILE_ON) in (None, self.token)
 
 
+    # ------------------------------------------------------------------ #
+    # internals: what a process holds, and whether its holder is alive
+    # ------------------------------------------------------------------ #
+    async def _take(self, name: str) -> str | None:
+        """Take `name` for this process — free, or held by a dead process (taken over).
+        None once taken; otherwise the token of the live process holding it, which may
+        be this one."""
+        while True:
+            if await self.valkey.set_nx(name, self.token):
+                return None
+
+            holder = await self.valkey.get(name)
+            if holder is None:
+                continue                                        # released meanwhile
+
+            if not await self._owner_dead(holder):
+                return holder
+
+            if await self.valkey.set_ifeq(name, self.token, holder):
+                log.warning("%s: taken over from dead process %s", name, holder)
+
+                return None
+            # Another process took it over first: the next round reads its token.
+
+
+    async def _holds(self, name: str) -> bool:
+        """Fencing before an irreversible step: this process still holds `name` and its
+        lease has not expired — nobody may have taken `name` over."""
+        return (
+            await self.valkey.get(name) == self.token
+            and await self.valkey.exists(self._lease_key(self.token))
+        )
+
+
+    async def _release(self, name: str) -> None:
+        """Release `name` if this process still holds it."""
+        await self.valkey.delete_ifeq(name, self.token)
+
+
+    async def _alive(self, tokens: Iterable[str]) -> dict[str, bool]:
+        tokens = sorted(set(tokens))
+        found = await self.valkey.exists_each(self._lease_key(token) for token in tokens)
+
+        return dict(zip(tokens, found))
+
+
+    async def _owner_dead(self, token: str) -> bool:
+        return not (await self._alive([token]))[token]
+
+
     @staticmethod
-    def _lease(token: str) -> str:
+    def _lease_key(token: str) -> str:
         return f"procs:{token}"
 
 
     @staticmethod
-    def _enroll(doc_id: str) -> str:
+    def _enroll_key(doc_id: str) -> str:
         return f"enroll:{doc_id}"

@@ -6,7 +6,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from virag.settings import Settings, SettingsError
+from virag.settings import Settings
 from virag.errors import ApiError, install_error_handlers
 from virag.responses import OrjsonResponse
 from virag.clients.qdrant_store import QdrantStore
@@ -91,17 +91,6 @@ def _warn_open_routes(settings: Settings) -> None:
         log.warning("VIRAG_ADMIN_API_KEY is empty: /enroll and /revision are open")
 
 
-def _require_vector_size(dimension: int | None, vector_size: int) -> None:
-    """The retriever's vectors must fit the collection, or the first upsert fails."""
-    if dimension != vector_size:
-        message = (
-            f"retriever returns {dimension}-d vectors but QDRANT_VECTOR_SIZE is {vector_size}"
-        )
-        log.critical("FATAL: %s", message)
-
-        raise SettingsError(message)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -137,7 +126,7 @@ async def lifespan(app: FastAPI):
         # Every dependency is essential; a failed check refuses startup.
         await _require_dependency("qdrant", store.ensure_collection())
         await _require_dependency("retriever", retriever.check_connection())
-        _require_vector_size(retriever.dimension, settings.qdrant_settings.vector_size)
+        store.check_vector_size(retriever.dimension)
         await _require_dependency("tiler", tiler.check_connection())
         await _require_dependency("vlm", vlm.check_connection())
         await _require_dependency("valkey", valkey.check_connection())

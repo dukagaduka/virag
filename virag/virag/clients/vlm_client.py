@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import httpx2
 
 from virag.clients.http_service import OpenAIService
-from virag.errors import ApiError
+from virag.errors import ApiError, not_ready
 from virag.settings import HttpSettings, VLMSettings
 
 
@@ -82,10 +82,9 @@ class VLMClient(OpenAIService):
             raise self._transport_error(self.route, "the vision probe", e) from e
 
         if response.status_code >= 400:
-            raise ApiError(
-                status_code=503,
-                message=f"Model {self.model_name} does not accept image inputs (not vision-capable)",
-                details=self._upstream_details(response),
+            raise not_ready(
+                f"Model {self.model_name} does not accept image inputs (not vision-capable)",
+                **self._upstream_details(response),
             )
 
 

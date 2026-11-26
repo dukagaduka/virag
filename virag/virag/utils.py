@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 
 from python_multipart.multipart import MultipartParser, parse_options_header
 
-from virag.errors import ApiError
+from virag.errors import not_ready
 
 
 log = logging.getLogger("virag.utils")
@@ -86,10 +86,9 @@ def unavailable_as_503(
                 if when is not None and not when(e):
                     raise
 
-                raise ApiError(
-                    status_code=503,
-                    message=f"{service} is unavailable during {method.__name__}",
-                    details=details(e) if details is not None else {"error": repr(e)},
+                raise not_ready(
+                    f"{service} is unavailable during {method.__name__}",
+                    **(details(e) if details is not None else {"error": repr(e)}),
                 ) from e
 
         return wrapper

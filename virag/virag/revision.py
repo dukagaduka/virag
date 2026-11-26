@@ -53,7 +53,7 @@ from virag.clients.qdrant_store import QdrantStore
 from virag.clients.tiler_client import TilerClient
 from virag.coordination import Coordinator, EnrollInProgress
 from virag.enroll import Enroller
-from virag.errors import ApiError
+from virag.errors import ApiError, conflict
 from virag.reconcile import Reconciler
 from virag.settings import RevisionSettings
 
@@ -122,17 +122,16 @@ class RevisionManager:
         async def prepare():
             abandoned, restored = await self.store.resolve()
             if restored is None:
-                raise ApiError(status_code=409, message="No previous collection to roll back to")
+                raise conflict("No previous collection to roll back to")
 
             render_version = await self.tiler.render_version()
             meta = await self.store.get_collection_metadata(collection=restored)
 
             if meta.get("render_version") != render_version:
-                raise ApiError(
-                    status_code=409,
-                    message=f"Previous collection {restored} was embedded from "
-                            f"render_version {meta.get('render_version')} but the tiler renders "
-                            f"{render_version}; chat would answer RENDER_VERSION_MISMATCH",
+                raise conflict(
+                    f"Previous collection {restored} was embedded from "
+                    f"render_version {meta.get('render_version')} but the tiler renders "
+                    f"{render_version}; chat would answer RENDER_VERSION_MISMATCH",
                 )
 
             return self._rollback(abandoned, restored)
@@ -239,11 +238,7 @@ class RevisionManager:
         checks; a refusal hands the job back — and run the job it returns in the background."""
         holder = await self.coordinator.acquire_revision()
         if holder is not None:
-            raise ApiError(
-                status_code=409,
-                message=f"A {holder.get('kind', 'revision')} is already running",
-                details={"status": holder},
-            )
+            raise conflict(f"A {holder.get('kind', 'revision')} is already running", status=holder)
 
         job = None
 

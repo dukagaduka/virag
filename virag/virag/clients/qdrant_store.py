@@ -28,8 +28,8 @@ from qdrant_client.models import (
     VectorParams
 )
 
-from virag.errors import ApiError
-from virag.settings import HttpSettings, QdrantStoreSettings
+from virag.errors import conflict, not_ready
+from virag.settings import HttpSettings, QdrantStoreSettings, SettingsError
 from virag.utils import unavailable_as_503
 
 
@@ -209,14 +209,22 @@ class QdrantStore:
             if e.code() != grpc.StatusCode.UNAUTHENTICATED:  # type: ignore[attr-defined]
                 raise
 
-            raise ApiError(
-                status_code=503,
-                message="Qdrant rejects QDRANT_API_KEY: set the service.api_key of its qdrant.yaml",
-                details={"grpc_status": "UNAUTHENTICATED"},
+            raise not_ready(
+                "Qdrant rejects QDRANT_API_KEY: set the service.api_key of its qdrant.yaml",
+                grpc_status="UNAUTHENTICATED",
             ) from e
 
         await self._validate(physical)
         await self._ensure_indexes(physical)
+
+
+    def check_vector_size(self, dimension: int | None) -> None:
+        """The retriever's vectors must fit the collection, or the first upsert fails."""
+        if dimension != self.vector_size:
+            message = f"retriever returns {dimension}-d vectors but QDRANT_VECTOR_SIZE is {self.vector_size}"
+            log.critical("FATAL: %s", message)
+
+            raise SettingsError(message)
 
 
     async def close(self) -> None:
@@ -456,10 +464,9 @@ class QdrantStore:
         enrolls writing into it are done."""
         info = (await self.qdrant.get_collection(restored)).config.params.vectors
         if info.size != self.vector_size:  # type: ignore
-            raise ApiError(
-                status_code=409,
-                message=f"Previous collection {restored} holds {info.size}-d vectors "  # type: ignore
-                        f"but QDRANT_VECTOR_SIZE is {self.vector_size}; revert the retriever config first",
+            raise conflict(
+                f"Previous collection {restored} holds {info.size}-d vectors "  # type: ignore
+                f"but QDRANT_VECTOR_SIZE is {self.vector_size}; revert the retriever config first",
             )
 
         meta = await self._collection_metadata(restored)

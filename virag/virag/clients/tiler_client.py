@@ -23,7 +23,7 @@ import httpx2
 import orjson
 
 from virag.clients.http_service import HttpService
-from virag.errors import ApiError
+from virag.errors import ApiError, bad_gateway, conflict, not_ready
 from virag.settings import HttpSettings, TilerSettings
 
 
@@ -175,10 +175,6 @@ class TilerClient(HttpService):
         return f"{self.base_url}/docs/search"
 
 
-    def doc_route(self, doc_id: str) -> str:
-        return f"{self.base_url}/doc/{doc_id}"
-
-
     def doc_tiles_route(self, doc_id: str) -> str:
         return f"{self.base_url}/doc/{doc_id}/tiles"
 
@@ -223,11 +219,7 @@ class TilerClient(HttpService):
         response = await self._request("GET", self.info_route, action="the key check", passthrough_statuses=(401,))
 
         if response.status_code == 401:
-            raise ApiError(
-                status_code=503,
-                message="the tiler rejects TILER_API_KEY: set the tiler's own value",
-                details={"upstream_status": 401},
-            )
+            raise not_ready("the tiler rejects TILER_API_KEY: set the tiler's own value", upstream_status=401)
 
         await self.check_schema()
 
@@ -243,17 +235,15 @@ class TilerClient(HttpService):
             actual_type = declared.get(key)
 
             if actual_type is None:
-                raise ApiError(
-                    status_code=503,
-                    message=f"tiler metadata schema is missing required field {key!r}; "
-                            f"declare it in tiler_metadata_schema.yaml",
+                raise not_ready(
+                    f"tiler metadata schema is missing required field {key!r}; "
+                    f"declare it in tiler_metadata_schema.yaml",
                 )
 
             if actual_type != expected_type:
-                raise ApiError(
-                    status_code=503,
-                    message=f"tiler metadata field {key!r} is declared {actual_type!r} "
-                            f"but virag needs {expected_type!r}",
+                raise not_ready(
+                    f"tiler metadata field {key!r} is declared {actual_type!r} "
+                    f"but virag needs {expected_type!r}",
                 )
 
 
@@ -340,20 +330,15 @@ class TilerClient(HttpService):
 
         rendered_by = response.headers.get("X-Render-Version")
         if render_version is not None and rendered_by != render_version:
-            raise ApiError(
-                status_code=409,
-                code=self.RENDER_VERSION_MISMATCH,
-                message=(
-                    f"tile ({doc_id}, {tile_num}) was embedded from render_version "
-                    f"{render_version} but the tiler renders {rendered_by}; rebuild the "
-                    f"collection with POST /revision"
-                ),
-                details={
-                    "doc_id": doc_id,
-                    "tile_num": tile_num,
-                    "embedded_render_version": render_version,
-                    "tiler_render_version": rendered_by,
-                },
+            raise conflict(
+                f"tile ({doc_id}, {tile_num}) was embedded from render_version "
+                f"{render_version} but the tiler renders {rendered_by}; rebuild the "
+                f"collection with POST /revision",
+                self.RENDER_VERSION_MISMATCH,
+                doc_id=doc_id,
+                tile_num=tile_num,
+                embedded_render_version=render_version,
+                tiler_render_version=rendered_by,
             )
 
         return response.content
@@ -374,40 +359,12 @@ class TilerClient(HttpService):
         tiler_revision = info.get("revision") or {}
 
         if not tiler_revision.get("serving", True):
-            raise ApiError(
-                status_code=409,
-                message=f"The tiler is not serving (its revision is {tiler_revision.get('state')}); "
-                        f"retry once it is",
+            raise conflict(
+                f"The tiler is not serving (its revision is {tiler_revision.get('state')}); "
+                f"retry once it is",
             )
 
         return info.get("render_version")
-
-
-    async def doc_exists(self, doc_id: str) -> bool:
-        """Cheaply check a document exists in the tiler (Range 0-0, no blob transfer)."""
-        route = self.doc_route(doc_id)
-
-        try:
-            response = await self.send("GET", route, headers={"Range": "bytes=0-0"})
-
-        except httpx2.RequestError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Cannot reach {route}",
-                details={"error": repr(e)},
-            ) from e
-
-        if response.status_code in (200, 206):
-            return True
-
-        if response.status_code == 404:
-            return False
-
-        raise ApiError(
-            status_code=503,
-            message=f"Unexpected status {response.status_code} checking doc {doc_id}",
-            details=self._upstream_details(response),
-        )
 
 
     async def get_schema(self) -> dict:
@@ -500,21 +457,13 @@ class TilerClient(HttpService):
                 name = fields.pop("event", None)
 
                 if name == "error":
-                    raise ApiError(
-                        status_code=502,
-                        message=f"tiler stream error: {fields.get('message')}",
-                        details={"tiler_code": fields.get("code")},
-                    )
+                    raise bad_gateway(f"tiler stream error: {fields.get('message')}", tiler_code=fields.get("code"))
 
                 if name in cls.EVENTS:
                     yield cls._event(cls.EVENTS[name], fields, action=action)
 
         except httpx2.RequestError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Lost {response.url} mid-stream during {action}",
-                details={"error": repr(e)},
-            ) from e
+            raise not_ready(f"Lost {response.url} mid-stream during {action}", error=repr(e)) from e
 
 
     @staticmethod
@@ -525,10 +474,9 @@ class TilerClient(HttpService):
             return kind(**{name: fields[name] for name in kind.__dataclass_fields__ if name in fields})
 
         except TypeError as e:
-            raise ApiError(
-                status_code=502,
-                message=f"tiler stream sent a malformed `{kind.__name__.lower()}` event during {action}",
-                details={"base_message": str(e)},
+            raise bad_gateway(
+                f"tiler stream sent a malformed `{kind.__name__.lower()}` event during {action}",
+                base_message=str(e),
             ) from e
 
 

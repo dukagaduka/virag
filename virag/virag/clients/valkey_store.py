@@ -9,7 +9,7 @@ from redis.exceptions import AuthenticationError as RedisAuthenticationError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from virag.errors import ApiError
+from virag.errors import not_ready
 from virag.settings import ValkeySettings
 from virag.utils import unavailable_as_503
 
@@ -78,20 +78,18 @@ class ValkeyStore:
             await self.redis.ping()
 
         except RedisAuthenticationError as e:
-            raise ApiError(
-                status_code=503,
-                message="Valkey rejects the password in VALKEY_URL: set the requirepass of its valkey.conf",
-                details={"error": repr(e)},
+            raise not_ready(
+                "Valkey rejects the password in VALKEY_URL: set the requirepass of its valkey.conf",
+                error=repr(e),
             ) from e
 
         version = (await self.redis.info("server")).get("valkey_version")
         parsed = tuple(int(part) for part in str(version).split(".")[:2]) if version else None
 
         if parsed is None or parsed < self.MIN_VERSION:
-            raise ApiError(
-                status_code=503,
-                message=f"Valkey {version or '(not Valkey)'} is too old: virag needs "
-                        f"{'.'.join(map(str, self.MIN_VERSION))}+ (SET IFEQ, DELIFEQ)",
+            raise not_ready(
+                f"Valkey {version or '(not Valkey)'} is too old: virag needs "
+                f"{'.'.join(map(str, self.MIN_VERSION))}+ (SET IFEQ, DELIFEQ)",
             )
 
         log.info("valkey: version=%s prefix=%s", version, self.prefix)

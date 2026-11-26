@@ -14,16 +14,13 @@ class ApiError(Exception):
         401: "UNAUTHORIZED",
         403: "FORBIDDEN",
         404: "NOT_FOUND",
-        405: "METHOD_NOT_ALLOWED",
         409: "CONFLICT",
         413: "PAYLOAD_TOO_LARGE",
         415: "UNSUPPORTED_MEDIA",
-        416: "RANGE_NOT_SATISFIABLE",
         422: "UNPROCESSABLE",
         500: "INTERNAL_ERROR",
         502: "UPSTREAM_FAILURE",
         503: "NOT_READY",
-        504: "RENDER_TIMEOUT",
     }
 
 
@@ -52,6 +49,41 @@ class ApiError(Exception):
             error["details"] = self.details
 
         return {"error": error}
+
+
+def unauthorized(message: str, code: str = "UNAUTHORIZED", **details: Any) -> ApiError:
+    """Build a 401 error with the Bearer challenge."""
+    return ApiError(401, message, details or None, code, headers={"WWW-Authenticate": "Bearer"})
+
+
+def forbidden(message: str, code: str = "FORBIDDEN", **details: Any) -> ApiError:
+    """Build a 403 error."""
+    return ApiError(403, message, details or None, code)
+
+
+def not_found(message: str, code: str = "NOT_FOUND", **details: Any) -> ApiError:
+    """Build a 404 error."""
+    return ApiError(404, message, details or None, code)
+
+
+def conflict(message: str, code: str = "CONFLICT", **details: Any) -> ApiError:
+    """Build a 409 error."""
+    return ApiError(409, message, details or None, code)
+
+
+def unprocessable(message: str, code: str = "UNPROCESSABLE", **details: Any) -> ApiError:
+    """Build a 422 error."""
+    return ApiError(422, message, details or None, code)
+
+
+def bad_gateway(message: str, code: str = "UPSTREAM_FAILURE", **details: Any) -> ApiError:
+    """Build a 502 error."""
+    return ApiError(502, message, details or None, code)
+
+
+def not_ready(message: str, code: str = "NOT_READY", **details: Any) -> ApiError:
+    """Build a 503 error."""
+    return ApiError(503, message, details or None, code)
 
 
 def install_error_handlers(app: FastAPI) -> None:

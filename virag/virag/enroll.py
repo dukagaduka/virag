@@ -48,7 +48,7 @@ from virag.clients.qdrant_store import QdrantStore, TilePoint
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import Begin, Committed, Event, Tile, TilerClient, TilerDoc
 from virag.coordination import Coordinator
-from virag.errors import ApiError
+from virag.errors import ApiError, bad_gateway
 from virag.settings import EnrollSettings
 from virag.utils import chunked, gather
 
@@ -175,10 +175,10 @@ class Enroller:
             event = await anext(events)
 
         except StopAsyncIteration:
-            raise ApiError(status_code=502, message="tiler stream ended before it began") from None
+            raise bad_gateway("tiler stream ended before it began") from None
 
         if not isinstance(event, Begin):
-            raise ApiError(status_code=502, message=f"tiler stream began with {type(event).__name__}")
+            raise bad_gateway(f"tiler stream began with {type(event).__name__}")
 
         return event
 
@@ -209,7 +209,7 @@ class Enroller:
 
                 return enrolled, event
 
-        raise ApiError(status_code=502, message="tiler stream ended without a committed event")
+        raise bad_gateway("tiler stream ended without a committed event")
 
 
     async def _flush(self, begin: Begin, batch: list[Tile], collection: str) -> int:

@@ -6,7 +6,7 @@ from typing import AsyncIterator
 import orjson
 from fastapi import APIRouter, Request
 
-from virag.errors import ApiError
+from virag.errors import unprocessable
 from virag.utils import MultipartFields
 
 
@@ -92,7 +92,7 @@ class EnrollUpload:
             self.form = MultipartFields(request.headers.get("content-type", ""))
 
         except ValueError as e:
-            raise ApiError(status_code=422, message=f"/enroll takes multipart/form-data: {e}") from e
+            raise unprocessable(f"/enroll takes multipart/form-data: {e}") from e
 
         self._name_checked = False
 
@@ -105,7 +105,7 @@ class EnrollUpload:
                 self.form.feed(chunk)
 
             except ValueError as e:
-                raise ApiError(status_code=422, message=f"malformed multipart body: {e}") from e
+                raise unprocessable(f"malformed multipart body: {e}") from e
 
             if "metadata" in self.form.fields:
                 self.require_name()
@@ -126,14 +126,10 @@ class EnrollUpload:
             metadata = orjson.loads(raw)
 
         except (ValueError, TypeError) as e:
-            raise ApiError(
-                status_code=422,
-                message="`metadata` must be a valid JSON object",
-                details={"base_message": str(e)},
-            ) from e
+            raise unprocessable("`metadata` must be a valid JSON object", base_message=str(e)) from e
 
         if not isinstance(metadata, dict):
-            raise ApiError(status_code=422, message="`metadata` must be a JSON object")
+            raise unprocessable("`metadata` must be a JSON object")
 
         return metadata
 
@@ -155,8 +151,7 @@ class EnrollUpload:
         self._name_checked = True
 
         if not self.has_name and not self.allow_missing_name:
-            raise ApiError(
-                status_code=422,
-                message="Each enrolled document must include metadata.name. "
-                        "Set allow_missing_name=true to fall back to the document content hash.",
+            raise unprocessable(
+                "Each enrolled document must include metadata.name. "
+                "Set allow_missing_name=true to fall back to the document content hash.",
             )

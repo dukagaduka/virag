@@ -12,6 +12,7 @@ import pytest
 
 from virag.clients.qdrant_store import Hit, QdrantStore, TilePoint
 from virag.errors import ApiError
+from virag.settings import SettingsError
 
 from conftest import make_store
 
@@ -83,6 +84,18 @@ def test_upsert_writes_the_points_ids_and_payloads_in_chunks(monkeypatch):
     assert [(call["collection_name"], call["wait"]) for call in calls] == [("c__v2", True)] * 2
     assert [call["points"].ids for call in calls] == [[points[0].id, points[1].id], [points[2].id]]
     assert calls[1]["points"].payloads == [{"doc_id": "d", "tile_num": 2, "image_hash": "h2", "render_version": "rv"}]
+
+
+def test_the_retrievers_vectors_must_fit_the_collection():
+    store = _store()                                                    # QDRANT_VECTOR_SIZE = 4
+
+    store.check_vector_size(4)
+
+    with pytest.raises(SettingsError, match="retriever returns 8-d vectors but QDRANT_VECTOR_SIZE is 4"):
+        store.check_vector_size(8)
+
+    with pytest.raises(SettingsError):
+        store.check_vector_size(None)                                   # the retriever was never asked
 
 
 def test_query_hands_top_k_and_threshold_to_qdrant(monkeypatch):

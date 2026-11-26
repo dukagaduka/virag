@@ -350,7 +350,6 @@ class FakeTiler:
         self.get_tile_calls: list[tuple] = []
         self.doc_stream_calls: list[str] = []
         self.uploads: list[dict] = []                          # ingest forms relayed in full
-        self.existing: set[str] = set()
         self.metadata_patches: list[tuple] = []
         self.doc_metadata: dict[str, dict] = {}
         self.metadata_calls: list[str] = []
@@ -400,9 +399,6 @@ class FakeTiler:
 
     async def get_info(self) -> dict:
         return self._info
-
-    async def doc_exists(self, doc_id: str) -> bool:
-        return doc_id in self.existing
 
     async def get_metadata(self, doc_id: str) -> dict:
         self.metadata_calls.append(doc_id)

@@ -149,7 +149,7 @@ which has to cover the upstream's longest silence.
   enroll marker (`virag_enrolled_at`), which nothing else reads or writes.
   `render_version()` is the one a revision may build from (409 while the tiler is not
   serving); `get_tile()`, `get_info()` (for binding), `get_metadata()` (document
-  names), `doc_exists()`. `check_connection()` also proves `TILER_API_KEY` and that the
+  names). `check_connection()` also proves `TILER_API_KEY` and that the
   metadata schema declares the fields virag depends on (`check_schema()`).
 - **`QdrantStore`** — speaks **gRPC** to Qdrant: one multiplexed HTTP/2 channel (no pool
   of idle HTTP/1.1 connections to race the server's keep-alive), retries done by the
@@ -180,7 +180,7 @@ which has to cover the upstream's longest silence.
 - `ensure_collection()` on Qdrant; then `check_connection()` on retriever, tiler (which
   also proves `TILER_API_KEY` and the metadata schema, below), VLM and Valkey. **Every dependency is fatal** — the service is useless without any one of
   them, so a failed check aborts startup. The retriever's vector size must also equal
-  `QDRANT_VECTOR_SIZE`. Two processes starting on one empty Qdrant both try to create
+  `QDRANT_VECTOR_SIZE` (`QdrantStore.check_vector_size`). Two processes starting on one empty Qdrant both try to create
   `<name>__v1`; the one that loses adopts the other's.
 - **Binding** (`enforce_binding`) — see [SECURITY.md](SECURITY.md): the Qdrant
   collection must have been embedded from the tiler's volume (its `volume_id`), or
@@ -451,7 +451,7 @@ virag/
   reconcile.py       # Reconciler: Qdrant ⊆ Tiler self-repair (startup + periodic) — the invariant, abandoned enrolls
   revision.py        # RevisionManager: background revision / rollback job — the build, the alias move, journal sync
   rag.py             # Rag: the tiles a question is answered from — RagConfig (the `rag` field), retrieval, integrity check, rerank, injection, sources
-  errors.py          # ApiError + the uniform {"error": {...}} envelope
+  errors.py          # ApiError, its factories by status (conflict, unprocessable, not_ready, …) + the uniform {"error": {...}} envelope
   responses.py       # OrjsonResponse, the app-wide default response class
   utils.py           # non-domain helpers (gather, cancel, every, chunked, unavailable_as_503, MultipartFields)
   api/

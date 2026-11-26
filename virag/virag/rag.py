@@ -29,7 +29,7 @@ from virag.clients.qdrant_store import Hit, QdrantStore
 from virag.clients.reranker_client import RerankerClient
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerClient
-from virag.errors import ApiError
+from virag.errors import ApiError, not_ready, unprocessable
 from virag.settings import RagSettings, RerankerSettings, RetrieverSettings
 from virag.utils import gather
 
@@ -67,10 +67,7 @@ class RagConfig:
             raw = {}
 
         if not isinstance(raw, dict):
-            raise ApiError(
-                status_code=422,
-                message="`rag` must be an object or a boolean",
-            )
+            raise unprocessable("`rag` must be an object or a boolean")
 
         top_k = cls._positive_int(raw, "top_k", retriever.top_k)
         retriever_threshold = cls._number_or_null(raw, "retriever_threshold", retriever.threshold)
@@ -78,23 +75,14 @@ class RagConfig:
         reranker_threshold = cls._number_or_null(raw, "reranker_threshold", reranker.threshold)
 
         if reranker_threshold is not None and not 0 <= reranker_threshold <= 1:
-            raise ApiError(
-                status_code=422,
-                message="`rag.reranker_threshold` must be within [0, 1]",
-            )
+            raise unprocessable("`rag.reranker_threshold` must be within [0, 1]")
 
         if reranker.enabled and top_n > top_k:
-            raise ApiError(
-                status_code=422,
-                message=f"`rag.top_n` ({top_n}) must not exceed `rag.top_k` ({top_k})",
-            )
+            raise unprocessable(f"`rag.top_n` ({top_n}) must not exceed `rag.top_k` ({top_k})")
 
         framing_text = raw.get("framing_text", rag.framing_text)
         if not isinstance(framing_text, str):
-            raise ApiError(
-                status_code=422,
-                message="`rag.framing_text` must be a string",
-            )
+            raise unprocessable("`rag.framing_text` must be a string")
 
         return cls(
             top_k=top_k,
@@ -111,10 +99,7 @@ class RagConfig:
         value = raw.get(key, default)
 
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ApiError(
-                status_code=422,
-                message=f"`rag.{key}` must be a positive integer",
-            )
+            raise unprocessable(f"`rag.{key}` must be a positive integer")
 
         return value
 
@@ -124,10 +109,7 @@ class RagConfig:
         value = raw.get(key, default)
 
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
-            raise ApiError(
-                status_code=422,
-                message=f"`rag.{key}` must be a number or null",
-            )
+            raise unprocessable(f"`rag.{key}` must be a number or null")
 
         return value
 
@@ -194,10 +176,7 @@ class Rag:
         query = self.query_of(messages)
 
         if not query:
-            raise ApiError(
-                status_code=422,
-                message="RAG is enabled but no user text was found to build the query",
-            )
+            raise unprocessable("RAG is enabled but no user text was found to build the query")
 
         log.info(
             "rag query: top_k=%d retriever_threshold=%s preview=%r",
@@ -304,7 +283,7 @@ class Rag:
                 raise
 
             if self.tiler.unavailable(e):
-                raise ApiError(status_code=503, message=f"The tiler is not ready: {e.message}", details=e.details) from e
+                raise not_ready(f"The tiler is not ready: {e.message}", **(e.details or {})) from e
 
             log.warning("skipping tile (doc_id=%s tile_num=%s): %s", doc_id, tile_num, e.message)
 

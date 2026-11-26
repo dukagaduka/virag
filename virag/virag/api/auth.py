@@ -12,7 +12,7 @@ import hmac
 from fastapi import Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from virag.errors import ApiError
+from virag.errors import forbidden, unauthorized
 
 
 # auto_error=False: a missing header answers our own 401 envelope, not FastAPI's 403.
@@ -30,7 +30,7 @@ def require_api_key(
         return
 
     if not _matches(credentials, settings.api_key, settings.admin_api_key):
-        raise _unauthorized()
+        raise unauthorized("missing or invalid API key")
 
 
 def require_admin_key(
@@ -48,9 +48,9 @@ def require_admin_key(
 
     # The user key is valid, just not here.
     if _matches(credentials, settings.api_key):
-        raise ApiError(status_code=403, message="this route needs VIRAG_ADMIN_API_KEY")
+        raise forbidden("this route needs VIRAG_ADMIN_API_KEY")
 
-    raise _unauthorized()
+    raise unauthorized("missing or invalid API key")
 
 
 def _matches(credentials: HTTPAuthorizationCredentials | None, *keys: str) -> bool:
@@ -61,11 +61,3 @@ def _matches(credentials: HTTPAuthorizationCredentials | None, *keys: str) -> bo
     presented = credentials.credentials.encode()
 
     return any(hmac.compare_digest(presented, key.encode()) for key in keys if key)
-
-
-def _unauthorized() -> ApiError:
-    return ApiError(
-        status_code=401,
-        message="missing or invalid API key",
-        headers={"WWW-Authenticate": "Bearer"},
-    )

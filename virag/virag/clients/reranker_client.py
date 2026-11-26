@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from virag.clients.http_service import OpenAIService
-from virag.errors import ApiError
+from virag.errors import ApiError, unprocessable
 from virag.settings import HttpSettings, RerankerSettings
 from virag.utils import gather
 
@@ -95,9 +95,8 @@ class RerankerClient(OpenAIService):
         scores = self._json(response, action="reranking", parse=parse)
 
         if len(scores) != len(base64_images):
-            raise ApiError(
-                status_code=422,
-                message=f"Upstream {self.route} returned {len(scores)} scores for {len(base64_images)} images",
+            raise unprocessable(
+                f"Upstream {self.route} returned {len(scores)} scores for {len(base64_images)} images",
             )
 
         return scores

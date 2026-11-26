@@ -18,7 +18,7 @@ from typing import Any, Callable
 import httpx2
 import orjson
 
-from virag.errors import ApiError
+from virag.errors import ApiError, not_found, not_ready, unprocessable
 from virag.settings import HttpSettings, UpstreamSettings
 
 
@@ -260,10 +260,9 @@ class HttpService(ABC):
             return parse(data) if parse is not None else data
 
         except (KeyError, IndexError, TypeError, ValueError) as e:
-            raise ApiError(
-                status_code=422,
-                message=f"Cannot decode {response.url} response or unexpected response structure during {action}",
-                details={"base_message": str(e)},
+            raise unprocessable(
+                f"Cannot decode {response.url} response or unexpected response structure during {action}",
+                base_message=str(e),
             ) from e
 
 
@@ -307,11 +306,7 @@ class HttpService(ABC):
     @classmethod
     def _status_error(cls, url: str, action: str, response: httpx2.Response) -> ApiError:
         """ApiError(503) for an upstream that answered with an error status."""
-        return ApiError(
-            status_code=503,
-            message=f"Upstream {url} failed during {action}",
-            details=cls._upstream_details(response),
-        )
+        return not_ready(f"Upstream {url} failed during {action}", **cls._upstream_details(response))
 
 
     @classmethod
@@ -371,7 +366,6 @@ class OpenAIService(HttpService):
         )
 
         self.model_name = model_name
-        self.api_key    = api_key
 
 
     @property
@@ -390,11 +384,7 @@ class OpenAIService(HttpService):
         models = self._json(response, action="the check", parse=self._model_ids)
 
         if self.model_name not in models:
-            raise ApiError(
-                status_code=404,
-                message=f"Model {self.model_name} is not established at {self.base_url}",
-                details={"models": models},
-            )
+            raise not_found(f"Model {self.model_name} is not established at {self.base_url}", models=models)
 
 
     @staticmethod
