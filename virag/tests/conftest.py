@@ -29,6 +29,7 @@ from virag.coordination import Coordinator
 from virag.enroll import Enroller
 from virag.errors import ApiError, install_error_handlers
 from virag.main import include_routers
+from virag.rag import Rag
 from virag.settings import (
     RetrieverSettings,
     EnrollSettings,
@@ -521,7 +522,11 @@ def build_app(*, settings=None, store=None, coordinator=None, retriever=None, re
     install_error_handlers(app)
     include_routers(app)
 
-    app.state.settings = settings if settings is not None else make_settings()
+    settings = app.state.settings = settings if settings is not None else make_settings()
+    app.state.rag = Rag(
+        store, tiler, retriever, reranker,
+        settings.rag_settings, settings.retriever_settings, settings.reranker_settings,
+    )
     if store is not None:
         app.state.store = store
         app.state.coordinator = coordinator if coordinator is not None else make_coordinator(store)

@@ -38,7 +38,7 @@ passthrough — functionally identical to calling the VLM directly. The trigger 
 the request **body** (not a header or query param) so it rides through any
 OpenAI-compatible SDK via `extra_body`, which flattens to top-level JSON.
 
-`rag` is normalized (`_rag_config`) into a config or `None`:
+`rag` is normalized (`RagConfig.from_request`, `rag.py`) into a config or `None`:
 
 - absent / `false` → RAG off.
 - `true` → RAG on with server defaults (`RETRIEVER_TOP_K`, `RETRIEVER_THRESHOLD`,
@@ -49,7 +49,7 @@ OpenAI-compatible SDK via `extra_body`, which flattens to top-level JSON.
 
 ## 3. The retrieval pipeline
 
-When RAG is on, `_run_rag` runs before the upstream call:
+When RAG is on, `Rag.augment` (`rag.py`) runs before the upstream call:
 
 1. **Build the query.** Take the text of the *last user message* — concatenating the
    text parts of multimodal content. No user text → `422` (RAG was asked for but there
@@ -450,11 +450,12 @@ virag/
   enroll.py          # Enroller: the one writer of points — a tile stream of the tiler (an ingest, or a stored doc) → a document's points; the flat re-embed of a revision's build
   reconcile.py       # Reconciler: Qdrant ⊆ Tiler self-repair (startup + periodic) — the invariant, abandoned enrolls
   revision.py        # RevisionManager: background revision / rollback job — the build, the alias move, journal sync
+  rag.py             # Rag: the tiles a question is answered from — RagConfig (the `rag` field), retrieval, integrity check, rerank, injection, sources
   errors.py          # ApiError + the uniform {"error": {...}} envelope
   responses.py       # OrjsonResponse, the app-wide default response class
   utils.py           # non-domain helpers (error_body, gather, cancel, every, chunked, unavailable_as_503, MultipartFields)
   api/
-    chat_completions.py  # /v1/chat/completions: rag trigger, retrieval, injection, sources
+    chat_completions.py  # /v1/chat/completions: the request through the Rag, then the VLM's answer relayed (sources spliced in)
     enroll.py            # /enroll: the upload relayed to the tiler, name policy, the tiler's ingest stream → Enroller
     revision.py          # /revision (start, status) and /revision/rollback
     models.py            # /v1/models: the VLM's entry for VLM_MODEL_NAME

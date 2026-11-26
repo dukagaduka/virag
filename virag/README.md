@@ -84,6 +84,7 @@ virag/
   revision.py        /revision re-embed and /revision/rollback jobs
   coordination.py    Coordinator: process leases, documents being enrolled + journal, revision lock/status, reconcile lead
   enroll.py          Enroller: a tile stream of the tiler → a document's points; the flat re-embed of a revision's build
+  rag.py             Rag: the tiles a question is answered from — the `rag` field, retrieval, integrity check, rerank, injection
   errors.py          ApiError + the uniform {"error": {...}} envelope
   api/               chat_completions, models, enroll, revision, ops, auth
   clients/           retriever_client, reranker_client, qdrant_store, valkey_store, tiler_client, vlm_client

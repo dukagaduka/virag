@@ -1,7 +1,9 @@
+"""POST /v1/chat/completions: the request goes to the VLM as it came, except for its
+`rag` field — with it, the Rag puts the tiles the question is answered from into the last
+user message, and the answer may carry their `sources`."""
+
 from __future__ import annotations
 
-import base64
-import hashlib
 import logging
 from contextlib import AsyncExitStack
 
@@ -12,7 +14,6 @@ from fastapi.responses import Response, StreamingResponse
 
 from virag.errors import ApiError
 from virag.responses import OrjsonResponse
-from virag.utils import gather
 
 
 log = logging.getLogger(__name__)
@@ -28,18 +29,13 @@ router = APIRouter()
 async def chat_completions(request: Request):
 
     body = await _read_body(request)
-    settings = request.app.state.settings
+    rag = request.app.state.rag
 
-    rag_config = _rag_config(
-        body.pop("rag", None),
-        settings.rag_settings,
-        settings.retriever_settings,
-        settings.reranker_settings,
-    )
+    rag_config = rag.config(body.pop("rag", None))
 
     sources = None
     if rag_config is not None:
-        sources = await _run_rag(request, body, rag_config)
+        sources = await rag.augment(body.get("messages", []), rag_config)
 
     vlm = request.app.state.vlm
 
@@ -47,229 +43,6 @@ async def chat_completions(request: Request):
         return await _stream_response(vlm, body, sources)
 
     return await _complete_response(vlm, body, sources)
-
-
-# ---------------------------------------------------------------------------
-# RAG pipeline
-# ---------------------------------------------------------------------------
-
-async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | None:
-    """Retrieve tiles for the query, rerank them when a reranker is set, inject them
-    into the last user message, and return the sources list when the caller asked for
-    it (else None)."""
-    retriever = request.app.state.retriever
-    reranker = request.app.state.reranker
-    store = request.app.state.store
-    tiler = request.app.state.tiler
-
-    messages = body.get("messages", [])
-    query = _extract_query(messages)
-
-    if not query:
-        raise ApiError(
-            status_code=422,
-            message="RAG is enabled but no user text was found to build the query",
-        )
-
-    log.info(
-        "rag query: top_k=%d retriever_threshold=%s preview=%r",
-        config["top_k"], config["retriever_threshold"], query[:120],
-    )
-
-    vector = (await retriever.embed_texts([query]))[0]
-    hits = await store.query(vector, top_k=config["top_k"], score_threshold=config["retriever_threshold"])
-
-    log.info("rag retrieved: %d hits", len(hits))
-
-    tiles = await _fetch_tiles(tiler, hits)
-
-    if reranker is not None:
-        tiles = await _rerank(reranker, query, tiles, config)
-    else:
-        tiles = [(hit, b64, None) for hit, b64 in tiles]
-
-    if tiles:
-        _inject_tiles(messages, [b64 for _, b64, _ in tiles], config["framing_text"])
-        log.info("rag injected: %d tiles", len(tiles))
-    else:
-        log.info("rag injected: 0 tiles")
-
-    if config["include_sources"]:
-        names = await _doc_names(tiler, {hit.point.doc_id for hit, _, _ in tiles})
-
-        return [_source(hit, names[hit.point.doc_id], rerank_score) for hit, _, rerank_score in tiles]
-
-    return None
-
-
-async def _rerank(reranker, query: str, tiles: list[tuple], config: dict) -> list[tuple]:
-    """Score the candidate tiles against the query; keep those at or above the
-    threshold, best first, at most `top_n`. A failing reranker never fails the request:
-    the retriever's order, cut to `top_n`, is used instead."""
-    if not tiles:
-        return []
-
-    try:
-        scores = await reranker.score(query, [b64 for _, b64 in tiles])
-
-    except ApiError as e:
-        # A refusal is a contract mismatch to fix; an outage is just waited out.
-        level = logging.ERROR if reranker.rejected(e) else logging.WARNING
-        log.log(level, "rag rerank failed, using the retriever's order: %s | details=%s", e.message, e.details)
-
-        return [(hit, b64, None) for hit, b64 in tiles[:config["top_n"]]]
-
-    threshold = config["reranker_threshold"]
-    ranked = sorted(
-        ((hit, b64, score) for (hit, b64), score in zip(tiles, scores) if threshold is None or score >= threshold),
-        key=lambda tile: tile[2],
-        reverse=True,
-    )
-
-    log.info(
-        "rag reranked: %d of %d kept (top_n=%d reranker_threshold=%s)",
-        min(len(ranked), config["top_n"]), len(tiles), config["top_n"], threshold,
-    )
-
-    return ranked[:config["top_n"]]
-
-
-async def _fetch_tiles(tiler, hits) -> list[tuple]:
-    """Fetch each hit's tile as base64 JPEG, skipping any the tiler refuses.
-
-    Two failures are the whole request's, never quietly answered without tiles: a tile
-    the tiler now renders by another render_version than the one it was embedded from
-    (409 RENDER_VERSION_MISMATCH — the collection is stale and must be rebuilt), and a
-    tiler that is unreachable or not serving (503 NOT_READY).
-    """
-    async def fetch(hit):
-        doc_id, tile_num = hit.point.doc_id, hit.point.tile_num
-        render_version = hit.point.render_version or None
-
-        try:
-            data = await tiler.get_tile(doc_id, tile_num, render_version=render_version)
-
-        except ApiError as e:
-            if e.code == tiler.RENDER_VERSION_MISMATCH:
-                raise
-
-            if tiler.unavailable(e):
-                raise ApiError(status_code=503, message=f"The tiler is not ready: {e.message}", details=e.details) from e
-
-            log.warning("skipping tile (doc_id=%s tile_num=%s): %s", doc_id, tile_num, e.message)
-
-            return None
-
-        # Integrity: the fetched tile must be the exact bytes enrolled in Qdrant; a
-        # point without a hash cannot be checked, so it is not trusted either.
-        expected_hash = hit.point.image_hash
-        if expected_hash is None:
-            log.warning("integrity: tile (doc_id=%s tile_num=%s) has no image_hash in qdrant; skipping", doc_id, tile_num)
-
-            return None
-
-        if hashlib.sha256(data).hexdigest() != expected_hash:
-            log.warning(
-                "integrity: tile (doc_id=%s tile_num=%s) hash mismatch (qdrant=%s); skipping",
-                doc_id, tile_num, expected_hash,
-            )
-
-            return None
-
-        return hit, base64.b64encode(data).decode()
-
-    # The first such failure cancels the other fetches.
-    results = await gather(fetch(hit) for hit in hits)
-
-    return [result for result in results if result is not None]
-
-
-def _extract_query(messages: list) -> str:
-    """Text of the last user message (concatenated text parts of multimodal content)."""
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-
-        content = message.get("content")
-
-        if isinstance(content, str):
-            return content.strip()
-
-        if isinstance(content, list):
-            texts = [
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
-
-            return " ".join(text for text in texts if text).strip()
-
-        return ""
-
-    return ""
-
-
-def _inject_tiles(messages: list, images_b64: list[str], framing_text: str) -> None:
-    """Prepend framing text + retrieved tile images to the last user message."""
-    index = _last_user_index(messages)
-
-    image_parts = [
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        for b64 in images_b64
-    ]
-
-    original = messages[index].get("content")
-    new_content = [{"type": "text", "text": framing_text}, *image_parts]
-
-    if isinstance(original, str):
-        new_content.append({"type": "text", "text": original})
-    elif isinstance(original, list):
-        new_content.extend(original)
-
-    messages[index] = {**messages[index], "content": new_content}
-
-
-def _last_user_index(messages: list) -> int:
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "user":
-            return index
-
-    return len(messages) - 1
-
-
-async def _doc_names(tiler, doc_ids: set[str]) -> dict[str, str]:
-    """Each document's `metadata.name` as the tiler holds it now (points carry no
-    metadata); a document without one, or one the tiler would not answer for, goes by
-    its doc_id."""
-    async def name(doc_id: str) -> str:
-        try:
-            metadata = await tiler.get_metadata(doc_id)
-
-        except ApiError as e:
-            log.warning("no name for doc_id=%s: %s", doc_id, e.message)
-
-            return doc_id
-
-        return metadata.get("name") or doc_id
-
-    ordered = sorted(doc_ids)
-
-    return dict(zip(ordered, await gather(name(doc_id) for doc_id in ordered)))
-
-
-def _source(hit, name: str, rerank_score: float | None = None) -> dict:
-    source = {
-        "name": name,
-        "doc_id": hit.point.doc_id,
-        "tile_num": hit.point.tile_num,
-        "score": hit.score,
-    }
-
-    # Present only for a tile the reranker scored.
-    if rerank_score is not None:
-        source["rerank_score"] = rerank_score
-
-    return source
 
 
 # ---------------------------------------------------------------------------
@@ -384,77 +157,3 @@ async def _read_body(request: Request) -> dict:
         )
 
     return body
-
-
-def _rag_config(raw, rag, retriever, reranker) -> dict | None:
-    """Normalize the `rag` trigger into a config dict, or None when RAG is off; what the
-    request leaves out comes from the `rag`, `retriever` and `reranker` settings. The
-    reranker's fields are validated always, but bound to `top_k` only while it is on."""
-    if raw is None or raw is False:
-        return None
-
-    if raw is True:
-        raw = {}
-
-    if not isinstance(raw, dict):
-        raise ApiError(
-            status_code=422,
-            message="`rag` must be an object or a boolean",
-        )
-
-    top_k = _positive_int(raw, "top_k", retriever.top_k)
-    retriever_threshold = _number_or_null(raw, "retriever_threshold", retriever.threshold)
-    top_n = _positive_int(raw, "top_n", reranker.top_n)
-    reranker_threshold = _number_or_null(raw, "reranker_threshold", reranker.threshold)
-
-    if reranker_threshold is not None and not 0 <= reranker_threshold <= 1:
-        raise ApiError(
-            status_code=422,
-            message="`rag.reranker_threshold` must be within [0, 1]",
-        )
-
-    if reranker.enabled and top_n > top_k:
-        raise ApiError(
-            status_code=422,
-            message=f"`rag.top_n` ({top_n}) must not exceed `rag.top_k` ({top_k})",
-        )
-
-    framing_text = raw.get("framing_text", rag.framing_text)
-    if not isinstance(framing_text, str):
-        raise ApiError(
-            status_code=422,
-            message="`rag.framing_text` must be a string",
-        )
-
-    return {
-        "top_k": top_k,
-        "retriever_threshold": retriever_threshold,
-        "top_n": top_n,
-        "reranker_threshold": reranker_threshold,
-        "framing_text": framing_text,
-        "include_sources": bool(raw.get("include_sources", False)),
-    }
-
-
-def _positive_int(raw: dict, key: str, default: int) -> int:
-    value = raw.get(key, default)
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise ApiError(
-            status_code=422,
-            message=f"`rag.{key}` must be a positive integer",
-        )
-
-    return value
-
-
-def _number_or_null(raw: dict, key: str, default: float | None) -> float | None:
-    value = raw.get(key, default)
-
-    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
-        raise ApiError(
-            status_code=422,
-            message=f"`rag.{key}` must be a number or null",
-        )
-
-    return value

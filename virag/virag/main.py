@@ -18,6 +18,7 @@ from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding
 from virag.coordination import Coordinator
 from virag.enroll import Enroller
+from virag.rag import Rag
 from virag.reconcile import Reconciler
 from virag.revision import RevisionManager
 from virag.utils import cancel, every
@@ -158,6 +159,16 @@ async def lifespan(app: FastAPI):
         reconciler = Reconciler(store, coordinator, tiler, enroller, settings.reconcile_settings)
 
         revision = RevisionManager(store, coordinator, tiler, enroller, reconciler, settings.revision_settings)
+
+        rag = Rag(
+            store,
+            tiler,
+            retriever,
+            reranker,
+            settings.rag_settings,
+            settings.retriever_settings,
+            settings.reranker_settings,
+        )
         stack.push_async_callback(revision.close)
 
         async def upkeep() -> None:
@@ -184,6 +195,7 @@ async def lifespan(app: FastAPI):
         app.state.store = store
         app.state.coordinator = coordinator
         app.state.enroller = enroller
+        app.state.rag = rag
         app.state.retriever = retriever
         app.state.reranker = reranker
         app.state.tiler = tiler

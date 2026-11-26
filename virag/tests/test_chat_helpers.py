@@ -1,8 +1,8 @@
-"""chat_completions message helpers: query extraction, tile injection, sources."""
+"""Rag and the request's messages: query extraction, tile injection, sources."""
 
 from __future__ import annotations
 
-from virag.api.chat_completions import _extract_query, _inject_tiles, _last_user_index, _source
+from virag.rag import Rag, RetrievedTile
 
 from conftest import hit_for
 
@@ -12,7 +12,7 @@ def test_extract_query_string_content():
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "  hello  "},
     ]
-    assert _extract_query(messages) == "hello"
+    assert Rag.query_of(messages) == "hello"
 
 
 def test_extract_query_last_user_wins():
@@ -21,7 +21,7 @@ def test_extract_query_last_user_wins():
         {"role": "assistant", "content": "reply"},
         {"role": "user", "content": "second"},
     ]
-    assert _extract_query(messages) == "second"
+    assert Rag.query_of(messages) == "second"
 
 
 def test_extract_query_multimodal_concats_text_parts():
@@ -33,21 +33,21 @@ def test_extract_query_multimodal_concats_text_parts():
             {"type": "text", "text": "this"},
         ],
     }]
-    assert _extract_query(messages) == "what is this"
+    assert Rag.query_of(messages) == "what is this"
 
 
 def test_extract_query_no_user():
-    assert _extract_query([{"role": "system", "content": "x"}]) == ""
+    assert Rag.query_of([{"role": "system", "content": "x"}]) == ""
 
 
 def test_last_user_index():
     messages = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
-    assert _last_user_index(messages) == 0
+    assert Rag._last_user_index(messages) == 0
 
 
 def test_inject_tiles_into_string_message():
     messages = [{"role": "user", "content": "original question"}]
-    _inject_tiles(messages, ["AAA", "BBB"], "FRAME")
+    Rag.inject(messages, ["AAA", "BBB"], "FRAME")
 
     content = messages[0]["content"]
     assert content[0] == {"type": "text", "text": "FRAME"}
@@ -64,7 +64,7 @@ def test_inject_tiles_preserves_multimodal_original():
         {"type": "image_url", "image_url": {"url": "data:user-img"}},
     ]
     messages = [{"role": "user", "content": list(original)}]
-    _inject_tiles(messages, ["TILE"], "FRAME")
+    Rag.inject(messages, ["TILE"], "FRAME")
 
     content = messages[0]["content"]
     assert content[0] == {"type": "text", "text": "FRAME"}
@@ -75,11 +75,11 @@ def test_inject_tiles_preserves_multimodal_original():
 
 def test_source_shape():
     hit = hit_for("d1", 3, 0.77)
-    assert _source(hit, "Report") == {"name": "Report", "doc_id": "d1", "tile_num": 3, "score": 0.77}
+    assert RetrievedTile(hit, "b64").source("Report") == {"name": "Report", "doc_id": "d1", "tile_num": 3, "score": 0.77}
 
 
 def test_source_carries_the_rerank_score_when_there_is_one():
     hit = hit_for("d2", 0, 0.5)
-    src = _source(hit, "d2", 0.8)
+    src = RetrievedTile(hit, "b64", 0.8).source("d2")
     assert src["rerank_score"] == 0.8
     assert src["doc_id"] == "d2"
