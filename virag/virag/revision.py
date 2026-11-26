@@ -51,11 +51,11 @@ import hashlib
 import logging
 import time
 
-from virag.clients.qdrant_store import QdrantStore
+from virag.clients.qdrant_store import QdrantStore, TilePoint
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import TilerClient, TilerDoc
 from virag.coordination import Coordinator, EnrollInProgress
-from virag.enroll import Enroller, point_id
+from virag.enroll import Enroller
 from virag.errors import ApiError
 from virag.reconcile import enforce_subset
 from virag.settings import EnrollSettings, RevisionSettings
@@ -537,8 +537,8 @@ class RevisionManager:
         tiles concurrently (bulk, capped by the tiler's `max_concurrency`), embeds them in
         one bulk retriever call and upserts once. A window of batches stays in flight, so
         one batch fetches while another embeds; it is derived from the tiler cap — more
-        would only queue at the guard. Point ids match enroll's (`point_id`), so this
-        writes exactly what a fresh enroll would.
+        would only queue at the guard. The points are the ones an enroll writes (`TilePoint`),
+        ids included.
 
         A failed batch fails every doc it touched (their later tiles are skipped).
         `per_doc` keeps batches within one document (the retry pass).
@@ -556,18 +556,12 @@ class RevisionManager:
                 b64s = [base64.b64encode(j).decode("ascii") for j in jpegs]
                 vectors = await self.retriever.embed_images(b64s, bulk=True)
 
-                payloads = [
-                    {
-                        "doc_id": doc_id,
-                        "tile_num": n,
-                        "image_hash": hashlib.sha256(j).hexdigest(),
-                        "render_version": by_id[doc_id].render_version,
-                    }
+                points = [
+                    TilePoint(doc_id, n, hashlib.sha256(j).hexdigest(), by_id[doc_id].render_version)
                     for (doc_id, n), j in zip(batch, jpegs)
                 ]
-                ids = [point_id(doc_id, n) for doc_id, n in batch]
 
-                await self.store.upsert(vectors, payloads, ids=ids, collection=collection)
+                await self.store.upsert(vectors, points, collection=collection)
 
             except Exception as e:  # noqa: BLE001 - a failed batch fails its docs, not the stream
                 touched = {doc_id for doc_id, _ in batch}

@@ -32,12 +32,11 @@ through it (`drop`).
 from __future__ import annotations
 
 import logging
-import uuid
 from collections.abc import Callable
 from contextlib import aclosing
 from typing import AsyncIterator
 
-from virag.clients.qdrant_store import QdrantStore
+from virag.clients.qdrant_store import QdrantStore, TilePoint
 from virag.clients.retriever_client import RetrieverClient
 from virag.clients.tiler_client import Begin, Committed, Event, Tile, TilerClient
 from virag.coordination import Coordinator
@@ -46,13 +45,6 @@ from virag.settings import EnrollSettings
 
 
 log = logging.getLogger("virag.enroll")
-
-_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "virag.pixelrag")
-
-
-def point_id(doc_id: str, tile_num: int) -> str:
-    """Deterministic point id so re-enrolling a document overwrites its own tiles."""
-    return str(uuid.uuid5(_ID_NAMESPACE, f"{doc_id}:{tile_num}"))
 
 
 class Enroller:
@@ -195,19 +187,9 @@ class Enroller:
             return 0
 
         vectors = await self.retriever.embed_images([tile.data for tile in batch], bulk=True)
+        points = [TilePoint(begin.doc_id, tile.tile_num, tile.image_hash, begin.render_version) for tile in batch]
 
-        payloads = [
-            {
-                "doc_id": begin.doc_id,
-                "tile_num": tile.tile_num,
-                "image_hash": tile.image_hash,
-                "render_version": begin.render_version,
-            }
-            for tile in batch
-        ]
-        ids = [point_id(begin.doc_id, tile.tile_num) for tile in batch]
-
-        await self.store.upsert(vectors, payloads, ids=ids, collection=collection)
+        await self.store.upsert(vectors, points, collection=collection)
 
         return len(batch)
 

@@ -95,9 +95,9 @@ async def _run_rag(request: Request, body: dict, config: dict) -> list[dict] | N
         log.info("rag injected: 0 tiles")
 
     if config["include_sources"]:
-        names = await _doc_names(tiler, {hit.payload.get("doc_id") for hit, _, _ in tiles})
+        names = await _doc_names(tiler, {hit.point.doc_id for hit, _, _ in tiles})
 
-        return [_source(hit, names[hit.payload.get("doc_id")], rerank_score) for hit, _, rerank_score in tiles]
+        return [_source(hit, names[hit.point.doc_id], rerank_score) for hit, _, rerank_score in tiles]
 
     return None
 
@@ -143,9 +143,8 @@ async def _fetch_tiles(tiler, hits) -> list[tuple]:
     tiler that is unreachable or not serving (503 NOT_READY).
     """
     async def fetch(hit):
-        doc_id = hit.payload.get("doc_id")
-        tile_num = hit.payload.get("tile_num")
-        render_version = hit.payload.get("render_version") or None
+        doc_id, tile_num = hit.point.doc_id, hit.point.tile_num
+        render_version = hit.point.render_version or None
 
         try:
             data = await tiler.get_tile(doc_id, tile_num, render_version=render_version)
@@ -163,7 +162,7 @@ async def _fetch_tiles(tiler, hits) -> list[tuple]:
 
         # Integrity: the fetched tile must be the exact bytes enrolled in Qdrant; a
         # point without a hash cannot be checked, so it is not trusted either.
-        expected_hash = hit.payload.get("image_hash")
+        expected_hash = hit.point.image_hash
         if expected_hash is None:
             log.warning("integrity: tile (doc_id=%s tile_num=%s) has no image_hash in qdrant; skipping", doc_id, tile_num)
 
@@ -259,12 +258,10 @@ async def _doc_names(tiler, doc_ids: set[str]) -> dict[str, str]:
 
 
 def _source(hit, name: str, rerank_score: float | None = None) -> dict:
-    payload = hit.payload or {}
-
     source = {
         "name": name,
-        "doc_id": payload.get("doc_id"),
-        "tile_num": payload.get("tile_num"),
+        "doc_id": hit.point.doc_id,
+        "tile_num": hit.point.tile_num,
         "score": hit.score,
     }
 

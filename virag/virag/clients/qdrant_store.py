@@ -5,8 +5,8 @@ import re
 import time
 import uuid
 import warnings
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import asdict, dataclass
+from typing import ClassVar, Sequence
 
 import grpc
 import numpy as np
@@ -36,11 +36,48 @@ from virag.utils import unavailable_as_503
 log = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
-class QueryResult:
-    id: str
+@dataclass(frozen=True, slots=True)
+class TilePoint:
+    """A point: one tile of a document. Its payload names the tile and what it was
+    embedded from — `image_hash`, the sha256 of the tile's JPEG, and the tiler's
+    `render_version`; the document's metadata stays in the tiler."""
+
+    ID_NAMESPACE: ClassVar[uuid.UUID] = uuid.uuid5(uuid.NAMESPACE_DNS, "virag.pixelrag")
+
+    doc_id: str
+    tile_num: int
+    image_hash: str | None
+    render_version: str
+
+
+    @property
+    def id(self) -> str:
+        """Deterministic, so writing a document again overwrites its own tiles."""
+        return str(uuid.uuid5(self.ID_NAMESPACE, f"{self.doc_id}:{self.tile_num}"))
+
+
+    def payload(self) -> dict:
+        return asdict(self)
+
+
+    @classmethod
+    def from_payload(cls, payload: dict | None) -> TilePoint:
+        payload = payload or {}
+
+        return cls(
+            doc_id=payload.get("doc_id"),               # type: ignore[arg-type]
+            tile_num=payload.get("tile_num"),           # type: ignore[arg-type]
+            image_hash=payload.get("image_hash"),
+            render_version=payload.get("render_version") or "",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Hit:
+    """A point a query found, and how close it is to the query."""
+
+    point: TilePoint
     score: float
-    payload: dict
 
 
 class QdrantStore:
@@ -157,111 +194,14 @@ class QdrantStore:
         )
 
 
-    @_unavailable_as_503
-    async def upsert(
-        self,
-        vectors: Sequence[Sequence[float]],
-        payloads: Sequence[dict],
-        *,
-        ids: Sequence[str] | None = None,
-        wait: bool = True,
-        collection: str | None = None,
-    ):
-
-        assert len(vectors) == len(payloads), "Sizes of `vectors` and `payloads` must be equal"
-        assert ids is None or len(ids) == len(vectors), "Sizes of `ids` and `vectors` must be equal"
-
-        target = collection or self.serving_name
-
-        do_size_check = True
-        if isinstance(vectors, np.ndarray) and vectors.ndim == 2:
-            if vectors.shape[1] == self.vector_size:
-                do_size_check = False
-            else:
-                raise ValueError(f"Every vector's size must equal {self.vector_size}")
-
-        chunk_size = self._chunk_size(payloads)
-
-        for i in range(0, len(vectors), chunk_size):
-            v_batch = vectors[i:i+chunk_size]
-            p_batch = payloads[i:i+chunk_size]
-
-            id_batch = (
-                [str(uuid.uuid4()) for _ in range(len(v_batch))]
-                if ids is None
-                else list(ids[i:i+chunk_size])
-            )
-
-            if do_size_check:
-                for v in v_batch:  # validate per-batch, not all up front
-                    if len(v) != self.vector_size:
-                        raise ValueError(f"Every vector's size must equal {self.vector_size}")
-
-            await self.qdrant.upsert(
-                collection_name=target,
-                wait=wait,
-                points=Batch(
-                    ids=id_batch,
-                    vectors=v_batch,       # type: ignore
-                    payloads=list(p_batch),  # type: ignore
-                ),
-            )
-
-
-    def _chunk_size(self, payloads: Sequence[dict]) -> int:
-        # Estimate the serialized cost of one point and derive how many fit
-        # into the byte budget, capped by `max_batch_chunks`. Payloads are
-        # homogeneous, so a single sample is enough to size the batch.
-        payload_bytes = len(orjson.dumps(payloads[0], default=str)) if payloads else 0
-
-        est_point_bytes = self.vector_size * self.BYTES_PER_FLOAT + payload_bytes
-
-        by_bytes = max(1, self.chunk_byte_budget // est_point_bytes)
-
-        return min(self.max_batch_chunks, by_bytes)
-
-
-    @_unavailable_as_503
-    async def query(
-        self,
-        vector: Sequence[float],
-        *,
-        top_k: int = 5,
-        score_threshold: float | None = None
-    ) -> list[QueryResult]:
-        """The `top_k` points nearest to `vector`. Qdrant applies `score_threshold` by the
-        collection's distance: for cosine and dot it is a floor, for euclid and manhattan a
-        ceiling."""
-
-        assert len(vector) == self.vector_size, (
-            f"Vector size mismatch: got {len(vector)} but expected {self.vector_size}"
-        )
-
-        result = await self.qdrant.query_points(
-            collection_name=self.serving_name,
-            query=vector, # type: ignore
-            limit=top_k,
-            score_threshold=score_threshold,
-            with_payload=True,
-            with_vectors=False
-        )
-
-        query_results = []
-
-        for point in result.points:
-            query_results.append(
-                QueryResult(id=point.id, score=point.score, payload=point.payload) # type: ignore
-            )
-
-        return query_results
-
-
     # ------------------------------------------------------------------ #
-    # collection lifecycle (alias-aware)
+    # lifecycle
     # ------------------------------------------------------------------ #
     @_unavailable_as_503
-    async def create_collection(self):
-        """The first call at startup: also where a wrong QDRANT_API_KEY shows."""
+    async def ensure_collection(self) -> None:
+        """The first call at startup: the serving collection exists (created, with its
+        alias, on an empty Qdrant), holds vectors of the configured size and distance,
+        and is indexed. Also where a wrong QDRANT_API_KEY shows."""
         try:
             physical = await self._resolve_or_create()
 
@@ -279,14 +219,152 @@ class QdrantStore:
         await self._ensure_indexes(physical)
 
 
-    async def _alias_target(self) -> str | None:
-        """The physical collection the serving alias points to, or None without the alias."""
-        aliases = await self.qdrant.get_aliases()
-        alias_map = {a.alias_name: a.collection_name for a in aliases.aliases}
-
-        return alias_map.get(self.serving_name)
+    async def close(self) -> None:
+        await self.qdrant.close()
 
 
+    # ------------------------------------------------------------------ #
+    # points
+    # ------------------------------------------------------------------ #
+    @_unavailable_as_503
+    async def upsert(
+        self,
+        vectors: Sequence[Sequence[float]],
+        points: Sequence[TilePoint],
+        *,
+        collection: str | None = None,
+    ) -> None:
+        """Write `points` with their `vectors` into the serving collection, or into
+        `collection` (a revision build). A point written again replaces itself."""
+
+        assert len(vectors) == len(points), "Sizes of `vectors` and `points` must be equal"
+
+        target = collection or self.serving_name
+
+        do_size_check = True
+        if isinstance(vectors, np.ndarray) and vectors.ndim == 2:
+            if vectors.shape[1] == self.vector_size:
+                do_size_check = False
+            else:
+                raise ValueError(f"Every vector's size must equal {self.vector_size}")
+
+        chunk_size = self._chunk_size(points)
+
+        for i in range(0, len(vectors), chunk_size):
+            v_batch = vectors[i:i+chunk_size]
+            p_batch = points[i:i+chunk_size]
+
+            if do_size_check:
+                for v in v_batch:  # validate per-batch, not all up front
+                    if len(v) != self.vector_size:
+                        raise ValueError(f"Every vector's size must equal {self.vector_size}")
+
+            await self.qdrant.upsert(
+                collection_name=target,
+                wait=True,
+                points=Batch(
+                    ids=[point.id for point in p_batch],
+                    vectors=v_batch,       # type: ignore
+                    payloads=[point.payload() for point in p_batch],
+                ),
+            )
+
+
+    @_unavailable_as_503
+    async def query(
+        self,
+        vector: Sequence[float],
+        *,
+        top_k: int = 5,
+        score_threshold: float | None = None
+    ) -> list[Hit]:
+        """The `top_k` points nearest to `vector`. Qdrant applies `score_threshold` by the
+        collection's distance: for cosine and dot it is a floor, for euclid and manhattan a
+        ceiling."""
+
+        assert len(vector) == self.vector_size, (
+            f"Vector size mismatch: got {len(vector)} but expected {self.vector_size}"
+        )
+
+        result = await self.qdrant.query_points(
+            collection_name=self.serving_name,
+            query=vector, # type: ignore
+            limit=top_k,
+            score_threshold=score_threshold,
+            with_payload=True,
+            with_vectors=False
+        )
+
+        return [Hit(TilePoint.from_payload(point.payload), point.score) for point in result.points]
+
+
+    @_unavailable_as_503
+    async def delete_by_doc(
+        self,
+        doc_id: str,
+        *,
+        collection: str | None = None,
+    ) -> None:
+        """Delete every point belonging to one document — the enroll rollback + reconcile primitive."""
+        await self.qdrant.delete(
+            collection_name=collection or self.serving_name,
+            wait=True,
+            points_selector=Filter(
+                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+            ),
+        )
+
+
+    @_unavailable_as_503
+    async def delete_by_docs(
+        self,
+        doc_ids: Sequence[str],
+        *,
+        collection: str | None = None,
+    ) -> None:
+        """Delete every point of many documents, `DELETE_DOCS_CHUNK` doc_ids per request."""
+        chunk = self.DELETE_DOCS_CHUNK
+        doc_ids = list(doc_ids)
+
+        for i in range(0, len(doc_ids), chunk):
+            await self.qdrant.delete(
+                collection_name=collection or self.serving_name,
+                wait=True,
+                points_selector=Filter(
+                    must=[FieldCondition(key="doc_id", match=MatchAny(any=doc_ids[i:i + chunk]))]
+                ),
+            )
+
+
+    @_unavailable_as_503
+    async def doc_ids(self, *, collection: str | None = None) -> set[str]:
+        """The distinct doc_ids the collection holds points of (a scroll of all of it)."""
+        found: set[str] = set()
+        offset = None
+
+        while True:
+            points, offset = await self.qdrant.scroll(
+                collection_name=collection or self.serving_name,
+                limit=self.SCROLL_PAGE,
+                offset=offset,
+                with_payload=["doc_id"],
+                with_vectors=False,
+            )
+
+            for point in points:
+                doc_id = (point.payload or {}).get("doc_id")
+                if doc_id:
+                    found.add(doc_id)
+
+            if offset is None:
+                break
+
+        return found
+
+
+    # ------------------------------------------------------------------ #
+    # the serving alias and its collection
+    # ------------------------------------------------------------------ #
     async def serving_physical(self) -> str:
         """The physical collection the serving alias points to now."""
         physical = await self._alias_target()
@@ -301,6 +379,118 @@ class QdrantStore:
         physical = await self.serving_physical()
 
         return physical, await self._find_previous(physical)
+
+
+    async def get_collection_metadata(self, *, collection: str | None = None) -> dict:
+        """Metadata of the serving collection, or of `collection` (a revision build or
+        the rollback target)."""
+        return await self._collection_metadata(collection or await self.serving_physical())
+
+
+    async def set_collection_metadata(self, metadata: dict, *, collection: str | None = None) -> None:
+        """Merge `metadata` into the serving collection's (or `collection`'s) metadata."""
+        await self.qdrant.update_collection(
+            collection_name=collection or await self.serving_physical(),
+            metadata=metadata,
+        )
+
+
+    # ------------------------------------------------------------------ #
+    # revision: the next collection, the swap, the rollback
+    # ------------------------------------------------------------------ #
+    async def create_revision_collection(self, physical: str) -> str:
+        """Create the physical collection after `physical` (indexed, binding metadata
+        carried) to re-embed into. A leftover of an aborted or crashed revision is
+        dropped first, so a build never resumes on top of stale points."""
+        new_name = self._next_physical(physical)
+
+        if await self.qdrant.collection_exists(new_name):
+            log.warning("revision: dropping leftover collection %s from an earlier attempt", new_name)
+            await self.qdrant.delete_collection(collection_name=new_name)
+
+        await self._create_physical(new_name)
+        await self._ensure_indexes(new_name)
+
+        meta = await self._collection_metadata(physical)
+        if meta:
+            await self.qdrant.update_collection(collection_name=new_name, metadata=meta)
+
+        return new_name
+
+
+    async def drop_collection(self, name: str) -> None:
+        """Drop a non-serving physical collection (an aborted build, an abandoned one);
+        a no-op when it is gone already."""
+        if name == await self._alias_target():
+            raise ValueError(f"refusing to drop the serving collection {name}")
+
+        if await self.qdrant.collection_exists(name):
+            await self.qdrant.delete_collection(collection_name=name)
+
+
+    async def swap_alias(self, new_physical: str, old_physical: str, stale_previous: str | None) -> None:
+        """Atomically repoint the serving alias from `old_physical` to `new_physical`. The
+        replaced one becomes the rollback target, stamped with `retired_at` so a rollback
+        knows which enrolls it missed; `stale_previous`, the one it supersedes, is dropped."""
+        meta = await self._collection_metadata(old_physical)
+        await self.qdrant.update_collection(
+            collection_name=old_physical,
+            metadata={**meta, "retired_at": int(time.time())},
+        )
+
+        await self._repoint_alias(new_physical)
+
+        if stale_previous and stale_previous not in (new_physical, old_physical):
+            await self.qdrant.delete_collection(collection_name=stale_previous)
+
+
+    async def retired_at(self, physical: str) -> int:
+        """When `physical` stopped serving (the stamp of the swap that replaced it); 0 for
+        one that never did. Documents enrolled since then are not in it."""
+        return int((await self._collection_metadata(physical)).get("retired_at") or 0)
+
+
+    async def rollback_alias(self, restored: str) -> None:
+        """Point the serving alias back at `restored`, the retained collection, and clear
+        its `retired_at`. The collection it replaces is the caller's to drop, once the
+        enrolls writing into it are done."""
+        info = (await self.qdrant.get_collection(restored)).config.params.vectors
+        if info.size != self.vector_size:  # type: ignore
+            raise ApiError(
+                status_code=409,
+                message=f"Previous collection {restored} holds {info.size}-d vectors "  # type: ignore
+                        f"but QDRANT_VECTOR_SIZE is {self.vector_size}; revert the retriever config first",
+            )
+
+        meta = await self._collection_metadata(restored)
+
+        # Explicit null: Qdrant merges metadata updates, so an omitted key would survive.
+        await self.qdrant.update_collection(collection_name=restored, metadata={**meta, "retired_at": None})
+        await self._repoint_alias(restored)
+
+
+    # ------------------------------------------------------------------ #
+    # internals
+    # ------------------------------------------------------------------ #
+    def _chunk_size(self, points: Sequence[TilePoint]) -> int:
+        # Estimate the serialized cost of one point and derive how many fit
+        # into the byte budget, capped by `max_batch_chunks`. Payloads are
+        # homogeneous, so a single sample is enough to size the batch.
+        payload_bytes = len(orjson.dumps(points[0].payload())) if points else 0
+
+        est_point_bytes = self.vector_size * self.BYTES_PER_FLOAT + payload_bytes
+
+        by_bytes = max(1, self.chunk_byte_budget // est_point_bytes)
+
+        return min(self.max_batch_chunks, by_bytes)
+
+
+    async def _alias_target(self) -> str | None:
+        """The physical collection the serving alias points to, or None without the alias."""
+        aliases = await self.qdrant.get_aliases()
+        alias_map = {a.alias_name: a.collection_name for a in aliases.aliases}
+
+        return alias_map.get(self.serving_name)
 
 
     async def _resolve_or_create(self) -> str:
@@ -380,9 +570,17 @@ class QdrantStore:
         )
 
 
-    # ------------------------------------------------------------------ #
-    # revision (blue-green re-embed target)
-    # ------------------------------------------------------------------ #
+    async def _repoint_alias(self, physical: str) -> None:
+        await self.qdrant.update_collection_aliases(
+            change_aliases_operations=[
+                DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=self.serving_name)),
+                CreateAliasOperation(
+                    create_alias=CreateAlias(collection_name=physical, alias_name=self.serving_name)
+                ),
+            ]
+        )
+
+
     def _version(self, name: str | None) -> int | None:
         """The `N` of a `<serving>__vN` physical name, or None for any other name."""
         match = re.match(rf"^{re.escape(self.serving_name)}__v(\d+)$", name or "")
@@ -413,177 +611,9 @@ class QdrantStore:
         return max(older)[1] if older else None
 
 
-    async def create_revision_collection(self, physical: str) -> str:
-        """Create the physical collection after `physical` (indexed, binding metadata
-        carried) to re-embed into. A leftover of an aborted or crashed revision is
-        dropped first, so a build never resumes on top of stale points."""
-        new_name = self._next_physical(physical)
-
-        if await self.qdrant.collection_exists(new_name):
-            log.warning("revision: dropping leftover collection %s from an earlier attempt", new_name)
-            await self.qdrant.delete_collection(collection_name=new_name)
-
-        await self._create_physical(new_name)
-        await self._ensure_indexes(new_name)
-
-        meta = await self._collection_metadata(physical)
-        if meta:
-            await self.qdrant.update_collection(collection_name=new_name, metadata=meta)
-
-        return new_name
-
-
-    async def drop_collection(self, name: str) -> None:
-        """Drop a non-serving physical collection (an aborted build, an abandoned one);
-        a no-op when it is gone already."""
-        if name == await self._alias_target():
-            raise ValueError(f"refusing to drop the serving collection {name}")
-
-        if await self.qdrant.collection_exists(name):
-            await self.qdrant.delete_collection(collection_name=name)
-
-
-    async def swap_alias(self, new_physical: str, old_physical: str, stale_previous: str | None) -> None:
-        """Atomically repoint the serving alias from `old_physical` to `new_physical`. The
-        replaced one becomes the rollback target, stamped with `retired_at` so a rollback
-        knows which enrolls it missed; `stale_previous`, the one it supersedes, is dropped."""
-        meta = await self._collection_metadata(old_physical)
-        await self.qdrant.update_collection(
-            collection_name=old_physical,
-            metadata={**meta, "retired_at": int(time.time())},
-        )
-
-        await self._repoint_alias(new_physical)
-
-        if stale_previous and stale_previous not in (new_physical, old_physical):
-            await self.qdrant.delete_collection(collection_name=stale_previous)
-
-
-    async def retired_at(self, physical: str) -> int:
-        """When `physical` stopped serving (the stamp of the swap that replaced it); 0 for
-        one that never did. Documents enrolled since then are not in it."""
-        return int((await self._collection_metadata(physical)).get("retired_at") or 0)
-
-
-    async def rollback_alias(self, restored: str) -> None:
-        """Point the serving alias back at `restored`, the retained collection, and clear
-        its `retired_at`. The collection it replaces is the caller's to drop, once the
-        enrolls writing into it are done."""
-        info = (await self.qdrant.get_collection(restored)).config.params.vectors
-        if info.size != self.vector_size:  # type: ignore
-            raise ApiError(
-                status_code=409,
-                message=f"Previous collection {restored} holds {info.size}-d vectors "  # type: ignore
-                        f"but QDRANT_VECTOR_SIZE is {self.vector_size}; revert the retriever config first",
-            )
-
-        meta = await self._collection_metadata(restored)
-
-        # Explicit null: Qdrant merges metadata updates, so an omitted key would survive.
-        await self.qdrant.update_collection(collection_name=restored, metadata={**meta, "retired_at": None})
-        await self._repoint_alias(restored)
-
-
-    async def _repoint_alias(self, physical: str) -> None:
-        await self.qdrant.update_collection_aliases(
-            change_aliases_operations=[
-                DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=self.serving_name)),
-                CreateAliasOperation(
-                    create_alias=CreateAlias(collection_name=physical, alias_name=self.serving_name)
-                ),
-            ]
-        )
-
-
-    # ------------------------------------------------------------------ #
-    # metadata / points
-    # ------------------------------------------------------------------ #
     async def _collection_metadata(self, name: str) -> dict:
         info = await self.qdrant.get_collection(name)
         return getattr(info.config, "metadata", None) or {}
-
-
-    async def get_collection_metadata(self, *, collection: str | None = None) -> dict:
-        """Metadata of the serving collection, or of `collection` (a revision build or
-        the rollback target)."""
-        return await self._collection_metadata(collection or await self.serving_physical())
-
-
-    async def set_collection_metadata(self, metadata: dict, *, collection: str | None = None) -> None:
-        """Merge `metadata` into the serving collection's (or `collection`'s) metadata."""
-        await self.qdrant.update_collection(
-            collection_name=collection or await self.serving_physical(),
-            metadata=metadata,
-        )
-
-
-    @_unavailable_as_503
-    async def delete_by_doc(
-        self,
-        doc_id: str,
-        *,
-        wait: bool = True,
-        collection: str | None = None,
-    ) -> None:
-        """Delete every point belonging to one document — the enroll rollback + reconcile primitive."""
-        await self.qdrant.delete(
-            collection_name=collection or self.serving_name,
-            wait=wait,
-            points_selector=Filter(
-                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
-            ),
-        )
-
-
-    @_unavailable_as_503
-    async def delete_by_docs(
-        self,
-        doc_ids: Sequence[str],
-        *,
-        collection: str | None = None,
-    ) -> None:
-        """Delete every point of many documents, `DELETE_DOCS_CHUNK` doc_ids per request."""
-        chunk = self.DELETE_DOCS_CHUNK
-        doc_ids = list(doc_ids)
-
-        for i in range(0, len(doc_ids), chunk):
-            await self.qdrant.delete(
-                collection_name=collection or self.serving_name,
-                wait=True,
-                points_selector=Filter(
-                    must=[FieldCondition(key="doc_id", match=MatchAny(any=doc_ids[i:i + chunk]))]
-                ),
-            )
-
-
-    @_unavailable_as_503
-    async def iter_doc_ids(self, *, collection: str | None = None) -> set[str]:
-        """Scroll the whole collection and return the distinct doc_ids it holds."""
-        doc_ids: set[str] = set()
-        offset = None
-
-        while True:
-            points, offset = await self.qdrant.scroll(
-                collection_name=collection or self.serving_name,
-                limit=self.SCROLL_PAGE,
-                offset=offset,
-                with_payload=["doc_id"],
-                with_vectors=False,
-            )
-
-            for point in points:
-                doc_id = (point.payload or {}).get("doc_id")
-                if doc_id:
-                    doc_ids.add(doc_id)
-
-            if offset is None:
-                break
-
-        return doc_ids
-
-
-    async def close(self):
-        await self.qdrant.close()
 
 
     @classmethod

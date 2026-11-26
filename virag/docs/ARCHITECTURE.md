@@ -155,8 +155,11 @@ which has to cover the upstream's longest silence.
   of idle HTTP/1.1 connections to race the server's keep-alive), retries done by the
   channel's service config (`UNAVAILABLE`, idempotent methods only), an unreachable
   Qdrant surfaced as `503`. Collection lifecycle behind a serving alias over versioned physical
-  collections, `upsert` (optional deterministic ids, byte-budget sub-batching), `query`,
-  `delete_by_doc` / `iter_doc_ids` (reconcile), the revision blue-green swap
+  collections (`ensure_collection` at startup). A point is a `TilePoint` — one tile of a
+  document: its deterministic id and its payload (`doc_id`, `tile_num`, `image_hash`,
+  `render_version`) are described there and nowhere else. `upsert` takes points
+  (byte-budget sub-batching), `query` returns `Hit`s (a point and its score),
+  `delete_by_doc` / `doc_ids` (reconcile), the revision blue-green swap
   (`create_revision_collection` / `swap_alias` / `rollback_alias`), and collection-level
   metadata (used by the binding). The alias is never cached: `resolve()` reads the
   serving collection and the rollback target from Qdrant, since another process may
@@ -174,7 +177,7 @@ which has to cover the upstream's longest silence.
 `lifespan` wires everything and refuses to serve a half-working system:
 
 - Build all five clients from `Settings.from_env()`.
-- `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler (which
+- `ensure_collection()` on Qdrant; then `check_connection()` on retriever, tiler (which
   also proves `TILER_API_KEY` and the metadata schema, below), VLM and Valkey. **Every dependency is fatal** — the service is useless without any one of
   them, so a failed check aborts startup. The retriever's vector size must also equal
   `QDRANT_VECTOR_SIZE`. Two processes starting on one empty Qdrant both try to create
@@ -227,8 +230,8 @@ contract is unchanged (see [API.md](API.md)); what changed is that it no longer 
 whole multi-MB manifest and no longer hits a render timeout, so arbitrarily large
 documents enroll fully.
 
-- **Deterministic point ids.** A point's id is `uuid5(namespace, "{doc_id}:{tile_num}")`,
-  so re-enrolling a document overwrites its own points in place rather than duplicating.
+- **Deterministic point ids.** A point's id (`TilePoint.id`) is
+  `uuid5(namespace, "{doc_id}:{tile_num}")`, so re-enrolling a document overwrites its own points in place rather than duplicating.
 - **Byte-budget batching.** `QdrantStore.upsert` splits into sub-batches so no single
   request exceeds Qdrant's request limit: `QDRANT_CHUNK_SIZE` (per-request budget in MB)
   and `QDRANT_MAX_BATCH_CHUNKS` (hard cap on points per request).

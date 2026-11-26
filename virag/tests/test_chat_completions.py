@@ -6,7 +6,7 @@ import json
 
 from virag.errors import ApiError
 
-from conftest import FakeHit, FakeRetriever, FakeStore, FakeTiler, FakeVLM, hit_for
+from conftest import FakeRetriever, FakeStore, FakeTiler, FakeVLM, hit_for
 
 
 def _rag_store():
@@ -117,9 +117,7 @@ def test_rag_overrides_reach_qdrant(make_client):
 
 def test_rag_integrity_mismatch_skips_tile(make_client):
     # a hit whose stored image_hash does NOT match what the tiler regenerates
-    bad_hit = FakeHit(score=0.9, payload={
-        "doc_id": "doc-a", "tile_num": 0, "image_hash": "deadbeef",
-    })
+    bad_hit = hit_for("doc-a", 0, image_hash="deadbeef")
     vlm = FakeVLM()
     client = make_client(vlm=vlm, store=FakeStore(hits=[bad_hit]),
                          retriever=FakeRetriever(), tiler=FakeTiler())
@@ -137,7 +135,7 @@ def test_rag_integrity_mismatch_skips_tile(make_client):
 
 def test_rag_tile_without_hash_is_skipped(make_client):
     # a point that carries no image_hash cannot be checked, so it is not trusted
-    hashless = FakeHit(score=0.9, payload={"doc_id": "doc-a", "tile_num": 0})
+    hashless = hit_for("doc-a", 0, image_hash=None)
     vlm = FakeVLM()
     client = make_client(vlm=vlm, store=FakeStore(hits=[hashless]),
                          retriever=FakeRetriever(), tiler=FakeTiler())
@@ -154,8 +152,7 @@ def test_rag_tile_without_hash_is_skipped(make_client):
 
 def test_rag_render_version_mismatch_fails_the_request(make_client):
     # embedded from rv-old, while the tiler now renders rv-test
-    stale = hit_for("doc-a", 0)
-    stale.payload["render_version"] = "rv-old"
+    stale = hit_for("doc-a", 0, render_version="rv-old")
     vlm = FakeVLM()
     client = make_client(vlm=vlm, store=FakeStore(hits=[hit_for("doc-a", 1), stale]),
                          retriever=FakeRetriever(), tiler=FakeTiler())

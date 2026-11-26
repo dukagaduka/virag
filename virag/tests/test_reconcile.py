@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
-from virag.enroll import Enroller, point_id
+from virag.enroll import Enroller
 from virag.errors import ApiError
 from virag.reconcile import reconcile
 from virag.settings import EnrollSettings, ReconcileSettings
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, tiler_doc as _doc, lease_key, make_coordinator
+from conftest import FakeRetriever, FakeStore, FakeTiler, point_id, tiler_doc as _doc, lease_key, make_coordinator
 
 
 def _reconcile(store, tiler, coordinator=None, *, self_heal=True, retriever=None):

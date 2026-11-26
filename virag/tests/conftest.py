@@ -12,7 +12,7 @@ import base64
 import hashlib
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from qdrant_client.models import Distance
 
+from virag.clients.qdrant_store import Hit, TilePoint
 from virag.clients.reranker_client import RerankerClient
 from virag.clients.tiler_client import Begin, Committed, TilerClient, TilerDoc
 from virag.clients.tiler_client import Tile as TileEvent
@@ -52,10 +53,9 @@ def tile_hash(doc_id: str, tile_num: int) -> str:
     return hashlib.sha256(tile_bytes(doc_id, tile_num)).hexdigest()
 
 
-@dataclass
-class FakeHit:
-    score: float
-    payload: dict
+def point_id(doc_id: str, tile_num: int) -> str:
+    """The id of a tile's point."""
+    return TilePoint(doc_id, tile_num, None, "").id
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ class FakeReranker:
 
 class FakeStore:
 
-    def __init__(self, hits: list[FakeHit] | None = None):
+    def __init__(self, hits: list[Hit] | None = None):
         self._hits = hits or []
         self.upserts: list[dict] = []
         self.metadata: dict | None = None                     # the serving collection's
@@ -117,10 +117,15 @@ class FakeStore:
 
         return hits[:top_k]
 
-    async def upsert(self, vectors, payloads, ids=None, wait=True, collection=None):
-        self.upserts.append({"vectors": vectors, "payloads": payloads, "ids": ids, "collection": collection})
+    async def upsert(self, vectors, points, *, collection=None):
+        self.upserts.append({
+            "vectors": vectors,
+            "payloads": [point.payload() for point in points],
+            "ids": [point.id for point in points],
+            "collection": collection,
+        })
 
-    async def create_collection(self):
+    async def ensure_collection(self):
         pass
 
     async def serving_physical(self) -> str:
@@ -169,7 +174,7 @@ class FakeStore:
         else:
             self.metadata = {**(self.metadata or {}), **metadata}             # Qdrant merges
 
-    async def delete_by_doc(self, doc_id: str, *, wait: bool = True, collection=None) -> None:
+    async def delete_by_doc(self, doc_id: str, *, collection=None) -> None:
         self.deletes.append(doc_id)
         self.delete_collections.append(collection)
         self._doc_ids.discard(doc_id)
@@ -178,7 +183,7 @@ class FakeStore:
         for doc_id in doc_ids:
             await self.delete_by_doc(doc_id, collection=collection)
 
-    async def iter_doc_ids(self, *, collection=None) -> set[str]:
+    async def doc_ids(self, *, collection=None) -> set[str]:
         return set(self._doc_ids)
 
     async def close(self):
@@ -567,13 +572,10 @@ def sample_tile_result(doc_id="doc-a", n_tiles=2, doc_type="PDF") -> TileResult:
     )
 
 
-def hit_for(doc_id, tile_num, score=0.9) -> FakeHit:
-    """A Qdrant hit whose image_hash matches what FakeTiler.get_tile will produce."""
-    return FakeHit(
-        score=score,
-        payload={
-            "doc_id": doc_id,
-            "tile_num": tile_num,
-            "image_hash": tile_hash(doc_id, tile_num),
-        },
-    )
+def hit_for(doc_id, tile_num, score=0.9, *, image_hash: str | None = "", render_version: str = "") -> Hit:
+    """A Qdrant hit; by default its image_hash matches what FakeTiler.get_tile will
+    produce (None = a point that carries no hash)."""
+    if image_hash == "":
+        image_hash = tile_hash(doc_id, tile_num)
+
+    return Hit(TilePoint(doc_id, tile_num, image_hash, render_version), score)

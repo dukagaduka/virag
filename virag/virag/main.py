@@ -134,7 +134,7 @@ async def lifespan(app: FastAPI):
         _warn_open_routes(settings)
 
         # Every dependency is essential; a failed check refuses startup.
-        await _require_dependency("qdrant", store.create_collection())
+        await _require_dependency("qdrant", store.ensure_collection())
         await _require_dependency("retriever", retriever.check_connection())
         _require_vector_size(retriever.dimension, settings.qdrant_settings.vector_size)
         await _require_dependency("tiler", tiler.check_connection())

@@ -57,7 +57,7 @@ async def enforce_subset(
     """Delete points whose doc_id is absent from the tiler (invariant repair) or
     quarantined by it, in the serving collection or in `collection` (a revision build).
     Returns how many docs."""
-    qdrant_ids = await store.iter_doc_ids(collection=collection)
+    qdrant_ids = await store.doc_ids(collection=collection)
     docs = await tiler.docs()
 
     # Read last, right before the delete: a document being enrolled now is left to its

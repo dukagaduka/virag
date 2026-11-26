@@ -6,12 +6,12 @@ from __future__ import annotations
 import json
 
 from virag.clients.tiler_client import Begin
-from virag.enroll import point_id
 from virag.errors import ApiError
 
 from virag.settings import EnrollSettings
 
 from conftest import (
+    point_id,
     FakeRetriever,
     FakeStore,
     FakeTiler,
@@ -47,12 +47,6 @@ def _held(client) -> dict:
     values = client.app.state.coordinator.valkey.values
 
     return {name.removeprefix("enroll:"): value for name, (value, _) in values.items() if name.startswith("enroll:")}
-
-
-def test_point_id_is_deterministic_and_unique():
-    assert point_id("doc-a", 0) == point_id("doc-a", 0)
-    assert point_id("doc-a", 0) != point_id("doc-a", 1)
-    assert point_id("doc-a", 0) != point_id("doc-b", 0)
 
 
 def test_enroll_success(make_client):

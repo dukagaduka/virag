@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
-from virag.clients.qdrant_store import QdrantStore
+from virag.clients.qdrant_store import Hit, QdrantStore, TilePoint
 from virag.errors import ApiError
 
 from conftest import make_store
@@ -58,20 +58,50 @@ def test_zero_backoff_is_made_positive_for_grpc():
     assert policy["initialBackoff"] == "0.010s" and policy["maxBackoff"] == "0.010s"
 
 
+def test_a_point_id_is_deterministic_and_unique():
+    assert TilePoint("doc-a", 0, "h", "rv").id == TilePoint("doc-a", 0, "other", "rv2").id   # the tile names it
+    assert TilePoint("doc-a", 0, "h", "rv").id != TilePoint("doc-a", 1, "h", "rv").id
+    assert TilePoint("doc-a", 0, "h", "rv").id != TilePoint("doc-b", 0, "h", "rv").id
+
+    # Pinned: the points of every collection written so far carry these ids.
+    assert TilePoint("doc-a", 0, "h", "rv").id == "ee92f9a0-fa84-5910-91c3-e6c1163cdc59"
+
+
+def test_upsert_writes_the_points_ids_and_payloads_in_chunks(monkeypatch):
+    store = _store()
+    monkeypatch.setattr(store, "_chunk_size", lambda points: 2)
+    calls = []
+
+    async def upsert(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(store.qdrant, "upsert", upsert)
+    points = [TilePoint("d", n, f"h{n}", "rv") for n in range(3)]
+
+    asyncio.run(store.upsert([[0.0] * 4] * 3, points, collection="c__v2"))
+
+    assert [(call["collection_name"], call["wait"]) for call in calls] == [("c__v2", True)] * 2
+    assert [call["points"].ids for call in calls] == [[points[0].id, points[1].id], [points[2].id]]
+    assert calls[1]["points"].payloads == [{"doc_id": "d", "tile_num": 2, "image_hash": "h2", "render_version": "rv"}]
+
+
 def test_query_hands_top_k_and_threshold_to_qdrant(monkeypatch):
     store = _store()
     calls = []
 
     async def query_points(**kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(points=[SimpleNamespace(id=1, score=0.7, payload={"doc_id": "d"})])
+        return SimpleNamespace(points=[
+            SimpleNamespace(id=1, score=0.7, payload={"doc_id": "d", "tile_num": 2, "image_hash": "h", "render_version": "rv"}),
+            SimpleNamespace(id=2, score=0.6, payload={"doc_id": "old", "tile_num": 0}),      # written before hashes
+        ])
 
     monkeypatch.setattr(store.qdrant, "query_points", query_points)
 
     hits = asyncio.run(store.query([0.0] * 4, top_k=3, score_threshold=0.25))
 
     assert calls[0]["limit"] == 3 and calls[0]["score_threshold"] == 0.25
-    assert [(hit.id, hit.score) for hit in hits] == [(1, 0.7)]
+    assert hits == [Hit(TilePoint("d", 2, "h", "rv"), 0.7), Hit(TilePoint("old", 0, None, ""), 0.6)]
 
 
 @pytest.mark.parametrize("code", [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED])
@@ -161,5 +191,5 @@ def test_startup_names_a_rejected_key_and_an_unreachable_qdrant(code, message):
     store.qdrant.get_aliases = get_aliases
 
     with pytest.raises(ApiError, match=message) as error:
-        asyncio.run(store.create_collection())
+        asyncio.run(store.ensure_collection())
     assert error.value.status_code == 503

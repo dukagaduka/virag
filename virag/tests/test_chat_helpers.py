@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from virag.api.chat_completions import _extract_query, _inject_tiles, _last_user_index, _source
 
-from conftest import FakeHit
+from conftest import hit_for
 
 
 def test_extract_query_string_content():
@@ -74,12 +74,12 @@ def test_inject_tiles_preserves_multimodal_original():
 
 
 def test_source_shape():
-    hit = FakeHit(score=0.77, payload={"doc_id": "d1", "tile_num": 3})
+    hit = hit_for("d1", 3, 0.77)
     assert _source(hit, "Report") == {"name": "Report", "doc_id": "d1", "tile_num": 3, "score": 0.77}
 
 
 def test_source_carries_the_rerank_score_when_there_is_one():
-    hit = FakeHit(score=0.5, payload={"doc_id": "d2", "tile_num": 0})
+    hit = hit_for("d2", 0, 0.5)
     src = _source(hit, "d2", 0.8)
     assert src["rerank_score"] == 0.8
     assert src["doc_id"] == "d2"
