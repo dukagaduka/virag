@@ -1,7 +1,7 @@
 """Enroll self-repair: keep Qdrant a consistent subset of the tiler.
 
-Runs at startup and (optionally) on an interval — every process tries, the pass runs
-in the one leading it (`Coordinator.lead_reconcile`). Two passes:
+The Reconciler runs at startup and (optionally) on an interval — every process tries,
+the pass runs in the one leading it (`Coordinator.lead_reconcile`). Two passes:
 
   1. Enforce the `Qdrant ⊆ Tiler` invariant — delete any Qdrant points whose doc_id
      the tiler no longer has (a dangling hit would 404 on tile fetch).
@@ -29,102 +29,107 @@ from virag.settings import ReconcileSettings
 log = logging.getLogger("virag.reconcile")
 
 
-async def reconcile(
-    store: QdrantStore,
-    coordinator: Coordinator,
-    tiler: TilerClient,
-    enroller: Enroller,
-    settings: ReconcileSettings,
-) -> None:
-    """Run one reconcile pass if this process leads reconcile: enforce the invariant,
-    then finish abandoned enrolls."""
-    if not await coordinator.lead_reconcile():
-        log.debug("reconcile: led by another process")
+class Reconciler:
+    """Keeps Qdrant a consistent subset of the tiler: one pass of both repairs (`run`),
+    or the invariant alone on a collection a revision is about to serve
+    (`enforce_subset`)."""
 
-        return
+    def __init__(
+        self,
+        store: QdrantStore,
+        coordinator: Coordinator,
+        tiler: TilerClient,
+        enroller: Enroller,
+        reconcile_settings: ReconcileSettings,
+    ):
 
-    await enforce_subset(store, coordinator, tiler)
-    await finish_abandoned(coordinator, tiler, enroller, settings)
+        self.store       = store
+        self.coordinator = coordinator
+        self.tiler       = tiler
+        self.enroller    = enroller
 
-
-async def enforce_subset(
-    store: QdrantStore,
-    coordinator: Coordinator,
-    tiler: TilerClient,
-    *,
-    collection: str | None = None,
-) -> int:
-    """Delete points whose doc_id is absent from the tiler (invariant repair) or
-    quarantined by it, in the serving collection or in `collection` (a revision build).
-    Returns how many docs."""
-    qdrant_ids = await store.doc_ids(collection=collection)
-    docs = await tiler.docs()
-
-    # Read last, right before the delete: a document being enrolled now is left to its
-    # enroll — the tiler lists it from `begin`, and a re-enroll lifts a quarantine.
-    enrolling = set(await coordinator.enrolling_now())
-
-    dangling = qdrant_ids - {doc.doc_id for doc in docs} - enrolling
-
-    # A quarantined doc's tiles answer 410, so its points only crowd live hits out of top_k.
-    quarantined = ({doc.doc_id for doc in docs if doc.quarantined} & qdrant_ids) - enrolling
-
-    if dangling:
-        log.warning("reconcile: %d dangling doc_id(s) in qdrant not in tiler; deleting", len(dangling))
-
-    if quarantined:
-        log.warning("reconcile: %d doc_id(s) quarantined by the tiler; deleting their points", len(quarantined))
-
-    stale = dangling | quarantined
-    if not stale:
-        return 0
-
-    await store.delete_by_docs(sorted(stale), collection=collection)
-
-    return len(stale)
+        self.self_heal = reconcile_settings.self_heal
 
 
-async def finish_abandoned(
-    coordinator: Coordinator,
-    tiler: TilerClient,
-    enroller: Enroller,
-    settings: ReconcileSettings,
-) -> None:
-    """Finish the enrolls nobody is running any more: a pending doc the tiler serves is
-    enrolled again from its stored tiles (self-heal); any other loses its partial points
-    and waits for a re-enroll."""
-    # Read before the listing: a doc pending there and absent here is abandoned, or was
-    # taken since — and then taking it below is refused.
-    enrolling = await coordinator.enrolling_now()
+    async def run(self) -> None:
+        """Run one reconcile pass if this process leads reconcile: enforce the invariant,
+        then finish abandoned enrolls."""
+        if not await self.coordinator.lead_reconcile():
+            log.debug("reconcile: led by another process")
 
-    pending = await tiler.pending_docs()
-    abandoned = [doc for doc in pending if doc.doc_id not in enrolling]
+            return
 
-    if not abandoned:
-        return
+        await self.enforce_subset()
+        await self.finish_abandoned()
 
-    log.warning("reconcile: %d abandoned enroll(s)", len(abandoned))
 
-    healed = 0
+    async def enforce_subset(self, *, collection: str | None = None) -> int:
+        """Delete points whose doc_id is absent from the tiler (invariant repair) or
+        quarantined by it, in the serving collection or in `collection` (a revision build).
+        Returns how many docs."""
+        qdrant_ids = await self.store.doc_ids(collection=collection)
+        docs = await self.tiler.docs()
 
-    for doc in abandoned:
-        doc_id = doc.doc_id
+        # Read last, right before the delete: a document being enrolled now is left to its
+        # enroll — the tiler lists it from `begin`, and a re-enroll lifts a quarantine.
+        enrolling = set(await self.coordinator.enrolling_now())
 
-        try:
-            if settings.self_heal and doc.embeddable:
-                await enroller.enroll_stored(doc_id)
-                healed += 1
+        dangling = qdrant_ids - {doc.doc_id for doc in docs} - enrolling
 
-            else:
-                # No servable tiles (the tiler doc is incomplete or quarantined), or
-                # self-heal is off: only a re-enroll restores it.
-                await enroller.drop(doc_id)
-                log.info("reconcile: doc_id=%s left for re-enroll", doc_id)
+        # A quarantined doc's tiles answer 410, so its points only crowd live hits out of top_k.
+        quarantined = ({doc.doc_id for doc in docs if doc.quarantined} & qdrant_ids) - enrolling
 
-        except EnrollInProgress:
-            log.info("reconcile: doc_id=%s is being enrolled; left to its enroll", doc_id)
+        if dangling:
+            log.warning("reconcile: %d dangling doc_id(s) in qdrant not in tiler; deleting", len(dangling))
 
-        except Exception as e:  # noqa: BLE001 - one doc must not stop the pass; it stays pending
-            log.error("reconcile: self-heal failed for doc_id=%s: %r", doc_id, e)
+        if quarantined:
+            log.warning("reconcile: %d doc_id(s) quarantined by the tiler; deleting their points", len(quarantined))
 
-    log.info("reconcile: self-healed %d doc(s)", healed)
+        stale = dangling | quarantined
+        if not stale:
+            return 0
+
+        await self.store.delete_by_docs(sorted(stale), collection=collection)
+
+        return len(stale)
+
+
+    async def finish_abandoned(self) -> None:
+        """Finish the enrolls nobody is running any more: a pending doc the tiler serves is
+        enrolled again from its stored tiles (self-heal); any other loses its partial points
+        and waits for a re-enroll."""
+        # Read before the listing: a doc pending there and absent here is abandoned, or was
+        # taken since — and then taking it below is refused.
+        enrolling = await self.coordinator.enrolling_now()
+
+        pending = await self.tiler.pending_docs()
+        abandoned = [doc for doc in pending if doc.doc_id not in enrolling]
+
+        if not abandoned:
+            return
+
+        log.warning("reconcile: %d abandoned enroll(s)", len(abandoned))
+
+        healed = 0
+
+        for doc in abandoned:
+            doc_id = doc.doc_id
+
+            try:
+                if self.self_heal and doc.embeddable:
+                    await self.enroller.enroll_stored(doc_id)
+                    healed += 1
+
+                else:
+                    # No servable tiles (the tiler doc is incomplete or quarantined), or
+                    # self-heal is off: only a re-enroll restores it.
+                    await self.enroller.drop(doc_id)
+                    log.info("reconcile: doc_id=%s left for re-enroll", doc_id)
+
+            except EnrollInProgress:
+                log.info("reconcile: doc_id=%s is being enrolled; left to its enroll", doc_id)
+
+            except Exception as e:  # noqa: BLE001 - one doc must not stop the pass; it stays pending
+                log.error("reconcile: self-heal failed for doc_id=%s: %r", doc_id, e)
+
+        log.info("reconcile: self-healed %d doc(s)", healed)

@@ -9,8 +9,8 @@ syncs exactly those docs after the swap:
 
   1. Resolve the serving collection, drop any leftover target, create `<serving>__vN+1`,
      start the journal.
-  2. Re-embed every complete tiler doc into it (`reembed`: a flat tile stream across
-     documents, failed docs retried). Docs still failing abort the job without a swap —
+  2. Re-embed every complete tiler doc into it (`Enroller.reembed`: a flat tile stream
+     across documents, failed docs retried). Docs still failing abort the job without a swap —
      the old collection keeps serving.
   3. Enforce `Qdrant ⊆ Tiler` on the new collection, stamp it with the tiler's
      render_version, check the job is still this process's, then swap the alias. The
@@ -46,20 +46,16 @@ tiler's.
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
 import logging
 import time
 
-from virag.clients.qdrant_store import QdrantStore, TilePoint
-from virag.clients.retriever_client import RetrieverClient
-from virag.clients.tiler_client import TilerClient, TilerDoc
+from virag.clients.qdrant_store import QdrantStore
+from virag.clients.tiler_client import TilerClient
 from virag.coordination import Coordinator, EnrollInProgress
 from virag.enroll import Enroller
 from virag.errors import ApiError
-from virag.reconcile import enforce_subset
-from virag.settings import EnrollSettings, RevisionSettings
-from virag.utils import chunked, gather
+from virag.reconcile import Reconciler
+from virag.settings import RevisionSettings
 
 
 log = logging.getLogger("virag.revision")
@@ -67,31 +63,26 @@ log = logging.getLogger("virag.revision")
 
 class RevisionManager:
     """Runs this process's revision/rollback job; the job's lock and status live in the
-    Coordinator, so every process answers for the cluster."""
-
-    # Tiles assumed in flight when the tiler has no bulk concurrency cap; sizes the
-    # window of a re-embed.
-    UNCAPPED_TILES = 128
-
+    Coordinator, so every process answers for the cluster. The job only decides what
+    happens and when: points are written by the Enroller, the invariant is kept by the
+    Reconciler."""
 
     def __init__(
         self,
         store: QdrantStore,
         coordinator: Coordinator,
         tiler: TilerClient,
-        retriever: RetrieverClient,
         enroller: Enroller,
-        enroll_settings: EnrollSettings,
+        reconciler: Reconciler,
         revision_settings: RevisionSettings,
     ):
 
         self.store       = store
         self.coordinator = coordinator
         self.tiler       = tiler
-        self.retriever   = retriever
         self.enroller    = enroller
+        self.reconciler  = reconciler
 
-        self.batch_size    = enroll_settings.batch_size
         self.drain_timeout = revision_settings.revision_drain_timeout_sec
 
         # This process's job, if it runs one; `status` is what it publishes.
@@ -240,20 +231,6 @@ class RevisionManager:
             pass
 
 
-    async def reembed(self, docs: list[TilerDoc], collection: str) -> set[str]:
-        """Re-embed complete tiler docs into `collection`, a build nobody else writes;
-        docs that fail are retried once in per-document batches, so a doc that merely
-        shared a batch with a broken one recovers. Returns the doc_ids that still failed."""
-        failed = await self._reembed_pass(docs, collection)
-
-        if not failed:
-            return failed
-
-        log.warning("reembed: retrying %d failed doc(s)", len(failed))
-
-        return await self._reembed_pass([doc for doc in docs if doc.doc_id in failed], collection, per_doc=True)
-
-
     # ------------------------------------------------------------------ #
     # the job
     # ------------------------------------------------------------------ #
@@ -355,7 +332,7 @@ class RevisionManager:
             # Incomplete or quarantined docs have no servable tiles; leave them for a re-enroll.
             await self._update(total=len(docs), skipped=len(docs) - len(complete))
 
-            failed = await self.reembed(complete, target)
+            failed = await self.enroller.reembed(complete, target)
 
             self.status["reembedded"] = len(complete) - len(failed)
 
@@ -369,7 +346,7 @@ class RevisionManager:
 
                 return
 
-            await enforce_subset(store, coordinator, self.tiler, collection=target)
+            await self.reconciler.enforce_subset(collection=target)
 
             # The vectors must match what the tiler renders now, not when the job began.
             current = await self.tiler.render_version()
@@ -418,7 +395,7 @@ class RevisionManager:
 
         sync_failed = await self._sync(journal)
 
-        await enforce_subset(self.store, self.coordinator, self.tiler, collection=target)
+        await self.reconciler.enforce_subset(collection=target)
 
         self._conclude(journal, sync_failed)
 
@@ -464,7 +441,7 @@ class RevisionManager:
 
         sync_failed = await self._sync(missed)
 
-        await enforce_subset(self.store, self.coordinator, self.tiler, collection=restored)
+        await self.reconciler.enforce_subset(collection=restored)
 
         self._conclude(missed, sync_failed)
 
@@ -522,75 +499,5 @@ class RevisionManager:
             except Exception as e:  # noqa: BLE001 - a failed doc fails itself, not the job
                 failed.add(doc_id)
                 log.error("%s: cannot sync doc_id=%s: %r", self.status["kind"], doc_id, e)
-
-        return failed
-
-
-    # ------------------------------------------------------------------ #
-    # the flat re-embed
-    # ------------------------------------------------------------------ #
-    async def _reembed_pass(self, docs: list[TilerDoc], collection: str, per_doc: bool = False) -> set[str]:
-        """One pass of the flat tile stream.
-
-        Every (doc_id, tile_num) of every doc is cut into batches of `batch_size` across
-        document boundaries, so small docs share full batches. Each batch fetches its
-        tiles concurrently (bulk, capped by the tiler's `max_concurrency`), embeds them in
-        one bulk retriever call and upserts once. A window of batches stays in flight, so
-        one batch fetches while another embeds; it is derived from the tiler cap — more
-        would only queue at the guard. The points are the ones an enroll writes (`TilePoint`),
-        ids included.
-
-        A failed batch fails every doc it touched (their later tiles are skipped).
-        `per_doc` keeps batches within one document (the retry pass).
-        """
-        by_id = {doc.doc_id: doc for doc in docs}
-        failed: set[str] = set()
-
-        async def process(batch: list[tuple[str, int]]) -> None:
-            batch = [(doc_id, n) for doc_id, n in batch if doc_id not in failed]
-            if not batch:
-                return
-
-            try:
-                jpegs = await gather(self.tiler.get_tile(doc_id, n, bulk=True) for doc_id, n in batch)
-                b64s = [base64.b64encode(j).decode("ascii") for j in jpegs]
-                vectors = await self.retriever.embed_images(b64s, bulk=True)
-
-                points = [
-                    TilePoint(doc_id, n, hashlib.sha256(j).hexdigest(), by_id[doc_id].render_version)
-                    for (doc_id, n), j in zip(batch, jpegs)
-                ]
-
-                await self.store.upsert(vectors, points, collection=collection)
-
-            except Exception as e:  # noqa: BLE001 - a failed batch fails its docs, not the stream
-                touched = {doc_id for doc_id, _ in batch}
-                failed.update(touched)
-                log.error("reembed: batch failed for doc(s) %s: %r", sorted(touched), e)
-
-        if per_doc:
-            batches = (
-                batch
-                for doc_id, doc in by_id.items()
-                for batch in chunked(((doc_id, n) for n in range(doc.tile_count)), self.batch_size)
-            )
-        else:
-            tiles = ((doc_id, n) for doc_id, doc in by_id.items() for n in range(doc.tile_count))
-            batches = chunked(tiles, self.batch_size)
-
-        window = max(1, (self.tiler.max_concurrency or self.UNCAPPED_TILES) // self.batch_size) + 1
-        slots = asyncio.Semaphore(window)
-
-        async def run(batch: list[tuple[str, int]]) -> None:
-            try:
-                await process(batch)
-
-            finally:
-                slots.release()
-
-        async with asyncio.TaskGroup() as group:
-            for batch in batches:
-                await slots.acquire()
-                group.create_task(run(batch))
 
         return failed

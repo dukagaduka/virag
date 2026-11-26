@@ -6,7 +6,7 @@ import asyncio
 
 from virag.enroll import Enroller
 from virag.errors import ApiError
-from virag.reconcile import reconcile
+from virag.reconcile import Reconciler
 from virag.settings import EnrollSettings, ReconcileSettings
 
 from conftest import FakeRetriever, FakeStore, FakeTiler, point_id, tiler_doc as _doc, lease_key, make_coordinator
@@ -17,9 +17,7 @@ def _reconcile(store, tiler, coordinator=None, *, self_heal=True, retriever=None
     coordinator = coordinator if coordinator is not None else make_coordinator(store)
     enroller = Enroller(store, coordinator, tiler, retriever or FakeRetriever(), EnrollSettings(batch_size=16))
 
-    return reconcile(
-        store, coordinator, tiler, enroller, ReconcileSettings(self_heal=self_heal, interval_sec=0),
-    )
+    return Reconciler(store, coordinator, tiler, enroller, ReconcileSettings(self_heal=self_heal, interval_sec=0)).run()
 
 
 def _enrolled_docs(store) -> list[str]:

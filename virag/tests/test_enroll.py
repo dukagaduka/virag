@@ -1,24 +1,26 @@
 """/enroll: the upload relayed to the tiler, name policy, deterministic ids, embed+upsert,
-zero-tile handling, one enroll of a document at a time."""
+zero-tile handling, one enroll of a document at a time; the flat re-embed of a build."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from virag.clients.tiler_client import Begin
+from virag.enroll import Enroller
 from virag.errors import ApiError
-
 from virag.settings import EnrollSettings
 
 from conftest import (
-    point_id,
     FakeRetriever,
     FakeStore,
     FakeTiler,
     lease_key,
     make_coordinator,
     make_settings,
+    point_id,
     sample_tile_result,
+    tiler_doc,
 )
 
 
@@ -383,6 +385,40 @@ def test_a_doc_gone_from_the_tiler_while_its_stream_goes_on_fails_the_mark(make_
 
     assert (r.status_code, r.json()["error"]["message"]) == (503, "the metadata patch failed")
     assert store.upserts == [] and store.deletes == []
+
+
+# ---------------------------------------------------------------------------
+# the flat re-embed of a build
+# ---------------------------------------------------------------------------
+
+def _enroller(store, tiler, batch_size) -> Enroller:
+    return Enroller(store, make_coordinator(store), tiler, FakeRetriever(), EnrollSettings(batch_size=batch_size))
+
+
+def test_batches_cross_document_boundaries():
+    store, tiler = FakeStore(), FakeTiler()
+    docs = [tiler_doc("a", 1), tiler_doc("b", 2), tiler_doc("c", 1)]
+
+    failed = asyncio.run(_enroller(store, tiler, batch_size=2).reembed(docs, "c__v2"))
+
+    assert failed == set()
+    batches = sorted([p["doc_id"], p["tile_num"]] for u in store.upserts for p in u["payloads"])
+    assert batches == [["a", 0], ["b", 0], ["b", 1], ["c", 0]]
+    assert len(store.upserts) == 2                                      # two full batches, not three
+    assert all(u["collection"] == "c__v2" for u in store.upserts)
+    assert tiler.metadata_patches == []                                 # a build touches no markers
+
+
+def test_failed_batch_is_retried_and_only_the_bad_doc_fails():
+    store, tiler = FakeStore(), FakeTiler()
+    docs = [tiler_doc("a", 1), tiler_doc("b", 2), tiler_doc("c", 1)]
+    tiler.fail_tiles = {("b", 1)}                                       # shares a batch with c
+
+    failed = asyncio.run(_enroller(store, tiler, batch_size=2).reembed(docs, "c__v2"))
+
+    assert failed == {"b"}
+    stored = {p["doc_id"] for u in store.upserts for p in u["payloads"]}
+    assert {"a", "c"} <= stored                                         # c recovered on retry
 
 
 # ---------------------------------------------------------------------------

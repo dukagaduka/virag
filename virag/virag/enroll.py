@@ -27,10 +27,18 @@ The Enroller is the one writer of a document's points in the serving collection:
 `/enroll` feeds it the tiler's ingest stream, reconcile's self-heal and a revision's
 sync the stream of a stored doc (`enroll_stored`), and both drop a document's points
 through it (`drop`).
+
+It also writes a revision's build (`reembed`) — a collection nobody else writes and
+nobody reads yet, so no document is taken or marked: every tile of every stored doc is
+fetched from the tiler and embedded in one flat stream across documents, into the same
+points an enroll writes.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 import logging
 from collections.abc import Callable
 from contextlib import aclosing
@@ -38,17 +46,24 @@ from typing import AsyncIterator
 
 from virag.clients.qdrant_store import QdrantStore, TilePoint
 from virag.clients.retriever_client import RetrieverClient
-from virag.clients.tiler_client import Begin, Committed, Event, Tile, TilerClient
+from virag.clients.tiler_client import Begin, Committed, Event, Tile, TilerClient, TilerDoc
 from virag.coordination import Coordinator
 from virag.errors import ApiError
 from virag.settings import EnrollSettings
+from virag.utils import chunked, gather
 
 
 log = logging.getLogger("virag.enroll")
 
 
 class Enroller:
-    """Writes one document's points from a tile stream of the tiler."""
+    """Writes points from the tiler's tiles: one document's from its tile stream, or a
+    revision's whole build."""
+
+    # Tiles assumed in flight when the tiler has no bulk concurrency cap; sizes the
+    # window of a re-embed.
+    UNCAPPED_TILES = 128
+
 
     def __init__(
         self,
@@ -137,6 +152,23 @@ class Enroller:
             await self.store.delete_by_doc(doc_id, collection=collection)
 
 
+    async def reembed(self, docs: list[TilerDoc], collection: str) -> set[str]:
+        """Re-embed complete tiler docs into `collection`, a build nobody else writes;
+        docs that fail are retried once in per-document batches, so a doc that merely
+        shared a batch with a broken one recovers. Returns the doc_ids that still failed."""
+        failed = await self._reembed_pass(docs, collection)
+
+        if not failed:
+            return failed
+
+        log.warning("reembed: retrying %d failed doc(s)", len(failed))
+
+        return await self._reembed_pass([doc for doc in docs if doc.doc_id in failed], collection, per_doc=True)
+
+
+    # ------------------------------------------------------------------ #
+    # one document's stream
+    # ------------------------------------------------------------------ #
     async def _begin(self, events: AsyncIterator[Event]) -> Begin:
         """The stream's first event, which names the document."""
         try:
@@ -207,3 +239,73 @@ class Enroller:
 
         except Exception as e:  # noqa: BLE001
             log.error("rollback failed for doc_id=%s: %r", doc_id, e)
+
+
+    # ------------------------------------------------------------------ #
+    # the flat re-embed
+    # ------------------------------------------------------------------ #
+    async def _reembed_pass(self, docs: list[TilerDoc], collection: str, per_doc: bool = False) -> set[str]:
+        """One pass of the flat tile stream.
+
+        Every (doc_id, tile_num) of every doc is cut into batches of `batch_size` across
+        document boundaries, so small docs share full batches. Each batch fetches its
+        tiles concurrently (bulk, capped by the tiler's `max_concurrency`), embeds them in
+        one bulk retriever call and upserts once. A window of batches stays in flight, so
+        one batch fetches while another embeds; it is derived from the tiler cap — more
+        would only queue at the guard. The points are the ones an enroll writes (`TilePoint`),
+        ids included.
+
+        A failed batch fails every doc it touched (their later tiles are skipped).
+        `per_doc` keeps batches within one document (the retry pass).
+        """
+        by_id = {doc.doc_id: doc for doc in docs}
+        failed: set[str] = set()
+
+        async def process(batch: list[tuple[str, int]]) -> None:
+            batch = [(doc_id, n) for doc_id, n in batch if doc_id not in failed]
+            if not batch:
+                return
+
+            try:
+                jpegs = await gather(self.tiler.get_tile(doc_id, n, bulk=True) for doc_id, n in batch)
+                b64s = [base64.b64encode(j).decode("ascii") for j in jpegs]
+                vectors = await self.retriever.embed_images(b64s, bulk=True)
+
+                points = [
+                    TilePoint(doc_id, n, hashlib.sha256(j).hexdigest(), by_id[doc_id].render_version)
+                    for (doc_id, n), j in zip(batch, jpegs)
+                ]
+
+                await self.store.upsert(vectors, points, collection=collection)
+
+            except Exception as e:  # noqa: BLE001 - a failed batch fails its docs, not the stream
+                touched = {doc_id for doc_id, _ in batch}
+                failed.update(touched)
+                log.error("reembed: batch failed for doc(s) %s: %r", sorted(touched), e)
+
+        if per_doc:
+            batches = (
+                batch
+                for doc_id, doc in by_id.items()
+                for batch in chunked(((doc_id, n) for n in range(doc.tile_count)), self.batch_size)
+            )
+        else:
+            tiles = ((doc_id, n) for doc_id, doc in by_id.items() for n in range(doc.tile_count))
+            batches = chunked(tiles, self.batch_size)
+
+        window = max(1, (self.tiler.max_concurrency or self.UNCAPPED_TILES) // self.batch_size) + 1
+        slots = asyncio.Semaphore(window)
+
+        async def run(batch: list[tuple[str, int]]) -> None:
+            try:
+                await process(batch)
+
+            finally:
+                slots.release()
+
+        async with asyncio.TaskGroup() as group:
+            for batch in batches:
+                await slots.acquire()
+                group.create_task(run(batch))
+
+        return failed

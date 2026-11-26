@@ -18,7 +18,7 @@ from virag.clients.vlm_client import VLMClient
 from virag.binding import enforce_binding
 from virag.coordination import Coordinator
 from virag.enroll import Enroller
-from virag.reconcile import reconcile
+from virag.reconcile import Reconciler
 from virag.revision import RevisionManager
 from virag.utils import cancel, every
 from virag.api import enroll as enroll_api
@@ -155,16 +155,9 @@ async def lifespan(app: FastAPI):
         stack.push_async_callback(cancel, heartbeat_task)
 
         enroller = Enroller(store, coordinator, tiler, retriever, settings.enroll_settings)
+        reconciler = Reconciler(store, coordinator, tiler, enroller, settings.reconcile_settings)
 
-        revision = RevisionManager(
-            store,
-            coordinator,
-            tiler,
-            retriever,
-            enroller,
-            settings.enroll_settings,
-            settings.revision_settings,
-        )
+        revision = RevisionManager(store, coordinator, tiler, enroller, reconciler, settings.revision_settings)
         stack.push_async_callback(revision.close)
 
         async def upkeep() -> None:
@@ -172,7 +165,7 @@ async def lifespan(app: FastAPI):
             job left after its alias move, then the enrolls (in the process leading
             reconcile)."""
             await revision.resume_orphaned()
-            await reconcile(store, coordinator, tiler, enroller, settings.reconcile_settings)
+            await reconciler.run()
 
         # Repair what an earlier crash left before serving.
         await upkeep()

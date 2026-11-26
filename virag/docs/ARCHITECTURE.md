@@ -195,7 +195,7 @@ which has to cover the upstream's longest silence.
   renews it (§10).
 - **Upkeep** — before serving, a process finishes a revision / rollback job left after
   its alias move (`RevisionManager.resume_orphaned`, in the background) and runs one
-  `reconcile()` pass (repairing any partial or orphaned enrolls left by an earlier
+  reconcile pass (`Reconciler.run`; repairing any partial or orphaned enrolls left by an earlier
   crash; in the process leading reconcile); a background task in every process repeats
   both on `VIRAG_RECONCILE_INTERVAL_SEC`. See §9.
 - **render_version check** (`RevisionManager.revise_if_stale`) — a collection embedded
@@ -272,7 +272,7 @@ configured `QDRANT_COLLECTION_NAME`. The alias points to a versioned physical co
 collection already sitting under `QDRANT_COLLECTION_NAME` (the pre-alias layout) is
 refused at startup — the alias cannot take a name a collection holds.
 
-**Reconcile** (`reconcile.py`) runs once at startup and then on
+**Reconcile** (`Reconciler`, `reconcile.py`) runs once at startup and then on
 `VIRAG_RECONCILE_INTERVAL_SEC` (0 disables the loop; the startup pass still runs), in
 the one process leading it (§10). Two passes:
 
@@ -299,7 +299,7 @@ only look at the keys: reconcile's first pass, which deletes points of documents
 tiler no longer serves, and a revision's build, which writes a collection nobody reads
 yet.
 
-**The flat re-embed** (`RevisionManager.reembed`) is how a revision builds its
+**The flat re-embed** (`Enroller.reembed`) is how a revision builds its
 collection: every `(doc_id, tile_num)` of the docs is cut into batches of
 `VIRAG_ENROLL_BATCH_SIZE` *across document boundaries*, each batch fetches its tiles
 concurrently (bulk, capped by `TILER_MAX_CONCURRENCY`), embeds them in one bulk retriever
@@ -447,9 +447,9 @@ virag/
   settings.py        # pydantic-settings sections: every env var, its default and bounds
   binding.py         # the collection ↔ tiler volume binding
   coordination.py    # Coordinator: leases, documents being enrolled + journal, drain, the revision job, the reconcile lead
-  enroll.py          # Enroller: a tile stream of the tiler (an ingest, or a stored doc) → a document's points; the one writer
-  reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic): the invariant, abandoned enrolls
-  revision.py        # RevisionManager: background revision / rollback job, the flat re-embed of its build, journal sync
+  enroll.py          # Enroller: the one writer of points — a tile stream of the tiler (an ingest, or a stored doc) → a document's points; the flat re-embed of a revision's build
+  reconcile.py       # Reconciler: Qdrant ⊆ Tiler self-repair (startup + periodic) — the invariant, abandoned enrolls
+  revision.py        # RevisionManager: background revision / rollback job — the build, the alias move, journal sync
   errors.py          # ApiError + the uniform {"error": {...}} envelope
   responses.py       # OrjsonResponse, the app-wide default response class
   utils.py           # non-domain helpers (error_body, gather, cancel, every, chunked, unavailable_as_503, MultipartFields)

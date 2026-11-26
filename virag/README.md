@@ -80,10 +80,10 @@ virag/
   main.py            app, lifespan (clients, fatal dependency checks, binding, reconcile, render_version check), router order
   settings.py        Settings.from_env() — every env var and its validation
   binding.py         the collection ↔ tiler volume binding
-  reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic, in the leading process): the invariant, abandoned enrolls
+  reconcile.py       Reconciler: Qdrant ⊆ Tiler self-repair (startup + periodic, in the leading process): the invariant, abandoned enrolls
   revision.py        /revision re-embed and /revision/rollback jobs
   coordination.py    Coordinator: process leases, documents being enrolled + journal, revision lock/status, reconcile lead
-  enroll.py          Enroller: a tile stream of the tiler → a document's points
+  enroll.py          Enroller: a tile stream of the tiler → a document's points; the flat re-embed of a revision's build
   errors.py          ApiError + the uniform {"error": {...}} envelope
   api/               chat_completions, models, enroll, revision, ops, auth
   clients/           retriever_client, reranker_client, qdrant_store, valkey_store, tiler_client, vlm_client

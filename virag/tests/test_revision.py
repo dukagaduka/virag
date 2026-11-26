@@ -1,4 +1,4 @@
-"""Revision job: background build (the flat re-embed), journal sync after the swap, abort
+"""Revision job: background build, journal sync after the swap, abort
 without swap, rollback, and the job's lock and status shared across processes."""
 
 from __future__ import annotations
@@ -11,28 +11,21 @@ from virag.api import revision as revision_api
 from virag.coordination import REVISION_ON, REVISION_STATUS
 from virag.enroll import Enroller
 from virag.errors import ApiError
+from virag.reconcile import Reconciler
 from virag.revision import RevisionManager
-from virag.settings import EnrollSettings, RevisionSettings
+from virag.settings import EnrollSettings, ReconcileSettings, RevisionSettings
 
 from fastapi.testclient import TestClient
 
 from conftest import FakeRetriever, FakeStore, FakeTiler, tiler_doc as _doc, build_app, lease_key, make_coordinator
 
 
-def _manager(store, tiler, coordinator=None, batch_size=4):
+def _manager(store, tiler, coordinator=None):
     coordinator = coordinator if coordinator is not None else make_coordinator(store)
-    retriever = FakeRetriever()
-    enroll_settings = EnrollSettings(batch_size=batch_size)
+    enroller = Enroller(store, coordinator, tiler, FakeRetriever(), EnrollSettings(batch_size=4))
+    reconciler = Reconciler(store, coordinator, tiler, enroller, ReconcileSettings(self_heal=True, interval_sec=0))
 
-    return RevisionManager(
-        store,
-        coordinator,
-        tiler,
-        retriever,
-        Enroller(store, coordinator, tiler, retriever, enroll_settings),
-        enroll_settings,
-        RevisionSettings(revision_drain_timeout_sec=5),
-    )
+    return RevisionManager(store, coordinator, tiler, enroller, reconciler, RevisionSettings(revision_drain_timeout_sec=5))
 
 
 def _run_job(manager, start) -> dict:
@@ -569,33 +562,3 @@ def test_a_doc_that_fails_to_sync_is_reported_and_the_rest_go_on():
     assert {p["doc_id"] for u in store.upserts for p in u["payloads"]} >= {"good"}
     assert tiler.metadata_patches[-1] == ("good", tiler.metadata_patches[-1][1])
     assert all(patch["virag_enrolled_at"] == 0 for doc_id, patch in tiler.metadata_patches if doc_id == "bad")
-
-
-# ---------------------------------------------------------------------------
-# the flat re-embed of a build
-# ---------------------------------------------------------------------------
-
-def test_batches_cross_document_boundaries():
-    store, tiler = FakeStore(), FakeTiler()
-    docs = [_doc("a", 1), _doc("b", 2), _doc("c", 1)]
-
-    failed = asyncio.run(_manager(store, tiler, batch_size=2).reembed(docs, "c__v2"))
-
-    assert failed == set()
-    batches = sorted([p["doc_id"], p["tile_num"]] for u in store.upserts for p in u["payloads"])
-    assert batches == [["a", 0], ["b", 0], ["b", 1], ["c", 0]]
-    assert len(store.upserts) == 2                                      # two full batches, not three
-    assert all(u["collection"] == "c__v2" for u in store.upserts)
-    assert tiler.metadata_patches == []                                 # a build touches no markers
-
-
-def test_failed_batch_is_retried_and_only_the_bad_doc_fails():
-    store, tiler = FakeStore(), FakeTiler()
-    docs = [_doc("a", 1), _doc("b", 2), _doc("c", 1)]
-    tiler.fail_tiles = {("b", 1)}                                       # shares a batch with c
-
-    failed = asyncio.run(_manager(store, tiler, batch_size=2).reembed(docs, "c__v2"))
-
-    assert failed == {"b"}
-    stored = {p["doc_id"] for u in store.upserts for p in u["payloads"]}
-    assert {"a", "c"} <= stored                                         # c recovered on retry
