@@ -68,7 +68,9 @@ class Worker:
     # ------------------------------------------------------------------ #
     def on(self, doc_type: DocType, path: str, work: Callable[[DocumentReader], Any]) -> Any:
         """Run `work` on the worker's reader of this document — opened now, unless the
-        last task left it open — mapping memory exhaustion."""
+        last task left it open — mapping memory exhaustion. A failure never names the
+        file: the library that could not read it puts its path into the message, and
+        where the store keeps a document is nobody else's to know."""
         if type(self.reader) is not READERS[doc_type] or self.reader.path != path:
             self.forget()
             self.reader = READERS[doc_type](path, self.params)
@@ -81,7 +83,12 @@ class Worker:
         except MemoryError as exc:
             self.forget()
 
-            raise RenderTooLarge(str(exc) or "out of memory") from None
+            raise RenderTooLarge(self.unnamed(exc, path) or "out of memory") from None
+
+        except DecodeError as exc:
+            self.forget()
+
+            raise type(exc)(self.unnamed(exc, path)) from None
 
         except BaseException:
             self.forget()
@@ -102,6 +109,12 @@ class Worker:
                 pass
 
         self.reader = None
+
+
+    @staticmethod
+    def unnamed(exc: Exception, path: str) -> str:
+        """The failure's message with the document's path taken out of it."""
+        return str(exc).replace(path, "the document")
 
 
     @classmethod

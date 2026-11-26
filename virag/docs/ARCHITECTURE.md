@@ -140,11 +140,17 @@ which has to cover the upstream's longest silence.
   and may carry a vLLM `priority`; chat queries bypass both, so an ingest never queues a
   user's query. `check_connection()` also learns the vector size (checked against
   `QDRANT_VECTOR_SIZE`), resolves image batching and verifies the bulk priority.
-- **`TilerService`** — doc-tiler client: `ingest_stream()` (the NDJSON ingest stream
-  `/enroll` consumes), `doc_stream()` (the same stream of a stored doc: self-heal, a
-  revision's sync), `get_tile()`, `get_info()` (for binding), `get_schema()` (metadata
-  schema guard), `get_metadata()` / `patch_metadata()` (document names; the enroll's
-  pending marker), `search_docs()` / `iter_docs()` (reconcile), `doc_exists()`.
+- **`TilerClient`** — doc-tiler client, and everything virag knows about the tiler.
+  `ingest_stream()` (the ingest `/enroll` consumes) and `doc_stream()` (the same stream
+  of a stored doc: self-heal, a revision's sync) yield typed events — `Begin`, a `Tile`
+  per tile, `Committed`; an `error` event the tiler ends a stream with is raised (502).
+  `docs()` lists the tiler's documents as `TilerDoc` (`embeddable`, `enrolled`,
+  `enrolled_at`); `pending_docs()`, `mark_pending()` and `mark_enrolled()` are the
+  enroll marker (`virag_enrolled_at`), which nothing else reads or writes.
+  `render_version()` is the one a revision may build from (409 while the tiler is not
+  serving); `get_tile()`, `get_info()` (for binding), `get_metadata()` (document
+  names), `doc_exists()`. `check_connection()` also proves `TILER_API_KEY` and that the
+  metadata schema declares the fields virag depends on (`check_schema()`).
 - **`QdrantStore`** — speaks **gRPC** to Qdrant: one multiplexed HTTP/2 channel (no pool
   of idle HTTP/1.1 connections to race the server's keep-alive), retries done by the
   channel's service config (`UNAVAILABLE`, idempotent methods only), an unreachable
@@ -169,7 +175,7 @@ which has to cover the upstream's longest silence.
 
 - Build all five clients from `Settings.from_env()`.
 - `create_collection()` on Qdrant; then `check_connection()` on retriever, tiler (which
-  also proves `TILER_API_KEY`), VLM and Valkey. **Every dependency is fatal** — the service is useless without any one of
+  also proves `TILER_API_KEY` and the metadata schema, below), VLM and Valkey. **Every dependency is fatal** — the service is useless without any one of
   them, so a failed check aborts startup. The retriever's vector size must also equal
   `QDRANT_VECTOR_SIZE`. Two processes starting on one empty Qdrant both try to create
   `<name>__v1`; the one that loses adopts the other's.
@@ -177,11 +183,11 @@ which has to cover the upstream's longest silence.
   collection must have been embedded from the tiler's volume (its `volume_id`), or
   startup fails. A fresh collection is bound on first run (`tiler_volume_id` + the
   tiler's `render_version`).
-- **Metadata-schema guard** (`enforce_metadata_schema`) — reconcile searches the tiler's
-  indexed metadata, so the tiler must declare the two fields virag depends on:
-  `name` (text), `virag_enrolled_at` (number). A missing or
-  wrong-typed field is **fatal** (`BindingError`) — the tiler is misconfigured. See
-  §9.
+- **Metadata-schema guard** (`TilerClient.check_schema`, part of the tiler's
+  dependency check) — reconcile searches the tiler's indexed metadata, so the tiler
+  must declare the two fields virag depends on: `name` (text), `virag_enrolled_at`
+  (number). A missing or wrong-typed field is **fatal** — the tiler is misconfigured.
+  See §9.
 - **Lease** — the process takes its lease in Valkey and starts the heartbeat that
   renews it (§10).
 - **Upkeep** — before serving, a process finishes a revision / rollback job left after
@@ -434,7 +440,7 @@ and until then that document cannot be enrolled again — the tiler answers
 virag/
   main.py            # app, lifespan (clients, dependency checks, binding, lease, reconcile, render_version check), router order
   settings.py        # pydantic-settings sections: every env var, its default and bounds
-  binding.py         # the collection ↔ tiler volume binding + tiler metadata-schema guard
+  binding.py         # the collection ↔ tiler volume binding
   coordination.py    # Coordinator: leases, documents being enrolled + journal, drain, the revision job, the reconcile lead
   enroll.py          # Enroller: a tile stream of the tiler (an ingest, or a stored doc) → a document's points; the one writer
   reconcile.py       # Qdrant ⊆ Tiler self-repair (startup + periodic): the invariant, abandoned enrolls

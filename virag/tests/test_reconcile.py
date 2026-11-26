@@ -9,15 +9,7 @@ from virag.errors import ApiError
 from virag.reconcile import reconcile
 from virag.settings import EnrollSettings, ReconcileSettings
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, lease_key, make_coordinator
-
-
-def _doc(doc_id, tile_count, *, complete=True, enrolled_at=1):
-    return {
-        "doc_id": doc_id, "doc_type": "PDF", "tile_count": tile_count, "complete": complete,
-        "render_version": "rv", "source_url": None,
-        "metadata": {"name": doc_id, "virag_enrolled_at": enrolled_at},
-    }
+from conftest import FakeRetriever, FakeStore, FakeTiler, tiler_doc as _doc, lease_key, make_coordinator
 
 
 def _reconcile(store, tiler, coordinator=None, *, self_heal=True, retriever=None):
@@ -41,7 +33,7 @@ def _enrolled_docs(store) -> list[str]:
 def test_reconcile_deletes_dangling_points():
     store, tiler = FakeStore(), FakeTiler()
     store._doc_ids = {"kept", "dangling"}                       # dangling has no tiler doc
-    tiler.docs = [{"doc_id": "kept"}]
+    tiler.stored = [_doc("kept")]
 
     asyncio.run(_reconcile(store, tiler))
 
@@ -52,10 +44,10 @@ def test_reconcile_deletes_dangling_points():
 def test_reconcile_deletes_points_of_quarantined_docs():
     store, tiler = FakeStore(), FakeTiler()
     store._doc_ids = {"kept", "quarantined", "reenrolling"}
-    tiler.docs = [
-        {"doc_id": "kept"},
-        {"doc_id": "quarantined", "quarantined": True},
-        {"doc_id": "reenrolling", "quarantined": True},
+    tiler.stored = [
+        _doc("kept"),
+        _doc("quarantined", quarantined=True),
+        _doc("reenrolling", quarantined=True),
     ]
     coordinator = make_coordinator(store)
 
@@ -89,7 +81,7 @@ def test_reconcile_runs_only_in_the_leading_process():
 
 def test_an_abandoned_enroll_is_finished_from_the_stored_tiles():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("doc-a", 2, enrolled_at=0)]
+    tiler.pending = [_doc("doc-a", 2, enrolled_at=0)]
 
     asyncio.run(_reconcile(store, tiler))
 
@@ -110,7 +102,7 @@ def test_an_abandoned_enroll_is_finished_from_the_stored_tiles():
 def test_a_pending_doc_is_abandoned_whatever_its_age():
     """No age to wait out: pending and held by nobody means its enroll is over."""
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("just-failed", 1, enrolled_at=0)]
+    tiler.pending = [_doc("just-failed", 1, enrolled_at=0)]
 
     asyncio.run(_reconcile(store, tiler))
 
@@ -122,7 +114,7 @@ def test_reconcile_leaves_a_document_being_enrolled_to_its_enroll():
     reconcile's to touch while an enroll holds the document."""
     store, tiler = FakeStore(), FakeTiler()
     store._doc_ids = {"dangling", "enrolling"}                  # neither is in the tiler's listing
-    tiler.pending_docs = [_doc("enrolling", 1, enrolled_at=0), _doc("abandoned", 1, enrolled_at=0)]
+    tiler.pending = [_doc("enrolling", 1, enrolled_at=0), _doc("abandoned", 1, enrolled_at=0)]
     coordinator = make_coordinator(store)
     other = make_coordinator(store, valkey=coordinator.valkey)
 
@@ -141,17 +133,17 @@ def test_a_document_taken_after_reconcile_looked_is_left_alone(monkeypatch):
     """An enroll that takes the document between reconcile's look at the keys and its own
     attempt: taking it is refused, and nothing of the document is touched."""
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("raced", 1, enrolled_at=0)]
+    tiler.pending = [_doc("raced", 1, enrolled_at=0)]
     coordinator = make_coordinator(store)
     other = make_coordinator(store, valkey=coordinator.valkey)
-    listing = tiler.iter_docs
+    listing = tiler.docs
 
-    async def iter_docs(*, filters=None):
+    async def docs(*, filters=None):
         if filters:
             coordinator.valkey.values["enroll:raced"] = (other.token, None)   # taken meanwhile
         return await listing(filters=filters)
 
-    tiler.iter_docs = iter_docs
+    tiler.docs = docs
 
     asyncio.run(_reconcile(store, tiler, coordinator))
 
@@ -160,7 +152,7 @@ def test_a_document_taken_after_reconcile_looked_is_left_alone(monkeypatch):
 
 def test_a_document_of_a_dead_process_is_abandoned():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("orphan", 1, enrolled_at=0)]
+    tiler.pending = [_doc("orphan", 1, enrolled_at=0)]
     coordinator = make_coordinator(store)
     dead = make_coordinator(store, valkey=coordinator.valkey)
     coordinator.valkey.values["enroll:orphan"] = (dead.token, None)
@@ -173,7 +165,7 @@ def test_a_document_of_a_dead_process_is_abandoned():
 
 def test_self_heal_is_journaled_by_a_running_revision():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("doc-a", 1, enrolled_at=0)]
+    tiler.pending = [_doc("doc-a", 1, enrolled_at=0)]
     coordinator = make_coordinator(store)
 
     async def go():
@@ -188,9 +180,9 @@ def test_self_heal_is_journaled_by_a_running_revision():
 
 def test_a_doc_the_tiler_does_not_serve_only_loses_its_partial_points():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [
+    tiler.pending = [
         _doc("incomplete", 0, complete=False, enrolled_at=0),
-        _doc("quarantined", 1, enrolled_at=0) | {"quarantined": True},
+        _doc("quarantined", 1, enrolled_at=0, quarantined=True),
     ]
 
     asyncio.run(_reconcile(store, tiler))
@@ -202,7 +194,7 @@ def test_a_doc_the_tiler_does_not_serve_only_loses_its_partial_points():
 
 def test_self_heal_off_only_clears_partial_points():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("doc-a", 2, enrolled_at=0)]
+    tiler.pending = [_doc("doc-a", 2, enrolled_at=0)]
 
     asyncio.run(_reconcile(store, tiler, self_heal=False))
 
@@ -212,7 +204,7 @@ def test_self_heal_off_only_clears_partial_points():
 
 def test_a_failed_self_heal_leaves_the_doc_pending_and_goes_on():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("bad", 2, enrolled_at=0), _doc("good", 1, enrolled_at=0)]
+    tiler.pending = [_doc("bad", 2, enrolled_at=0), _doc("good", 1, enrolled_at=0)]
     tiler.fail_tiles = {("bad", 1)}                                     # its stream breaks mid-way
     coordinator = make_coordinator(store)
 
@@ -226,7 +218,7 @@ def test_a_failed_self_heal_leaves_the_doc_pending_and_goes_on():
 
 def test_a_refused_stream_fails_only_its_doc():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.pending_docs = [_doc("gone", 1, enrolled_at=0), _doc("good", 1, enrolled_at=0)]
+    tiler.pending = [_doc("gone", 1, enrolled_at=0), _doc("good", 1, enrolled_at=0)]
     stream = tiler.doc_stream
 
     def doc_stream(doc_id):

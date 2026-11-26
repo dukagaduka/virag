@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 
+from virag.clients.tiler_client import Begin
 from virag.enroll import point_id
 from virag.errors import ApiError
 
@@ -189,9 +190,8 @@ def test_enroll_stream_error_rolls_back(make_client):
     client, store, _, tiler = _client(make_client)
 
     async def bad_stream(body, **_):
-        yield {"event": "begin", "doc_id": "doc-a", "doc_type": "PDF",
-               "source_url": None, "render_version": "rv-test"}
-        yield {"event": "error", "code": "INTERNAL", "message": "boom"}
+        yield Begin(doc_id="doc-a", doc_type="PDF", render_version="rv-test")
+        raise ApiError(status_code=502, message="tiler stream error: boom", details={"tiler_code": "INTERNAL"})
 
     tiler.ingest_stream = bad_stream
 

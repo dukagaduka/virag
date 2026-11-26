@@ -22,7 +22,8 @@ from fastapi.testclient import TestClient
 from qdrant_client.models import Distance
 
 from virag.clients.reranker_client import RerankerClient
-from virag.clients.tiler_client import TilerService
+from virag.clients.tiler_client import Begin, Committed, TilerClient, TilerDoc
+from virag.clients.tiler_client import Tile as TileEvent
 from virag.coordination import Coordinator
 from virag.enroll import Enroller
 from virag.errors import ApiError, install_error_handlers
@@ -323,8 +324,18 @@ class TileResult:
 
 class FakeTiler:
 
-    RENDER_VERSION_MISMATCH = TilerService.RENDER_VERSION_MISMATCH
-    unavailable = staticmethod(TilerService.unavailable)
+    """In-memory TilerClient. What virag keeps in the tiler — the enroll marker, the
+    render_version it may build from — goes through the real client's methods, over the
+    fake's `patch_metadata`, `docs` and `get_info`."""
+
+    ENROLLED_AT = TilerClient.ENROLLED_AT
+    RENDER_VERSION_MISMATCH = TilerClient.RENDER_VERSION_MISMATCH
+    unavailable = staticmethod(TilerClient.unavailable)
+
+    mark_pending = TilerClient.mark_pending
+    mark_enrolled = TilerClient.mark_enrolled
+    pending_docs = TilerClient.pending_docs
+    render_version = TilerClient.render_version
 
     def __init__(self, result: TileResult | None = None, info: dict | None = None):
         self._result = result
@@ -336,15 +347,8 @@ class FakeTiler:
         self.metadata_patches: list[tuple] = []
         self.doc_metadata: dict[str, dict] = {}
         self.metadata_calls: list[str] = []
-        self.schema: dict = {
-            "version": 1,
-            "fields": [
-                {"key": "name", "type": "text"},
-                {"key": "virag_enrolled_at", "type": "number"},
-            ],
-        }
-        self.docs: list[dict] = []
-        self.pending_docs: list[dict] = []
+        self.stored: list[TilerDoc] = []                       # what the tiler lists
+        self.pending: list[TilerDoc] = []                      # what its pending search answers
         self.max_concurrency = 0
         self.fail_tiles: set[tuple] = set()
 
@@ -355,32 +359,29 @@ class FakeTiler:
         self.uploads.append({"body": form, "content_type": content_type, "content_length": content_length})
 
         res = self._result
-        yield {"event": "begin", "doc_id": res.doc_id, "doc_type": res.doc_type,
-               "source_url": res.source_url, "render_version": res.render_version}
+        identity = {"doc_id": res.doc_id, "doc_type": res.doc_type,
+                    "source_url": res.source_url, "render_version": res.render_version}
+
+        yield Begin(**identity)
         for t in res.tiles:
-            yield {"event": "tile", "tile_num": t.tile_num, "width": t.width,
-                   "height": t.height, "image_hash": t.image_hash, "data": t.data}
-        yield {"event": "committed", "doc_id": res.doc_id, "doc_type": res.doc_type,
-               "source_url": res.source_url, "render_version": res.render_version,
-               "height": res.height, "tile_count": res.tile_count, "result": "rendered"}
+            yield TileEvent(tile_num=t.tile_num, width=t.width, height=t.height, image_hash=t.image_hash, data=t.data)
+        yield Committed(**identity, height=res.height, tile_count=res.tile_count, result="rendered")
 
     async def doc_stream(self, doc_id):
-        """A stored doc (one of `docs` / `pending_docs`) as its ingest's events; a tile in
+        """A stored doc (one of `stored` / `pending`) as its ingest's events; a tile in
         `fail_tiles` breaks the stream there."""
         self.doc_stream_calls.append(doc_id)
-        doc = {d["doc_id"]: d for d in [*self.docs, *self.pending_docs]}[doc_id]
-        identity = {"doc_id": doc_id, "doc_type": doc["doc_type"], "source_url": None,
+        doc = {d.doc_id: d for d in [*self.stored, *self.pending]}[doc_id]
+        identity = {"doc_id": doc_id, "doc_type": doc.doc_type, "source_url": None,
                     "render_version": self._info["render_version"]}
 
-        yield {"event": "begin", **identity}
-        for n in range(doc["tile_count"]):
+        yield Begin(**identity)
+        for n in range(doc.tile_count):
             if (doc_id, n) in self.fail_tiles:
                 raise RuntimeError(f"tile {doc_id}:{n} unavailable")
-            yield {"event": "tile", "tile_num": n, "width": 875, "height": 1024,
-                   "image_hash": tile_hash(doc_id, n),
-                   "data": base64.b64encode(tile_bytes(doc_id, n)).decode("ascii")}
-        yield {"event": "committed", **identity, "height": doc["tile_count"] * 1024,
-               "tile_count": doc["tile_count"], "result": "idempotent"}
+            yield TileEvent(tile_num=n, width=875, height=1024, image_hash=tile_hash(doc_id, n),
+                            data=base64.b64encode(tile_bytes(doc_id, n)).decode("ascii"))
+        yield Committed(**identity, height=doc.tile_count * 1024, tile_count=doc.tile_count, result="idempotent")
 
     async def get_tile(self, doc_id, tile_num, *, render_version=None, bulk=False) -> bytes:
         self.get_tile_calls.append((doc_id, tile_num))
@@ -405,12 +406,9 @@ class FakeTiler:
     async def patch_metadata(self, doc_id: str, patch: dict) -> None:
         self.metadata_patches.append((doc_id, patch))
 
-    async def get_schema(self) -> dict:
-        return self.schema
-
-    async def iter_docs(self, *, filters=None) -> list[dict]:
+    async def docs(self, *, filters=None) -> list[TilerDoc]:
         # No filters = the Qdrant ⊆ Tiler listing; filters = the pending search.
-        return list(self.pending_docs if filters else self.docs)
+        return list(self.pending if filters else self.stored)
 
 
 class FakeVLMResponse:
@@ -542,6 +540,15 @@ def make_client():
         app = build_app(**kwargs)
         return TestClient(app, raise_server_exceptions=False)
     return _make
+
+
+def tiler_doc(doc_id, tile_count=1, *, complete=True, quarantined=False, enrolled_at=1) -> TilerDoc:
+    """A document as FakeTiler lists it."""
+    return TilerDoc(
+        doc_id=doc_id, doc_type="PDF", tile_count=tile_count, render_version="rv",
+        complete=complete, quarantined=quarantined,
+        metadata={"name": doc_id, "virag_enrolled_at": enrolled_at},
+    )
 
 
 def sample_tile_result(doc_id="doc-a", n_tiles=2, doc_type="PDF") -> TileResult:

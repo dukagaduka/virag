@@ -195,6 +195,20 @@ def test_a_worker_keeps_its_reader_while_the_document_stays(tmp_path):
         worker.forget()
 
 
+@pytest.mark.parametrize("doc_type, name", [(DocType.PDF, "doc.pdf"), (DocType.IMG, "doc.png")])
+def test_a_failure_never_names_the_file(tmp_path, doc_type, name):
+    """MuPDF and Pillow both put the path of a file they cannot read into the error."""
+    path = _file(tmp_path, b"%PDF-1.7\n" + b"this is not a document at all " * 8, name)
+    worker = Worker(PARAMS)
+
+    with pytest.raises(DecodeError) as exc:
+        worker.on(doc_type, path, lambda reader: reader.cut())
+
+    assert "the document" in str(exc.value)
+    assert path not in str(exc.value) and str(tmp_path) not in str(exc.value)
+    assert worker.reader is None
+
+
 def test_the_tasks_run_on_the_process_worker(tmp_path):
     """What the pool submits by name: the classmethods reach the worker `start` made."""
     pdf = _file(tmp_path, make_pdf(pages=2))

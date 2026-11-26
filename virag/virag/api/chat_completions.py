@@ -135,7 +135,7 @@ async def _rerank(reranker, query: str, tiles: list[tuple], config: dict) -> lis
 
 
 async def _fetch_tiles(tiler, hits) -> list[tuple]:
-    """Regenerate each hit's tile as base64 JPEG, skipping any the tiler refuses.
+    """Fetch each hit's tile as base64 JPEG, skipping any the tiler refuses.
 
     Two failures are the whole request's, never quietly answered without tiles: a tile
     the tiler now renders by another render_version than the one it was embedded from
@@ -161,7 +161,7 @@ async def _fetch_tiles(tiler, hits) -> list[tuple]:
 
             return None
 
-        # Integrity: the regenerated tile must be the exact bytes enrolled in Qdrant; a
+        # Integrity: the fetched tile must be the exact bytes enrolled in Qdrant; a
         # point without a hash cannot be checked, so it is not trusted either.
         expected_hash = hit.payload.get("image_hash")
         if expected_hash is None:

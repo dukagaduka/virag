@@ -250,10 +250,11 @@ async def test_a_failed_render_leaves_nothing(client):
 
     r = await client.post("/doc", **pdf_form(broken))
     assert (r.status_code, r.json()["error"]["code"]) == (422, "DECODE_FAILED")
+    assert "/" not in r.json()["error"]["message"]                # where the store kept it stays inside
 
     events = _events((await client.post("/doc", params={"tiles": "true"}, **pdf_form(broken))).content)
     assert [e["event"] for e in events] == ["begin", "error"]
-    assert events[-1]["code"] == "DECODE_FAILED"
+    assert events[-1]["code"] == "DECODE_FAILED" and "/" not in events[-1]["message"]
 
     assert await state.store.get_doc(doc_id) is None
     assert not state.blobs.exists(doc_id) and _spooled(state) == []

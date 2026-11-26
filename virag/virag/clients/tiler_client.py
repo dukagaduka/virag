@@ -1,7 +1,23 @@
+"""The tiler as virag sees it: the client of its API, and what that API hands out.
+
+`TilerDoc` is a document as the tiler lists it; `Begin`, `Tile` and `Committed` are the
+events of a document's tile stream — an ingest and the stream of a stored doc emit the
+same ones, in this order. A stream the tiler fails after `Begin` ends with an `error`
+event instead of `Committed`: the client raises it, so a consumer sees typed events or
+an ApiError, never a dict.
+
+The tiler keeps one thing for virag in a document's metadata — the enroll marker
+(`TilerClient.ENROLLED_AT`): 0 while the document's enroll is pending, the time it
+finished afterwards. Only the client reads and writes it.
+"""
+
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterable
 from contextlib import nullcontext
+from dataclasses import dataclass, field
+from typing import AsyncIterator
 
 import httpx2
 import orjson
@@ -12,7 +28,105 @@ from virag.settings import HttpSettings, TilerSettings
 from virag.utils import error_body
 
 
-class TilerService(HttpService):
+@dataclass(frozen=True, slots=True)
+class TilerDoc:
+    """A document as the tiler lists it."""
+
+    doc_id: str
+    doc_type: str | None = None
+    tile_count: int = 0
+    render_version: str = ""
+    complete: bool = True
+    quarantined: bool = False
+    metadata: dict = field(default_factory=dict)
+
+
+    @classmethod
+    def from_wire(cls, item: dict) -> TilerDoc:
+        return cls(
+            doc_id=item["doc_id"],
+            doc_type=item.get("doc_type"),
+            tile_count=item.get("tile_count") or 0,
+            render_version=item.get("render_version") or "",
+            complete=bool(item.get("complete", True)),
+            quarantined=bool(item.get("quarantined", False)),
+            metadata=item.get("metadata") or {},
+        )
+
+
+    @property
+    def embeddable(self) -> bool:
+        """Its tiles can be fetched: it is complete and not quarantined by a tiler
+        revision (a quarantined doc's tiles answer 410 until it is re-enrolled)."""
+        return self.complete and not self.quarantined
+
+
+    @property
+    def enrolled_at(self) -> int:
+        """When its enroll finished; 0 while one is pending."""
+        return self.metadata.get(TilerClient.ENROLLED_AT, 0)
+
+
+    @property
+    def enrolled(self) -> bool:
+        """An enroll has finished it (not pending)."""
+        return self.enrolled_at > 0
+
+
+@dataclass(frozen=True, slots=True)
+class Begin:
+    """The first event of a tile stream: the document's identity. The tiler knows the
+    doc from here on."""
+
+    doc_id: str
+    doc_type: str
+    render_version: str
+    source_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Tile:
+    """One rendered tile; `data` is its JPEG in base64, `image_hash` the sha256 of the JPEG."""
+
+    tile_num: int
+    image_hash: str
+    data: str
+    width: int | None = None
+    height: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Committed:
+    """The last event: the doc is in the tiler, whole, and its tiles are served."""
+
+    doc_id: str
+    tile_count: int
+    doc_type: str | None = None
+    render_version: str | None = None
+    source_url: str | None = None
+    height: int | None = None
+    result: str | None = None
+
+
+Event = Begin | Tile | Committed
+
+
+class TilerClient(HttpService):
+
+    # The enroll marker in a document's metadata: 0 while its enroll is pending, the
+    # time it finished afterwards.
+    ENROLLED_AT = "virag_enrolled_at"
+
+    # The indexed metadata fields virag relies on: `name` for search, and the enroll
+    # marker the pending docs are searched by. Both must be declared in the tiler's
+    # metadata schema (deploy/service/tiler_metadata_schema.yaml).
+    REQUIRED_FIELDS = {
+        "name": "text",
+        ENROLLED_AT: "number",
+    }
+
+    # The events of a tile stream by their name on the wire.
+    EVENTS = {"begin": Begin, "tile": Tile, "committed": Committed}
 
     # A tile rendered by another render_version than the one it was embedded from.
     RENDER_VERSION_MISMATCH = "RENDER_VERSION_MISMATCH"
@@ -79,7 +193,7 @@ class TilerService(HttpService):
 
 
     @classmethod
-    def from_settings(cls, ts: TilerSettings, hs: HttpSettings) -> TilerService:
+    def from_settings(cls, ts: TilerSettings, hs: HttpSettings) -> TilerClient:
         return cls(
             base_url=ts.base_url,
             api_key=ts.api_key,
@@ -116,6 +230,33 @@ class TilerService(HttpService):
                 details={"upstream_status": 401},
             )
 
+        await self.check_schema()
+
+
+    async def check_schema(self) -> None:
+        """The tiler must declare every metadata field virag depends on (`REQUIRED_FIELDS`):
+        the pending docs are searched by the enroll marker, and the tiler refuses a
+        search by an undeclared key — so a missing field is a misconfiguration."""
+        schema = await self.get_schema()
+        declared = {f.get("key"): f.get("type") for f in schema.get("fields", [])}
+
+        for key, expected_type in self.REQUIRED_FIELDS.items():
+            actual_type = declared.get(key)
+
+            if actual_type is None:
+                raise ApiError(
+                    status_code=503,
+                    message=f"tiler metadata schema is missing required field {key!r}; "
+                            f"declare it in tiler_metadata_schema.yaml",
+                )
+
+            if actual_type != expected_type:
+                raise ApiError(
+                    status_code=503,
+                    message=f"tiler metadata field {key!r} is declared {actual_type!r} "
+                            f"but virag needs {expected_type!r}",
+                )
+
 
     async def ingest_stream(
         self,
@@ -123,9 +264,9 @@ class TilerService(HttpService):
         *,
         content_type: str,
         content_length: str | None = None,
-    ):
+    ) -> AsyncIterator[Event]:
         """Relay an ingest form to the tiler (`POST /doc?tiles=true`) and stream the
-        ingest as NDJSON events (begin, tile*, committed | error).
+        ingest as its events: Begin, a Tile per tile, Committed.
 
         `body` is the multipart form as the tiler takes it (`doc_type`, `document` |
         `url`, `metadata`), sent on as it is read — never held here; `content_type`
@@ -136,7 +277,8 @@ class TilerService(HttpService):
         trips `TILER_TIMEOUT_SEC`. Never replayed: the body is gone once read.
 
         A document the tiler refuses before the stream begins (wrong type, too large,
-        invalid metadata, already being ingested, …) raises with the tiler's own status.
+        invalid metadata, already being ingested, …) raises with the tiler's own status;
+        an ingest it fails after `Begin` raises 502.
         """
         headers = {"Content-Type": content_type}
         if content_length is not None:
@@ -159,7 +301,7 @@ class TilerService(HttpService):
                 yield event
 
 
-    async def doc_stream(self, doc_id: str):
+    async def doc_stream(self, doc_id: str) -> AsyncIterator[Event]:
         """Stream a document the tiler holds, as the ingest of its bytes would: the same
         events, its tiles rendered again. A doc that is unknown, still being ingested or
         quarantined fails before the stream begins."""
@@ -182,9 +324,9 @@ class TilerService(HttpService):
         verify: bool = True,
         bulk: bool = False,
     ) -> bytes:
-        """Fetch one tile, rendered by the tiler from the stored original. `bulk` calls (self-heal, revision) are capped by
-        `max_concurrency`; interactive ones (chat RAG) bypass it, so a corpus rebuild
-        never starves a user's query of tiles.
+        """Fetch one tile, rendered by the tiler from the stored original. `bulk` calls
+        (a revision's re-embed) are capped by `max_concurrency`; interactive ones (chat
+        RAG) bypass it, so a corpus rebuild never starves a user's query of tiles.
 
         `render_version` is the one the caller embedded the tile from: a tile the tiler
         rendered by another one is refused with 409 RENDER_VERSION_MISMATCH.
@@ -193,7 +335,7 @@ class TilerService(HttpService):
             response = await self._request(
                 "GET",
                 self.tile_route(doc_id, tile_num),
-                action=f"tile regeneration ({doc_id}, {tile_num})",
+                action=f"the tile fetch ({doc_id}, {tile_num})",
                 params={"verify": verify},
             )
 
@@ -223,6 +365,23 @@ class TilerService(HttpService):
         response = await self._request("GET", self.info_route, action="the info fetch")
 
         return self._json(response, action="the info fetch")
+
+
+    async def render_version(self) -> str:
+        """The render_version the tiler renders by. Refused (409) while the tiler is not
+        serving: its docs are being revised, so their tiles are not yet the ones it
+        settles on."""
+        info = await self.get_info()
+        tiler_revision = info.get("revision") or {}
+
+        if not tiler_revision.get("serving", True):
+            raise ApiError(
+                status_code=409,
+                message=f"The tiler is not serving (its revision is {tiler_revision.get('state')}); "
+                        f"retry once it is",
+            )
+
+        return info.get("render_version")
 
 
     async def doc_exists(self, doc_id: str) -> bool:
@@ -279,7 +438,38 @@ class TilerService(HttpService):
         )
 
 
-    async def search_docs(
+    async def mark_pending(self, doc_id: str, metadata: dict | None = None) -> None:
+        """Mark a document's enroll as pending, storing `metadata` along with the mark."""
+        await self.patch_metadata(doc_id, {**(metadata or {}), self.ENROLLED_AT: 0})
+
+
+    async def mark_enrolled(self, doc_id: str) -> None:
+        """Mark a document's enroll as finished, now."""
+        await self.patch_metadata(doc_id, {self.ENROLLED_AT: int(time.time())})
+
+
+    async def docs(self, *, filters: list[dict] | None = None) -> list[TilerDoc]:
+        """Every document the tiler lists, or those matching the metadata `filters`."""
+        docs: list[TilerDoc] = []
+        cursor: str | None = None
+
+        while True:
+            page = await self._docs_page(filters=filters, cursor=cursor)
+            docs.extend(TilerDoc.from_wire(item) for item in page.get("items", []))
+
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+
+        return docs
+
+
+    async def pending_docs(self) -> list[TilerDoc]:
+        """The documents whose enroll is pending: begun and never finished, or running now."""
+        return await self.docs(filters=[{"key": self.ENROLLED_AT, "op": "eq", "value": 0}])
+
+
+    async def _docs_page(
         self,
         *,
         filters: list[dict] | None = None,
@@ -298,35 +488,48 @@ class TilerService(HttpService):
         return self._json(response, action="search")
 
 
-    async def iter_docs(self, *, filters: list[dict] | None = None) -> list[dict]:
-        """Follow the search cursor to the end and return every matching doc summary."""
-        items: list[dict] = []
-        cursor: str | None = None
-
-        while True:
-            page = await self.search_docs(filters=filters, cursor=cursor)
-            items.extend(page.get("items", []))
-
-            cursor = page.get("next_cursor")
-            if not cursor:
-                break
-
-        return items
-
-
-    @staticmethod
-    async def _events(response: httpx2.Response, *, action: str):
-        """The events of an NDJSON tile stream, one per line."""
+    @classmethod
+    async def _events(cls, response: httpx2.Response, *, action: str) -> AsyncIterator[Event]:
+        """The events of an NDJSON tile stream, one per line. An `error` event — the
+        tiler failed the stream after `Begin` — is raised."""
         try:
             async for line in response.aiter_lines():
-                if line.strip():
-                    yield orjson.loads(line)
+                if not line.strip():
+                    continue
+
+                fields = orjson.loads(line)
+                name = fields.pop("event", None)
+
+                if name == "error":
+                    raise ApiError(
+                        status_code=502,
+                        message=f"tiler stream error: {fields.get('message')}",
+                        details={"tiler_code": fields.get("code")},
+                    )
+
+                if name in cls.EVENTS:
+                    yield cls._event(cls.EVENTS[name], fields, action=action)
 
         except httpx2.RequestError as e:
             raise ApiError(
                 status_code=503,
                 message=f"Lost {response.url} mid-stream during {action}",
                 details={"error": repr(e)},
+            ) from e
+
+
+    @staticmethod
+    def _event(kind: type, fields: dict, *, action: str) -> Event:
+        """One event from its fields on the wire; fields this virag does not know are
+        left out."""
+        try:
+            return kind(**{name: fields[name] for name in kind.__dataclass_fields__ if name in fields})
+
+        except TypeError as e:
+            raise ApiError(
+                status_code=502,
+                message=f"tiler stream sent a malformed `{kind.__name__.lower()}` event during {action}",
+                details={"base_message": str(e)},
             ) from e
 
 

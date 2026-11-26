@@ -79,7 +79,7 @@ are spliced into a streaming response.
 virag/
   main.py            app, lifespan (clients, fatal dependency checks, binding, reconcile, render_version check), router order
   settings.py        Settings.from_env() — every env var and its validation
-  binding.py         the collection ↔ tiler volume binding + tiler metadata-schema guard
+  binding.py         the collection ↔ tiler volume binding
   reconcile.py       Qdrant ⊆ Tiler self-repair (startup + periodic, in the leading process): the invariant, abandoned enrolls
   revision.py        /revision re-embed and /revision/rollback jobs
   coordination.py    Coordinator: process leases, documents being enrolled + journal, revision lock/status, reconcile lead

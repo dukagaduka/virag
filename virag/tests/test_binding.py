@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from virag.binding import BindingError, enforce_binding, enforce_metadata_schema
+from virag.binding import BindingError, enforce_binding
 
 from conftest import FakeStore, FakeTiler
 
@@ -56,30 +56,3 @@ def test_render_version_drift_is_not_fatal():
     rv = asyncio.run(enforce_binding(store, tiler))
     assert rv == "rv-NEW"        # not fatal: chat answers RENDER_VERSION_MISMATCH until a revision
     assert store.metadata["render_version"] == "rv-OLD"     # binding never rewrites it
-
-
-def test_metadata_schema_complete_ok():
-    tiler = FakeTiler()                                     # default schema has both
-    asyncio.run(enforce_metadata_schema(tiler))             # does not raise
-
-
-def test_metadata_schema_missing_field_is_fatal():
-    tiler = FakeTiler()
-    tiler.schema = {"version": 1, "fields": [{"key": "name", "type": "text"}]}
-
-    with pytest.raises(BindingError):
-        asyncio.run(enforce_metadata_schema(tiler))
-
-
-def test_metadata_schema_wrong_type_is_fatal():
-    tiler = FakeTiler()
-    tiler.schema = {
-        "version": 1,
-        "fields": [
-            {"key": "name", "type": "text"},
-            {"key": "virag_enrolled_at", "type": "text"},       # should be number
-        ],
-    }
-
-    with pytest.raises(BindingError):
-        asyncio.run(enforce_metadata_schema(tiler))

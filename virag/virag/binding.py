@@ -3,25 +3,17 @@ from __future__ import annotations
 import logging
 
 from virag.clients.qdrant_store import QdrantStore
-from virag.clients.tiler_client import TilerService
+from virag.clients.tiler_client import TilerClient
 
 
 log = logging.getLogger("virag.binding")
-
-# The indexed metadata fields virag relies on: `name` for search, and the enroll
-# marker reconcile queries by. Both must be declared in the tiler's metadata schema
-# (deploy/tiler_metadata_schema.yaml) or reconcile's search would 400.
-REQUIRED_METADATA_FIELDS = {
-    "name": "text",
-    "virag_enrolled_at": "number",
-}
 
 
 class BindingError(RuntimeError):
     """Fatal: the Qdrant collection belongs to another tiler volume than this tiler's."""
 
 
-async def enforce_binding(store: QdrantStore, tiler: TilerService) -> str:
+async def enforce_binding(store: QdrantStore, tiler: TilerClient) -> str:
     """Refuse to run unless the Qdrant collection was embedded from this tiler's volume.
 
     The tiler gives each volume a random `volume_id` at init. A fresh (unbound)
@@ -61,35 +53,3 @@ async def enforce_binding(store: QdrantStore, tiler: TilerService) -> str:
         raise BindingError(message)
 
     return tiler_rv
-
-
-async def enforce_metadata_schema(tiler: TilerService) -> None:
-    """Refuse to run unless the tiler declares every metadata field virag depends on.
-
-    Fatal (BindingError): reconcile searches these keys, and an undeclared key would
-    make the tiler reject the search — so a missing field is a misconfiguration, not a
-    warning.
-    """
-    schema = await tiler.get_schema()
-    declared = {f.get("key"): f.get("type") for f in schema.get("fields", [])}
-
-    for key, expected_type in REQUIRED_METADATA_FIELDS.items():
-        actual_type = declared.get(key)
-
-        if actual_type is None:
-            message = (
-                f"tiler metadata schema is missing required field {key!r}; "
-                f"declare it in tiler_metadata_schema.yaml"
-            )
-            log.critical("FATAL: %s", message)
-
-            raise BindingError(message)
-
-        if actual_type != expected_type:
-            message = (
-                f"tiler metadata field {key!r} is declared {actual_type!r} "
-                f"but virag needs {expected_type!r}"
-            )
-            log.critical("FATAL: %s", message)
-
-            raise BindingError(message)

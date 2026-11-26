@@ -53,11 +53,11 @@ import time
 
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.retriever_client import RetrieverClient
-from virag.clients.tiler_client import TilerService
+from virag.clients.tiler_client import TilerClient, TilerDoc
 from virag.coordination import Coordinator, EnrollInProgress
 from virag.enroll import Enroller, point_id
 from virag.errors import ApiError
-from virag.reconcile import embeddable, enforce_subset, enrolled
+from virag.reconcile import enforce_subset
 from virag.settings import EnrollSettings, RevisionSettings
 from virag.utils import chunked, gather
 
@@ -78,7 +78,7 @@ class RevisionManager:
         self,
         store: QdrantStore,
         coordinator: Coordinator,
-        tiler: TilerService,
+        tiler: TilerClient,
         retriever: RetrieverClient,
         enroller: Enroller,
         enroll_settings: EnrollSettings,
@@ -118,7 +118,7 @@ class RevisionManager:
         """Launch a revision in the background; 409 while a job is already running or
         while the tiler is not serving."""
         async def prepare():
-            render_version = await self._tiler_render_version()
+            render_version = await self.tiler.render_version()
 
             return self._revise(render_version)
 
@@ -133,7 +133,7 @@ class RevisionManager:
             if restored is None:
                 raise ApiError(status_code=409, message="No previous collection to roll back to")
 
-            render_version = await self._tiler_render_version()
+            render_version = await self.tiler.render_version()
             meta = await self.store.get_collection_metadata(collection=restored)
 
             if meta.get("render_version") != render_version:
@@ -155,7 +155,7 @@ class RevisionManager:
         `auto` (VIRAG_REVISION_ON_RENDER_MISMATCH) the rebuild starts right here, unless
         another process already runs it; otherwise the mismatch is logged and left to
         POST /revision."""
-        render_version = await self._tiler_render_version()
+        render_version = await self.tiler.render_version()
         embedded = (await self.store.get_collection_metadata()).get("render_version")
 
         if embedded == render_version:
@@ -240,7 +240,7 @@ class RevisionManager:
             pass
 
 
-    async def reembed(self, docs: list[dict], collection: str) -> set[str]:
+    async def reembed(self, docs: list[TilerDoc], collection: str) -> set[str]:
         """Re-embed complete tiler docs into `collection`, a build nobody else writes;
         docs that fail are retried once in per-document batches, so a doc that merely
         shared a batch with a broken one recovers. Returns the doc_ids that still failed."""
@@ -251,28 +251,12 @@ class RevisionManager:
 
         log.warning("reembed: retrying %d failed doc(s)", len(failed))
 
-        return await self._reembed_pass([doc for doc in docs if doc["doc_id"] in failed], collection, per_doc=True)
+        return await self._reembed_pass([doc for doc in docs if doc.doc_id in failed], collection, per_doc=True)
 
 
     # ------------------------------------------------------------------ #
     # the job
     # ------------------------------------------------------------------ #
-    async def _tiler_render_version(self) -> str:
-        """The tiler's render_version. Refused (409) while the tiler is not serving: its
-        docs are being revised, so their tiles are not yet the ones it settles on."""
-        info = await self.tiler.get_info()
-        tiler_revision = info.get("revision") or {}
-
-        if not tiler_revision.get("serving", True):
-            raise ApiError(
-                status_code=409,
-                message=f"The tiler is not serving (its revision is {tiler_revision.get('state')}); "
-                        f"retry once it is",
-            )
-
-        return info.get("render_version")
-
-
     async def _launch(self, kind: str, prepare) -> dict:
         """Take the job (409 while a live process holds it), run `prepare` under it — its
         checks; a refusal hands the job back — and run the job it returns in the background."""
@@ -365,8 +349,8 @@ class RevisionManager:
         swapped = False
 
         try:
-            docs = await self.tiler.iter_docs()
-            complete = [doc for doc in docs if embeddable(doc)]
+            docs = await self.tiler.docs()
+            complete = [doc for doc in docs if doc.embeddable]
 
             # Incomplete or quarantined docs have no servable tiles; leave them for a re-enroll.
             await self._update(total=len(docs), skipped=len(docs) - len(complete))
@@ -388,7 +372,7 @@ class RevisionManager:
             await enforce_subset(store, coordinator, self.tiler, collection=target)
 
             # The vectors must match what the tiler renders now, not when the job began.
-            current = await self._tiler_render_version()
+            current = await self.tiler.render_version()
             if current != render_version:
                 self._finish(
                     "failed",
@@ -476,11 +460,7 @@ class RevisionManager:
         await self.store.drop_collection(abandoned)
 
         # Docs enrolled after the original swap exist only in the dropped collection.
-        missed = journal | {
-            doc["doc_id"]
-            for doc in await self.tiler.iter_docs()
-            if (doc.get("metadata") or {}).get("virag_enrolled_at", 0) >= retired_at
-        }
+        missed = journal | {doc.doc_id for doc in await self.tiler.docs() if doc.enrolled_at >= retired_at}
 
         sync_failed = await self._sync(missed)
 
@@ -523,14 +503,14 @@ class RevisionManager:
         if not doc_ids:
             return set()
 
-        docs = {doc["doc_id"]: doc for doc in await self.tiler.iter_docs()}
+        docs = {doc.doc_id: doc for doc in await self.tiler.docs()}
         failed: set[str] = set()
 
         for doc_id in sorted(doc_ids):
             doc = docs.get(doc_id)
 
             try:
-                if doc is not None and embeddable(doc) and enrolled(doc):
+                if doc is not None and doc.embeddable and doc.enrolled:
                     await self.enroller.enroll_stored(doc_id)
 
                 else:
@@ -549,7 +529,7 @@ class RevisionManager:
     # ------------------------------------------------------------------ #
     # the flat re-embed
     # ------------------------------------------------------------------ #
-    async def _reembed_pass(self, docs: list[dict], collection: str, per_doc: bool = False) -> set[str]:
+    async def _reembed_pass(self, docs: list[TilerDoc], collection: str, per_doc: bool = False) -> set[str]:
         """One pass of the flat tile stream.
 
         Every (doc_id, tile_num) of every doc is cut into batches of `batch_size` across
@@ -563,7 +543,7 @@ class RevisionManager:
         A failed batch fails every doc it touched (their later tiles are skipped).
         `per_doc` keeps batches within one document (the retry pass).
         """
-        by_id = {doc["doc_id"]: doc for doc in docs}
+        by_id = {doc.doc_id: doc for doc in docs}
         failed: set[str] = set()
 
         async def process(batch: list[tuple[str, int]]) -> None:
@@ -581,7 +561,7 @@ class RevisionManager:
                         "doc_id": doc_id,
                         "tile_num": n,
                         "image_hash": hashlib.sha256(j).hexdigest(),
-                        "render_version": by_id[doc_id].get("render_version") or "",
+                        "render_version": by_id[doc_id].render_version,
                     }
                     for (doc_id, n), j in zip(batch, jpegs)
                 ]
@@ -598,10 +578,10 @@ class RevisionManager:
             batches = (
                 batch
                 for doc_id, doc in by_id.items()
-                for batch in chunked(((doc_id, n) for n in range(doc["tile_count"])), self.batch_size)
+                for batch in chunked(((doc_id, n) for n in range(doc.tile_count)), self.batch_size)
             )
         else:
-            tiles = ((doc_id, n) for doc_id, doc in by_id.items() for n in range(doc["tile_count"]))
+            tiles = ((doc_id, n) for doc_id, doc in by_id.items() for n in range(doc.tile_count))
             batches = chunked(tiles, self.batch_size)
 
         window = max(1, (self.tiler.max_concurrency or self.UNCAPPED_TILES) // self.batch_size) + 1

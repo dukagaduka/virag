@@ -12,10 +12,10 @@ from virag.responses import OrjsonResponse
 from virag.clients.qdrant_store import QdrantStore
 from virag.clients.reranker_client import RerankerClient
 from virag.clients.retriever_client import RetrieverClient
-from virag.clients.tiler_client import TilerService
+from virag.clients.tiler_client import TilerClient
 from virag.clients.valkey_store import ValkeyStore
 from virag.clients.vlm_client import VLMClient
-from virag.binding import enforce_binding, enforce_metadata_schema
+from virag.binding import enforce_binding
 from virag.coordination import Coordinator
 from virag.enroll import Enroller
 from virag.reconcile import reconcile
@@ -125,7 +125,7 @@ async def lifespan(app: FastAPI):
             reranker = RerankerClient.from_settings(settings.reranker_settings, settings.http_settings)
             stack.push_async_callback(reranker.close)
 
-        tiler = TilerService.from_settings(settings.tiler_settings, settings.http_settings)
+        tiler = TilerClient.from_settings(settings.tiler_settings, settings.http_settings)
         stack.push_async_callback(tiler.close)
 
         vlm = VLMClient.from_settings(settings.vlm_settings, settings.http_settings)
@@ -144,8 +144,6 @@ async def lifespan(app: FastAPI):
 
         # Refuse a collection embedded from another tiler volume; bind a fresh one.
         render_version = await enforce_binding(store, tiler)
-        # Reconcile depends on these indexed metadata fields being declared in the tiler.
-        await enforce_metadata_schema(tiler)
 
         # This process's lease: everything it holds cluster-wide hangs on it. The
         # heartbeat is cancelled after the jobs below, and the lease handed back last.

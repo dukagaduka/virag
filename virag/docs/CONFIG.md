@@ -181,7 +181,7 @@ contract mismatch to fix) — and that request goes on with the retriever's orde
 | `TILER_CONNECT_TIMEOUT_SEC` | no | `10` | Connect deadline (≥ 1). |
 | `TILER_MAX_CONNECTIONS` | no | `100` | Pooled keep-alive connections to the tiler (≥ 1). |
 | `TILER_MAX_RETRIES` | no | `3` | Retries for a transient failure on idempotent calls (≥ 0); an ingest is never replayed. |
-| `TILER_MAX_CONCURRENCY` | no | `32` | Max concurrent **bulk** tile regenerations — a revision's build (≥ 0; `0` = unlimited; must be ≤ `TILER_MAX_CONNECTIONS`). Chat RAG tile fetches bypass it. Size it to the tiler's parallel render capacity; it also sizes how many re-embed batches are kept in flight. |
+| `TILER_MAX_CONCURRENCY` | no | `32` | Max concurrent **bulk** tile fetches — a revision's build (≥ 0; `0` = unlimited; must be ≤ `TILER_MAX_CONNECTIONS`). Chat RAG tile fetches bypass it. Size it to the tiler's parallel render capacity; it also sizes how many re-embed batches are kept in flight. |
 
 ## Upstream VLM (OpenAI-compatible; external)
 

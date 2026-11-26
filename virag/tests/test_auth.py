@@ -7,7 +7,7 @@ from __future__ import annotations
 import httpx2
 import pytest
 
-from virag.clients.tiler_client import TilerService
+from virag.clients.tiler_client import TilerClient
 from virag.clients.vlm_client import VLMClient
 from virag.errors import ApiError
 
@@ -132,23 +132,27 @@ def test_models_route_needs_the_user_key(make_client):
 # TILER_API_KEY
 # ---------------------------------------------------------------------------
 
-def _tiler(api_key: str = "") -> TilerService:
-    return TilerService("http://tiler", api_key=api_key, max_retries=0, **_HTTP)
+# What a ready tiler answers every route of the check with: /schema/metadata reads `fields`.
+_READY = {"status": "ready", "fields": [{"key": "name", "type": "text"}, {"key": "virag_enrolled_at", "type": "number"}]}
+
+
+def _tiler(api_key: str = "") -> TilerClient:
+    return TilerClient("http://tiler", api_key=api_key, max_retries=0, **_HTTP)
 
 
 def test_tiler_key_is_sent_and_checked():
     tiler = _tiler("t-key")
-    seen = _mock(tiler, lambda req, n: httpx2.Response(200, json={"status": "ready"}))
+    seen = _mock(tiler, lambda req, n: httpx2.Response(200, json=_READY))
 
     _run(tiler.check_connection())
 
-    assert [r.url.path for r in seen] == ["/readyz", "/info"]
+    assert [r.url.path for r in seen] == ["/readyz", "/info", "/schema/metadata"]
     assert all(r.headers["authorization"] == "Bearer t-key" for r in seen)
 
 
 def test_tiler_without_key_sends_no_header():
     tiler = _tiler()
-    seen = _mock(tiler, lambda req, n: httpx2.Response(200, json={}))
+    seen = _mock(tiler, lambda req, n: httpx2.Response(200, json=_READY))
 
     _run(tiler.check_connection())
 

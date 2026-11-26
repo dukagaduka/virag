@@ -16,15 +16,7 @@ from virag.settings import EnrollSettings, RevisionSettings
 
 from fastapi.testclient import TestClient
 
-from conftest import FakeRetriever, FakeStore, FakeTiler, build_app, lease_key, make_coordinator
-
-
-def _doc(doc_id, tile_count, *, complete=True, enrolled_at=1):
-    return {
-        "doc_id": doc_id, "doc_type": "PDF", "tile_count": tile_count, "complete": complete,
-        "render_version": "rv", "source_url": None,
-        "metadata": {"name": doc_id, "virag_enrolled_at": enrolled_at},
-    }
+from conftest import FakeRetriever, FakeStore, FakeTiler, tiler_doc as _doc, build_app, lease_key, make_coordinator
 
 
 def _manager(store, tiler, coordinator=None, batch_size=4):
@@ -56,19 +48,19 @@ def _run_job(manager, start) -> dict:
 def test_revision_builds_swaps_and_syncs_journal():
     store, tiler = FakeStore(), FakeTiler()
     store.metadata = {"tiler_volume_id": "vol-test", "render_version": "rv-old"}
-    tiler.docs = [_doc("a", 2), _doc("b", 1, complete=False), _doc("q", 1) | {"quarantined": True}, _doc("fresh", 1)]
+    tiler.stored = [_doc("a", 2), _doc("b", 1, complete=False), _doc("q", 1, quarantined=True), _doc("fresh", 1)]
     manager = _manager(store, tiler)
 
-    listing = tiler.iter_docs
+    listing = tiler.docs
 
-    async def iter_docs(*, filters=None):
+    async def docs(*, filters=None):
         if not getattr(tiler, "enrolled_fresh", False):
             tiler.enrolled_fresh = True
             async with manager.coordinator.enrolling("fresh"):        # enrolled while building
                 pass
         return await listing(filters=filters)
 
-    tiler.iter_docs = iter_docs
+    tiler.docs = docs
 
     status = _run_job(manager, manager.start)
 
@@ -86,7 +78,7 @@ def test_revision_builds_swaps_and_syncs_journal():
 
 def test_revision_releases_the_job_and_publishes_its_outcome():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
     valkey = manager.coordinator.valkey
 
@@ -123,7 +115,7 @@ def test_startup_mismatch_is_only_logged_by_default(caplog):
 def test_startup_mismatch_starts_the_revision_when_enabled():
     store, tiler = FakeStore(), FakeTiler()
     store.metadata = {"tiler_volume_id": "vol-test", "render_version": "rv-old"}
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
 
     status = _run_job(manager, lambda: manager.revise_if_stale(auto=True))
@@ -159,7 +151,7 @@ def test_startup_without_mismatch_starts_nothing():
 
 def test_revision_aborts_when_the_tiler_render_version_changes_mid_build():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
 
     async def go():
@@ -178,7 +170,7 @@ def test_revision_aborts_when_the_tiler_render_version_changes_mid_build():
 
 def test_revision_with_failed_docs_does_not_swap():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1), _doc("bad", 1)]
+    tiler.stored = [_doc("a", 1), _doc("bad", 1)]
     tiler.fail_tiles = {("bad", 0)}
     manager = _manager(store, tiler)
 
@@ -192,7 +184,7 @@ def test_revision_with_failed_docs_does_not_swap():
 
 def test_revision_that_lost_its_lease_does_not_swap():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
 
     async def lease_runs_out():
@@ -209,7 +201,7 @@ def test_revision_that_lost_its_lease_does_not_swap():
 
 def test_second_job_is_rejected_while_running():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
 
     async def go():
@@ -227,7 +219,7 @@ def test_second_job_is_rejected_while_running():
 
 def test_job_of_another_live_process_is_reported_not_repeated():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     first = _manager(store, tiler)
     second = _manager(store, tiler, make_coordinator(store, valkey=first.coordinator.valkey))
 
@@ -251,7 +243,7 @@ def test_job_of_another_live_process_is_reported_not_repeated():
 
 def test_job_of_a_dead_process_is_reported_lost_and_taken_over():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     dead = make_coordinator(store)
     manager = _manager(store, tiler, make_coordinator(store, valkey=dead.valkey))
 
@@ -301,7 +293,7 @@ def test_rollback_resyncs_docs_enrolled_since_retirement():
     store, tiler = FakeStore(), FakeTiler()
     store.physical_name, store.previous_name = "c__v2", "c__v1"
     store.collection_metadata = {"c__v1": {"render_version": "rv-test", "retired_at": 100}}
-    tiler.docs = [_doc("old", 1, enrolled_at=50), _doc("new", 1, enrolled_at=150)]
+    tiler.stored = [_doc("old", 1, enrolled_at=50), _doc("new", 1, enrolled_at=150)]
     manager = _manager(store, tiler)
 
     status = _run_job(manager, manager.start_rollback)
@@ -315,7 +307,7 @@ def test_rollback_resyncs_docs_enrolled_since_retirement():
 
 def test_revision_api_starts_in_background_and_reports_status():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
 
     app = build_app(store=store, tiler=tiler, retriever=FakeRetriever())
     app.include_router(revision_api.router)
@@ -349,7 +341,7 @@ def _left_running(store, tiler, *, journal=(), **status):
 def test_a_revision_left_after_its_swap_is_finished_by_another_process():
     store, tiler = FakeStore(), FakeTiler()
     store.physical_name, store.previous_name = "c__v2", "c__v1"        # the swap happened
-    tiler.docs = [_doc("built", 1), _doc("fresh", 1)]                   # fresh: enrolled during the build
+    tiler.stored = [_doc("built", 1), _doc("fresh", 1)]                   # fresh: enrolled during the build
     manager = _left_running(
         store, tiler, journal={"fresh"}, kind="revision", collection="c__v2", phase="building", reembedded=1,
     )
@@ -382,7 +374,7 @@ def test_a_revision_left_before_its_swap_is_not_resumed():
 def test_a_rollback_left_after_its_repoint_is_finished_by_another_process():
     store, tiler = FakeStore(), FakeTiler()
     store.physical_name = "c__v1"                                       # repointed back already
-    tiler.docs = [_doc("old", 1, enrolled_at=50), _doc("new", 1, enrolled_at=150)]
+    tiler.stored = [_doc("old", 1, enrolled_at=50), _doc("new", 1, enrolled_at=150)]
     manager = _left_running(
         store, tiler, kind="rollback", collection="c__v1", abandoned="c__v2", retired_at=100, phase="repointing",
     )
@@ -417,7 +409,7 @@ def test_a_job_another_live_process_runs_is_not_touched():
 def test_of_two_processes_one_finishes_the_job():
     store, tiler = FakeStore(), FakeTiler()
     store.physical_name = "c__v2"
-    tiler.docs = [_doc("fresh", 1)]
+    tiler.stored = [_doc("fresh", 1)]
     first = _left_running(store, tiler, journal={"fresh"}, kind="revision", collection="c__v2", phase="syncing")
     second = _manager(store, tiler, make_coordinator(store, valkey=first.coordinator.valkey))
 
@@ -438,9 +430,9 @@ def test_of_two_processes_one_finishes_the_job():
 
 def test_a_job_failed_by_a_backend_after_its_swap_stays_running_and_is_finished_later():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
-    listing = tiler.iter_docs
+    listing = tiler.docs
     swap = store.swap_alias
 
     async def swap_then_the_tiler_goes_away(*args):
@@ -449,7 +441,7 @@ def test_a_job_failed_by_a_backend_after_its_swap_stays_running_and_is_finished_
         async def unavailable(*, filters=None):
             raise ApiError(status_code=503, message="tiler is unavailable")
 
-        tiler.iter_docs = unavailable
+        tiler.docs = unavailable
 
     store.swap_alias = swap_then_the_tiler_goes_away
 
@@ -459,7 +451,7 @@ def test_a_job_failed_by_a_backend_after_its_swap_stays_running_and_is_finished_
     assert store.swapped_to == "c__v2" and store.dropped == []          # the swap stands
     assert REVISION_ON not in manager.coordinator.valkey.values         # released, to be taken again
 
-    tiler.iter_docs = listing                                           # the tiler is back
+    tiler.docs = listing                                           # the tiler is back
     status = _run_job(manager, manager.resume_orphaned)
 
     assert status["state"] == "succeeded" and "interrupted" not in status
@@ -467,7 +459,7 @@ def test_a_job_failed_by_a_backend_after_its_swap_stays_running_and_is_finished_
 
 def test_a_job_shut_down_after_its_swap_is_finished_by_the_next_process():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
     manager.coordinator.DRAIN_POLL_SEC = 0.005
     valkey = manager.coordinator.valkey
@@ -499,7 +491,7 @@ def test_a_job_shut_down_after_its_swap_is_finished_by_the_next_process():
 
 def test_a_job_shut_down_while_building_is_failed():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("a", 1)]
+    tiler.stored = [_doc("a", 1)]
     manager = _manager(store, tiler)
     reached = asyncio.Event()
 
@@ -534,7 +526,7 @@ def _sync(manager, doc_ids):
 
 def test_sync_mirrors_the_tiler_for_the_given_docs():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [
+    tiler.stored = [
         _doc("live", 1),
         _doc("pending", 1, enrolled_at=0),                              # rolled-back enroll
         _doc("partial", 1, complete=False),
@@ -553,7 +545,7 @@ def test_sync_mirrors_the_tiler_for_the_given_docs():
 
 def test_sync_leaves_a_document_being_enrolled_to_its_enroll():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("live", 1), _doc("enrolling", 1)]
+    tiler.stored = [_doc("live", 1), _doc("enrolling", 1)]
     manager = _manager(store, tiler)
 
     async def go():
@@ -567,7 +559,7 @@ def test_sync_leaves_a_document_being_enrolled_to_its_enroll():
 
 def test_a_doc_that_fails_to_sync_is_reported_and_the_rest_go_on():
     store, tiler = FakeStore(), FakeTiler()
-    tiler.docs = [_doc("bad", 2), _doc("good", 1)]
+    tiler.stored = [_doc("bad", 2), _doc("good", 1)]
     tiler.fail_tiles = {("bad", 1)}
     manager = _manager(store, tiler)
 

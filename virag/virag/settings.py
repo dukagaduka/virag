@@ -160,7 +160,7 @@ class TilerSettings(_UpstreamSettings):
     base_url: str = "http://tiler-virag:8080"
     api_key: str = Field("", repr=False)        # the tiler's TILER_API_KEY; empty = none
     timeout_sec: int = Field(120, ge=1)         # for the tile stream: the max gap between events
-    max_concurrency: int = Field(32, ge=0)      # bulk tile regeneration only; chat RAG bypasses it
+    max_concurrency: int = Field(32, ge=0)      # bulk tile fetches only; chat RAG bypasses it
 
 
 class VLMSettings(_UpstreamSettings):
