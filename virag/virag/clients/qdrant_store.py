@@ -221,10 +221,7 @@ class QdrantStore:
     def check_vector_size(self, dimension: int | None) -> None:
         """The retriever's vectors must fit the collection, or the first upsert fails."""
         if dimension != self.vector_size:
-            message = f"retriever returns {dimension}-d vectors but QDRANT_VECTOR_SIZE is {self.vector_size}"
-            log.critical("FATAL: %s", message)
-
-            raise SettingsError(message)
+            raise self._misfit(f"retriever returns {dimension}-d vectors but QDRANT_VECTOR_SIZE is {self.vector_size}")
 
 
     async def close(self) -> None:
@@ -245,7 +242,8 @@ class QdrantStore:
         """Write `points` with their `vectors` into the serving collection, or into
         `collection` (a revision build). A point written again replaces itself."""
 
-        assert len(vectors) == len(points), "Sizes of `vectors` and `points` must be equal"
+        if len(vectors) != len(points):
+            raise ValueError(f"{len(vectors)} vectors for {len(points)} points")
 
         target = collection or self.serving_name
 
@@ -290,9 +288,8 @@ class QdrantStore:
         collection's distance: for cosine and dot it is a floor, for euclid and manhattan a
         ceiling."""
 
-        assert len(vector) == self.vector_size, (
-            f"Vector size mismatch: got {len(vector)} but expected {self.vector_size}"
-        )
+        if len(vector) != self.vector_size:
+            raise ValueError(f"The query vector's size is {len(vector)}, the collection's is {self.vector_size}")
 
         result = await self.qdrant.query_points(
             collection_name=self.serving_name,
@@ -541,20 +538,31 @@ class QdrantStore:
 
 
     async def _validate(self, name: str) -> None:
+        """The collection must hold vectors of the configured size and distance: anything
+        else is a collection of another setup, and every point op on it would fail."""
         vectors_info = (await self.qdrant.get_collection(name)).config.params.vectors
 
         size = vectors_info.size # type: ignore
         distance_type = vectors_info.distance # type: ignore
 
-        assert size == self.vector_size, (
-            f"Vector size mismatch: collection `{name}` has size {size}, "
-            f"but expected {self.vector_size}"
-        )
+        if size != self.vector_size:
+            raise self._misfit(
+                f"Qdrant collection `{name}` holds {size}-d vectors but QDRANT_VECTOR_SIZE is {self.vector_size}"
+            )
 
-        assert distance_type == self.distance_type, (
-            f"Distance type mismatch: collection `{name}` uses {distance_type}, "
-            f"but expected {self.distance_type}"
-        )
+        if distance_type != self.distance_type:
+            raise self._misfit(
+                f"Qdrant collection `{name}` uses the {distance_type.value} distance "
+                f"but QDRANT_DISTANCE_TYPE is {self.distance_type.value}"
+            )
+
+
+    @staticmethod
+    def _misfit(message: str) -> SettingsError:
+        """The settings do not fit what is there: fatal at startup, said in the log."""
+        log.critical("FATAL: %s", message)
+
+        return SettingsError(message)
 
 
     async def _ensure_indexes(self, name: str) -> None:

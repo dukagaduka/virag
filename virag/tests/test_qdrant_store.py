@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import grpc
 import pytest
+from qdrant_client.models import Distance
 
 from virag.clients.qdrant_store import Hit, QdrantStore, TilePoint
 from virag.errors import ApiError
@@ -96,6 +97,46 @@ def test_the_retrievers_vectors_must_fit_the_collection():
 
     with pytest.raises(SettingsError):
         store.check_vector_size(None)                                   # the retriever was never asked
+
+
+@pytest.mark.parametrize("size, distance, told", [
+    (8, "Cosine", "holds 8-d vectors but QDRANT_VECTOR_SIZE is 4"),
+    (4, "Dot", "uses the Dot distance but QDRANT_DISTANCE_TYPE is Cosine"),
+])
+def test_startup_refuses_a_collection_of_another_size_or_distance(monkeypatch, caplog, size, distance, told):
+    store = _store()
+    _aliases(store, {"c": "c__v1"})
+
+    async def get_collection(name):
+        vectors = SimpleNamespace(size=size, distance=Distance(distance))
+
+        return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=vectors)))
+
+    monkeypatch.setattr(store.qdrant, "get_collection", get_collection)
+
+    with pytest.raises(SettingsError, match=told):
+        asyncio.run(store.ensure_collection())
+
+    assert "FATAL: Qdrant collection `c__v1`" in caplog.text
+
+
+def test_a_vector_of_another_size_is_refused_before_qdrant_is_asked(monkeypatch):
+    store = _store()
+
+    async def never(**kwargs):
+        raise AssertionError("Qdrant must not be asked")
+
+    monkeypatch.setattr(store.qdrant, "query_points", never)
+    monkeypatch.setattr(store.qdrant, "upsert", never)
+
+    with pytest.raises(ValueError, match="query vector's size is 3"):
+        asyncio.run(store.query([0.0] * 3))
+
+    with pytest.raises(ValueError, match="2 vectors for 1 points"):
+        asyncio.run(store.upsert([[0.0] * 4] * 2, [TilePoint("d", 0, "h", "rv")]))
+
+    with pytest.raises(ValueError, match="Every vector's size must equal 4"):
+        asyncio.run(store.upsert([[0.0] * 3], [TilePoint("d", 0, "h", "rv")]))
 
 
 def test_query_hands_top_k_and_threshold_to_qdrant(monkeypatch):
