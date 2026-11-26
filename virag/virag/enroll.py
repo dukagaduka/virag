@@ -13,6 +13,10 @@ The Enroller consumes a tile stream of the tiler — `Begin`, a `Tile` per tile,
      alias resolved to when the document was taken.
   4. `Committed` promotes the document (`TilerClient.mark_enrolled`).
 
+A document whose ingest fails right after `Begin` may be gone from the tiler before it
+is marked pending; the enroll then ends with what the stream failed with, not with the
+mark that found no document.
+
 A stream that fails or ends without `Committed` rolls the document back out of Qdrant —
 only while the document is still this process's: a process that stalled past its lease
 may find another enroll writing it already. A doc the tiler held before stays there
@@ -95,7 +99,16 @@ class Enroller:
             doc_id = begin.doc_id
 
             async with self.coordinator.enrolling(doc_id) as collection:
-                await self.tiler.mark_pending(doc_id, metadata() if metadata is not None else None)
+                try:
+                    await self.tiler.mark_pending(doc_id, metadata() if metadata is not None else None)
+
+                except ApiError as e:
+                    # The tiler has dropped the doc already: its ingest failed right after
+                    # `Begin`. The stream ends with the reason — that is what to answer with.
+                    if self.tiler.unknown_doc(e):
+                        await self._end(events)
+
+                    raise
 
                 try:
                     await self.store.delete_by_doc(doc_id, collection=collection)
@@ -144,6 +157,13 @@ class Enroller:
             raise ApiError(status_code=502, message=f"tiler stream began with {type(event).__name__}")
 
         return event
+
+
+    @staticmethod
+    async def _end(events: AsyncIterator[Event]) -> None:
+        """Read a stream the tiler has given up on to its end, raising what it ends with."""
+        async for _ in events:
+            pass
 
 
     async def _write(self, begin: Begin, events: AsyncIterator[Event], collection: str) -> tuple[int, Committed]:

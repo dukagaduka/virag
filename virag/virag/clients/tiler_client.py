@@ -216,6 +216,12 @@ class TilerClient(HttpService):
         return e.code == "NOT_READY" and status in (None, 503)
 
 
+    @staticmethod
+    def unknown_doc(e: ApiError) -> bool:
+        """The tiler does not hold the document a call named (404)."""
+        return (e.details or {}).get("upstream_status") == 404
+
+
     async def check_connection(self) -> None:
         # /readyz: a tiler still revising its corpus is no tiler yet — virag refuses to start.
         await self._request("GET", self.readyz_route, action="the check")

@@ -331,6 +331,7 @@ class FakeTiler:
     ENROLLED_AT = TilerClient.ENROLLED_AT
     RENDER_VERSION_MISMATCH = TilerClient.RENDER_VERSION_MISMATCH
     unavailable = staticmethod(TilerClient.unavailable)
+    unknown_doc = staticmethod(TilerClient.unknown_doc)
 
     mark_pending = TilerClient.mark_pending
     mark_enrolled = TilerClient.mark_enrolled

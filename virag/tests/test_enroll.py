@@ -355,6 +355,42 @@ def test_enroll_that_cannot_mark_pending_keeps_existing_points(make_client):
     assert _held(client) == {}
 
 
+def test_an_ingest_that_failed_before_the_pending_mark_answers_with_its_own_error(make_client):
+    """A document the tiler cannot read is dropped right after `Begin`: the mark finds no
+    doc (404), and the stream says why."""
+    client, store, _, tiler = _client(make_client)
+
+    async def failed_at_once(body, **_):
+        yield Begin(doc_id="doc-a", doc_type="PDF", render_version="rv-test")
+        raise ApiError(status_code=502, message="tiler stream error: cannot open PDF", details={"tiler_code": "DECODE_FAILED"})
+
+    async def dropped(doc_id, patch):
+        raise ApiError(status_code=503, message="the metadata patch failed", details={"upstream_status": 404})
+
+    tiler.ingest_stream = failed_at_once
+    tiler.patch_metadata = dropped
+
+    r = _enroll(client)
+
+    assert r.status_code == 502
+    assert r.json()["error"]["details"] == {"tiler_code": "DECODE_FAILED"}
+    assert store.deletes == [] and _held(client) == {}                 # nothing was begun here
+
+
+def test_a_doc_gone_from_the_tiler_while_its_stream_goes_on_fails_the_mark(make_client):
+    client, store, _, tiler = _client(make_client)                     # e.g. deleted from the tiler meanwhile
+
+    async def dropped(doc_id, patch):
+        raise ApiError(status_code=503, message="the metadata patch failed", details={"upstream_status": 404})
+
+    tiler.patch_metadata = dropped
+
+    r = _enroll(client)
+
+    assert (r.status_code, r.json()["error"]["message"]) == (503, "the metadata patch failed")
+    assert store.upserts == [] and store.deletes == []
+
+
 # ---------------------------------------------------------------------------
 # the upload is relayed, not held
 # ---------------------------------------------------------------------------

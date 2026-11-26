@@ -249,7 +249,9 @@ documents enroll fully.
   pending mark the partial points are rolled back out of Qdrant; a doc the tiler held
   before stays in place and pending — and, no enroll holding it any more, is enrolled
   again by the next reconcile pass; a new one the tiler drops with its ingest. An enroll
-  that could not even mark the document pending leaves its points as they were. Before
+  that could not even mark the document pending leaves its points as they were; when the
+  mark finds no document — the tiler dropped it, its ingest having failed right after
+  `Begin` — the enroll answers with what the stream ended with, not with the mark. Before
   the rollback delete the enroll checks the document is still its own (fencing): a
   process that stalled past its lease may find another enroll writing it already.
 - **One collection per write.** Taking the document also pins the enroll to the physical
