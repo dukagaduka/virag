@@ -19,7 +19,7 @@ import httpx2
 import orjson
 
 from virag.errors import ApiError
-from virag.utils import error_body
+from virag.settings import HttpSettings, UpstreamSettings
 
 
 class HttpService(ABC):
@@ -92,6 +92,20 @@ class HttpService(ABC):
             ),
             headers=headers,
         )
+
+
+    @staticmethod
+    def http_options(us: UpstreamSettings, hs: HttpSettings) -> dict:
+        """The transport options of the constructor as an upstream's settings give them."""
+        return {
+            "timeout": us.timeout_sec,
+            "connect_timeout": us.connect_timeout_sec,
+            "max_connections": us.max_connections,
+            "max_concurrency": us.max_concurrency,
+            "max_retries": us.max_retries,
+            "backoff_base": hs.backoff_base_sec,
+            "backoff_cap": hs.backoff_cap_sec,
+        }
 
 
     @abstractmethod
@@ -193,11 +207,7 @@ class HttpService(ABC):
             raise self._transport_error(url, action, e) from e
 
         if not response.is_success and response.status_code not in passthrough_statuses:
-            raise ApiError(
-                status_code=503,
-                message=f"Upstream {url} failed during {action}",
-                details={"upstream_status": response.status_code, "upstream_error": error_body(response)},
-            )
+            raise self._status_error(url, action, response)
 
         return response
 
@@ -227,11 +237,7 @@ class HttpService(ABC):
             if not response.is_success and response.status_code not in passthrough_statuses:
                 await response.aread()
 
-                raise ApiError(
-                    status_code=503,
-                    message=f"Upstream {url} failed during {action}",
-                    details={"upstream_status": response.status_code, "upstream_error": error_body(response)},
-                )
+                raise self._status_error(url, action, response)
 
             yield response
 
@@ -275,19 +281,53 @@ class HttpService(ABC):
 
 
     @staticmethod
-    def _transport_error(url: str, action: str, error: httpx2.RequestError) -> ApiError:
-        """ApiError(503) for a transport failure — a timeout is told apart from an
-        unreachable upstream, since a reachable-but-silent server needs other action."""
+    def _transport_error(
+        url: str,
+        action: str,
+        error: httpx2.RequestError,
+        *,
+        status_code: int = 503,
+        **details,
+    ) -> ApiError:
+        """ApiError (503 unless told otherwise) for a transport failure — a timeout is
+        told apart from an unreachable upstream, since a reachable-but-silent server
+        needs other action. `details` are added to the error's."""
         if isinstance(error, httpx2.TimeoutException):
             message = f"Timed out waiting for {url} during {action}"
         else:
             message = f"Cannot reach {url} during {action}"
 
         return ApiError(
-            status_code=503,
+            status_code=status_code,
             message=message,
-            details={"error": repr(error)},
+            details={"error": repr(error), **details},
         )
+
+
+    @classmethod
+    def _status_error(cls, url: str, action: str, response: httpx2.Response) -> ApiError:
+        """ApiError(503) for an upstream that answered with an error status."""
+        return ApiError(
+            status_code=503,
+            message=f"Upstream {url} failed during {action}",
+            details=cls._upstream_details(response),
+        )
+
+
+    @classmethod
+    def _upstream_details(cls, response: httpx2.Response) -> dict:
+        """What an upstream answered with, as an error's details."""
+        return {"upstream_status": response.status_code, "upstream_error": cls._error_body(response)}
+
+
+    @staticmethod
+    def _error_body(response: httpx2.Response):
+        """A response's body as parsed JSON if possible, else its raw text."""
+        try:
+            return orjson.loads(response.content)
+
+        except ValueError:
+            return response.text
 
 
     def _backoff(self, attempt: int) -> float:
@@ -337,6 +377,12 @@ class OpenAIService(HttpService):
     @property
     def models_route(self) -> str:
         return f"{self.base_url}/models"
+
+
+    @staticmethod
+    def image_part(b64: str, image_mime: str = "image/jpeg") -> dict:
+        """An image as a part of a chat message's content: a base64 data URL."""
+        return {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{b64}"}}
 
 
     async def check_connection(self) -> None:

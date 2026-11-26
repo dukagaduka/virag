@@ -7,8 +7,6 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator
 from itertools import islice
 from typing import Any, TypeVar
 
-import httpx2
-import orjson
 from python_multipart.multipart import MultipartParser, parse_options_header
 
 from virag.errors import ApiError
@@ -17,15 +15,6 @@ from virag.errors import ApiError
 log = logging.getLogger("virag.utils")
 
 T = TypeVar("T")
-
-
-def error_body(response: httpx2.Response):
-    """Return an httpx response body as parsed JSON if possible, else the raw text."""
-    try:
-        return orjson.loads(response.content)
-
-    except ValueError:
-        return response.text
 
 
 async def gather(coros: Iterable[Coroutine[Any, Any, T]]) -> list[T]:

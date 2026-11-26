@@ -25,7 +25,6 @@ import orjson
 from virag.clients.http_service import HttpService
 from virag.errors import ApiError
 from virag.settings import HttpSettings, TilerSettings
-from virag.utils import error_body
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,13 +196,7 @@ class TilerClient(HttpService):
         return cls(
             base_url=ts.base_url,
             api_key=ts.api_key,
-            timeout=ts.timeout_sec,
-            max_concurrency=ts.max_concurrency,
-            connect_timeout=ts.connect_timeout_sec,
-            max_connections=ts.max_connections,
-            max_retries=ts.max_retries,
-            backoff_base=hs.backoff_base_sec,
-            backoff_cap=hs.backoff_cap_sec,
+            **cls.http_options(ts, hs),
         )
 
 
@@ -413,7 +406,7 @@ class TilerClient(HttpService):
         raise ApiError(
             status_code=503,
             message=f"Unexpected status {response.status_code} checking doc {doc_id}",
-            details={"upstream_status": response.status_code, "upstream_error": error_body(response)},
+            details=self._upstream_details(response),
         )
 
 
@@ -539,11 +532,11 @@ class TilerClient(HttpService):
             ) from e
 
 
-    @staticmethod
-    async def _refusal(response: httpx2.Response) -> ApiError:
+    @classmethod
+    async def _refusal(cls, response: httpx2.Response) -> ApiError:
         """The tiler's refusal of a document as our own error of the same status."""
         await response.aread()
-        body = error_body(response)
+        body = cls._error_body(response)
         error = body.get("error", {}) if isinstance(body, dict) else {"message": body}
         details = {"tiler_code": error.get("code")}
 

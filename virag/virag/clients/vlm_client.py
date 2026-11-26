@@ -8,7 +8,6 @@ import httpx2
 from virag.clients.http_service import OpenAIService
 from virag.errors import ApiError
 from virag.settings import HttpSettings, VLMSettings
-from virag.utils import error_body
 
 
 log = logging.getLogger(__name__)
@@ -30,13 +29,7 @@ class VLMClient(OpenAIService):
             base_url=vs.base_url,
             model_name=vs.model_name,
             api_key=vs.api_key,
-            max_concurrency=vs.max_concurrency,
-            timeout=vs.timeout_sec,
-            connect_timeout=vs.connect_timeout_sec,
-            max_connections=vs.max_connections,
-            max_retries=vs.max_retries,
-            backoff_base=hs.backoff_base_sec,
-            backoff_cap=hs.backoff_cap_sec,
+            **cls.http_options(vs, hs),
         )
 
 
@@ -74,7 +67,7 @@ class VLMClient(OpenAIService):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Reply with the single word: ok"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.PROBE_IMAGE}"}},
+                        self.image_part(self.PROBE_IMAGE, "image/png"),
                     ],
                 }
             ],
@@ -86,17 +79,13 @@ class VLMClient(OpenAIService):
             response = await self.send("POST", self.route, json=body)
 
         except httpx2.RequestError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Cannot reach {self.route} during the vision probe",
-                details={"error": repr(e)},
-            ) from e
+            raise self._transport_error(self.route, "the vision probe", e) from e
 
         if response.status_code >= 400:
             raise ApiError(
                 status_code=503,
                 message=f"Model {self.model_name} does not accept image inputs (not vision-capable)",
-                details={"upstream_status": response.status_code, "upstream_error": error_body(response)},
+                details=self._upstream_details(response),
             )
 
 
@@ -110,11 +99,7 @@ class VLMClient(OpenAIService):
                 return await self.send("POST", self.route, json=body)
 
             except httpx2.RequestError as e:
-                raise ApiError(
-                    status_code=502,
-                    message=f"Cannot reach {self.route} during chat completion",
-                    details={"error": repr(e), "attempts": self.max_retries + 1},
-                ) from e
+                raise self._unreachable("chat completion", e) from e
 
 
     @asynccontextmanager
@@ -132,14 +117,16 @@ class VLMClient(OpenAIService):
                 response = await self.send("POST", self.route, stream=True, json=body)
 
             except httpx2.RequestError as e:
-                raise ApiError(
-                    status_code=502,
-                    message=f"Cannot reach {self.route} during streaming chat completion",
-                    details={"error": repr(e), "attempts": self.max_retries + 1},
-                ) from e
+                raise self._unreachable("streaming chat completion", e) from e
 
             try:
                 yield response
 
             finally:
                 await response.aclose()
+
+
+    def _unreachable(self, action: str, error: httpx2.RequestError) -> ApiError:
+        """The VLM could not be reached for a chat request, after every attempt: 502 — to
+        the client virag is the model, and its own upstream failed."""
+        return self._transport_error(self.route, action, error, status_code=502, attempts=self.max_retries + 1)

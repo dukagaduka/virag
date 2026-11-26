@@ -453,7 +453,7 @@ virag/
   rag.py             # Rag: the tiles a question is answered from — RagConfig (the `rag` field), retrieval, integrity check, rerank, injection, sources
   errors.py          # ApiError + the uniform {"error": {...}} envelope
   responses.py       # OrjsonResponse, the app-wide default response class
-  utils.py           # non-domain helpers (error_body, gather, cancel, every, chunked, unavailable_as_503, MultipartFields)
+  utils.py           # non-domain helpers (gather, cancel, every, chunked, unavailable_as_503, MultipartFields)
   api/
     chat_completions.py  # /v1/chat/completions: the request through the Rag, then the VLM's answer relayed (sources spliced in)
     enroll.py            # /enroll: the upload relayed to the tiler, name policy, the tiler's ingest stream → Enroller

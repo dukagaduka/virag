@@ -16,6 +16,8 @@ from virag.clients.vlm_client import VLMClient
 from virag.errors import ApiError
 from virag.utils import gather
 
+from conftest import make_settings
+
 
 _HTTP = dict(timeout=5, connect_timeout=5, max_connections=4, max_concurrency=0, backoff_base=0, backoff_cap=0)
 _RETRIEVER = dict(batch_size=32, bulk_priority=0, image_batching="auto")
@@ -345,6 +347,69 @@ def test_vlm_complete_retries_upstream_503_and_passes_through():
 
     assert response.status_code == 503
     assert len(seen) == 2
+
+
+@pytest.mark.parametrize("error, told", [
+    (httpx2.ConnectError, "Cannot reach http://vlm/v1/chat/completions during chat completion"),
+    (httpx2.ReadTimeout, "Timed out waiting for http://vlm/v1/chat/completions during chat completion"),
+])
+def test_vlm_that_cannot_be_reached_is_a_502_naming_the_attempts(error, told):
+    vlm = VLMClient("http://vlm/v1", "vlm", "k", max_retries=2, **_HTTP)
+
+    def handler(req, n):
+        raise error("no answer", request=req)
+
+    seen = _mock(vlm, handler)
+
+    with pytest.raises(ApiError) as exc:
+        _run(vlm.complete({"messages": []}))
+
+    assert (exc.value.status_code, exc.value.message) == (502, told)
+    assert exc.value.details["attempts"] == 3 and "no answer" in exc.value.details["error"]
+    assert len(seen) == (3 if error is httpx2.ConnectError else 1)      # a read timeout is not replayed
+
+
+def test_vlm_stream_that_cannot_be_opened_is_a_502():
+    vlm = VLMClient("http://vlm/v1", "vlm", "k", max_retries=0, **_HTTP)
+
+    def handler(req, n):
+        raise httpx2.ConnectError("refused", request=req)
+
+    _mock(vlm, handler)
+
+    async def open_stream():
+        async with vlm.stream({"messages": [], "stream": True}):
+            pass
+
+    with pytest.raises(ApiError, match="during streaming chat completion") as exc:
+        _run(open_stream())
+
+    assert exc.value.status_code == 502 and exc.value.details["attempts"] == 1
+
+
+def test_an_image_is_a_data_url_part():
+    assert VLMClient.image_part("QUJD") == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}}
+    assert VLMClient.image_part("QUJD", "image/png")["image_url"]["url"] == "data:image/png;base64,QUJD"
+
+
+def test_every_client_takes_its_transport_options_from_its_settings():
+    settings = make_settings()
+    hs = settings.http_settings
+
+    assert HttpService.http_options(settings.tiler_settings, hs) == {
+        "timeout": 120, "connect_timeout": 10, "max_connections": 100, "max_concurrency": 0,
+        "max_retries": 0, "backoff_base": 0, "backoff_cap": 0,
+    }
+
+    for client, section in [
+        (RetrieverClient, settings.retriever_settings),
+        (TilerClient, settings.tiler_settings),
+        (VLMClient, settings.vlm_settings),
+    ]:
+        built = client.from_settings(section, hs)
+
+        assert (built.base_url, built.max_retries, built.max_concurrency) == (section.base_url, section.max_retries, section.max_concurrency)
+        assert built.http.timeout == httpx2.Timeout(section.timeout_sec, connect=section.connect_timeout_sec)
 
 
 def test_tiler_doc_exists_statuses():

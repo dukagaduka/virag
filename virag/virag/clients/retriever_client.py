@@ -8,7 +8,7 @@ import httpx2
 from virag.clients.http_service import OpenAIService
 from virag.errors import ApiError
 from virag.settings import HttpSettings, RetrieverSettings
-from virag.utils import error_body, gather
+from virag.utils import gather
 
 
 log = logging.getLogger(__name__)
@@ -71,13 +71,7 @@ class RetrieverClient(OpenAIService):
             batch_size=rs.batch_size,
             bulk_priority=rs.bulk_priority,
             image_batching=rs.image_batching,
-            max_concurrency=rs.max_concurrency,
-            timeout=rs.timeout_sec,
-            connect_timeout=rs.connect_timeout_sec,
-            max_connections=rs.max_connections,
-            max_retries=rs.max_retries,
-            backoff_base=hs.backoff_base_sec,
-            backoff_cap=hs.backoff_cap_sec,
+            **cls.http_options(rs, hs),
         )
 
 
@@ -166,11 +160,7 @@ class RetrieverClient(OpenAIService):
             )
 
         except httpx2.RequestError as e:
-            raise ApiError(
-                status_code=503,
-                message=f"Cannot reach {self.route} during the check",
-                details={"error": repr(e)},
-            ) from e
+            raise self._transport_error(self.route, "the check", e) from e
 
         if not response.is_success:
             return None
@@ -245,7 +235,7 @@ class RetrieverClient(OpenAIService):
                 raise ApiError(
                     status_code=503,
                     message=f"Upstream {self.route} rejected an item during embedding",
-                    details={"upstream_status": response.status_code, "upstream_error": error_body(response)},
+                    details=self._upstream_details(response),
                 )
 
             log.warning(
@@ -277,19 +267,9 @@ class RetrieverClient(OpenAIService):
         return {"messages": units[0] if len(units) == 1 else units}
 
 
-    @staticmethod
-    def _image_conversation(b64: str, image_mime: str) -> list[dict]:
-        return [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{image_mime};base64,{b64}"},
-                    }
-                ],
-            }
-        ]
+    @classmethod
+    def _image_conversation(cls, b64: str, image_mime: str) -> list[dict]:
+        return [{"role": "user", "content": [cls.image_part(b64, image_mime)]}]
 
 
     @staticmethod

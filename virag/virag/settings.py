@@ -38,7 +38,7 @@ class _Section(BaseSettings):
     )
 
 
-class _UpstreamSettings(_Section):
+class UpstreamSettings(_Section):
     """Transport knobs every HTTP upstream shares: pool, deadlines, retries, concurrency cap."""
 
     base_url: str
@@ -49,7 +49,7 @@ class _UpstreamSettings(_Section):
     max_retries: int = Field(3, ge=0)           # transient failures only
 
     @model_validator(mode="after")
-    def _concurrency_within_pool(self) -> _UpstreamSettings:
+    def _concurrency_within_pool(self) -> UpstreamSettings:
         # Above the pool size a concurrency cap never binds — the pool would queue instead.
         if self.max_concurrency > self.max_connections:
             prefix = self.model_config.get("env_prefix", "")
@@ -114,7 +114,7 @@ class ValkeySettings(_Section):
     max_connections: int = Field(64, ge=1)
 
 
-class RetrieverSettings(_UpstreamSettings):
+class RetrieverSettings(UpstreamSettings):
     """The retrieval embedding model behind an OpenAI-compatible `/embeddings` API, and
     what a RAG query takes from Qdrant (a request's `rag` object overrides `top_k` and
     `threshold`)."""
@@ -133,7 +133,7 @@ class RetrieverSettings(_UpstreamSettings):
     threshold: float | None = None              # min Qdrant score of a candidate; unset = no threshold
 
 
-class RerankerSettings(_UpstreamSettings):
+class RerankerSettings(UpstreamSettings):
     """The optional reranker that picks the tiles for the VLM out of the retriever's
     candidates; off while `base_url` is unset (a request's `rag` object overrides
     `top_n` and `threshold`)."""
@@ -154,7 +154,7 @@ class RerankerSettings(_UpstreamSettings):
         return self.base_url is not None
 
 
-class TilerSettings(_UpstreamSettings):
+class TilerSettings(UpstreamSettings):
     model_config = SettingsConfigDict(env_prefix="TILER_")
 
     base_url: str = "http://tiler-virag:8080"
@@ -163,7 +163,7 @@ class TilerSettings(_UpstreamSettings):
     max_concurrency: int = Field(32, ge=0)      # bulk tile fetches only; chat RAG bypasses it
 
 
-class VLMSettings(_UpstreamSettings):
+class VLMSettings(UpstreamSettings):
     """The upstream OpenAI-compatible vision chat model (external to the deployment)."""
 
     model_config = SettingsConfigDict(env_prefix="VLM_")

@@ -24,6 +24,7 @@ import hashlib
 import logging
 from dataclasses import dataclass, replace
 
+from virag.clients.http_service import OpenAIService
 from virag.clients.qdrant_store import Hit, QdrantStore
 from virag.clients.reranker_client import RerankerClient
 from virag.clients.retriever_client import RetrieverClient
@@ -261,13 +262,8 @@ class Rag:
         """Prepend framing text + retrieved tile images to the last user message."""
         index = cls._last_user_index(messages)
 
-        image_parts = [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-            for b64 in images_b64
-        ]
-
         original = messages[index].get("content")
-        new_content = [{"type": "text", "text": framing_text}, *image_parts]
+        new_content = [{"type": "text", "text": framing_text}, *(OpenAIService.image_part(b64) for b64 in images_b64)]
 
         if isinstance(original, str):
             new_content.append({"type": "text", "text": original})

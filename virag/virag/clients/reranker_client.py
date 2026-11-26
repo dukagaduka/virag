@@ -58,13 +58,7 @@ class RerankerClient(OpenAIService):
             api_key=rs.api_key,
             api=rs.api,
             batch_size=rs.batch_size,
-            max_concurrency=rs.max_concurrency,
-            timeout=rs.timeout_sec,
-            connect_timeout=rs.connect_timeout_sec,
-            max_connections=rs.max_connections,
-            max_retries=rs.max_retries,
-            backoff_base=hs.backoff_base_sec,
-            backoff_cap=hs.backoff_cap_sec,
+            **cls.http_options(rs, hs),
         )
 
 
@@ -126,9 +120,9 @@ class RerankerClient(OpenAIService):
         return e.status_code == 422 or (status is not None and 400 <= status < 500 and status not in (408, 429))
 
 
-    @staticmethod
-    def _image_document(b64: str, image_mime: str) -> dict:
-        return {"content": [{"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{b64}"}}]}
+    @classmethod
+    def _image_document(cls, b64: str, image_mime: str) -> dict:
+        return {"content": [cls.image_part(b64, image_mime)]}
 
 
     @staticmethod
